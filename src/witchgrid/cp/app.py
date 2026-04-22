@@ -13,11 +13,13 @@ from ..config import config
 from ..logger import log
 from .api import router
 from .db import init_db
+from .routing import router as routing_router
 
 
 def build_app() -> FastAPI:
-    app = FastAPI(title="Witchgrid CP", version="0.1.0")
+    app = FastAPI(title="Witchgrid CP", version="0.2.0")
     app.include_router(router)
+    app.include_router(routing_router)
 
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():

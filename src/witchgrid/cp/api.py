@@ -4,7 +4,7 @@ import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from ..config import config
 from ..logger import log
@@ -28,22 +28,22 @@ def _now() -> str:
 
 
 @router.post("/nodes/register", response_model=RegisterResp)
-async def register_node(req: RegisterReq) -> RegisterResp:
+async def register_node(req: RegisterReq, request: Request) -> RegisterResp:
     now = _now()
+    addr = request.client.host if request.client else None
     with connect() as conn:
-        # Upsert: re-registration on the same node_id refreshes hostname,
-        # role, version, hardware. registered_at is preserved.
         existing = conn.execute(
             "select registered_at from nodes where node_id = ?", (req.node_id,)
         ).fetchone()
         registered_at = existing["registered_at"] if existing else now
         conn.execute(
             """
-            insert into nodes (node_id, hostname, role, version, registered_at,
+            insert into nodes (node_id, hostname, addr, role, version, registered_at,
                                last_heartbeat_at, hardware)
-            values (?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(node_id) do update set
                 hostname = excluded.hostname,
+                addr = excluded.addr,
                 role = excluded.role,
                 version = excluded.version,
                 last_heartbeat_at = excluded.last_heartbeat_at,
@@ -52,6 +52,7 @@ async def register_node(req: RegisterReq) -> RegisterResp:
             (
                 req.node_id,
                 req.hostname,
+                addr,
                 req.role,
                 req.version,
                 registered_at,
@@ -63,6 +64,7 @@ async def register_node(req: RegisterReq) -> RegisterResp:
         "node.register",
         node_id=req.node_id,
         hostname=req.hostname,
+        addr=addr,
         role=req.role,
         gpus=len(req.hardware.gpus),
     )
@@ -152,7 +154,10 @@ async def spawn_service(req: SpawnServiceReq) -> ServiceView:
 
     # Inject defaults the worker template expects.
     config_full = {
-        "host": "127.0.0.1",
+        # 0.0.0.0 so the CP can reach the service when worker is on
+        # a different host. Single-network homelab assumption — there's
+        # no auth on the spawned service yet.
+        "host": "0.0.0.0",
         "port": _next_port_for(req.node_id),
         "context_size": 8192,
         "n_gpu_layers": 999,

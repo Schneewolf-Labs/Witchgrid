@@ -18,6 +18,7 @@ SCHEMA = """
 create table if not exists nodes (
     node_id           text primary key,
     hostname          text not null,
+    addr              text,                            -- IP captured from request.client at register
     role              text not null,                   -- 'cp,worker', 'worker', etc.
     version           text,
     registered_at     text not null,                   -- ISO timestamp
@@ -68,9 +69,21 @@ def _db_path() -> Path:
     return config.STATE_DIR / "state.db"
 
 
+# Idempotent in-place column additions for DBs created by older versions.
+MIGRATIONS = [
+    "alter table nodes add column addr text",
+]
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                # column already exists
+                pass
 
 
 @contextmanager

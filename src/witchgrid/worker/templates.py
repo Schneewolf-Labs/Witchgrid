@@ -11,19 +11,21 @@ from typing import Any
 
 
 def llama_server(config: dict[str, Any]) -> tuple[list[str], str]:
-    """Build a launch argv for llama-server. Returns (argv, health_url)."""
-    host = config.get("host", "127.0.0.1")
+    """Build a launch argv for llama-server. Returns (argv, health_url).
+    health_url always uses loopback since the worker checks locally;
+    the bind host (often 0.0.0.0) is for cross-host reachability."""
+    bind = config.get("host", "0.0.0.0")
     port = config["port"]
     argv = [
         "llama-server",
         "-m", config["model_path"],
-        "--host", str(host),
+        "--host", str(bind),
         "--port", str(port),
         "-c", str(config.get("context_size", 8192)),
         "-ngl", str(config.get("n_gpu_layers", 999)),
         "--jinja",
     ]
-    return argv, f"http://{host}:{port}/health"
+    return argv, f"http://127.0.0.1:{port}/health"
 
 
 def build(template: str, config: dict[str, Any]) -> tuple[list[str], str]:
