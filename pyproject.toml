@@ -1,0 +1,32 @@
+[project]
+name = "witchgrid"
+version = "0.1.0"
+description = "Orchestration + dashboard for self-hosted AI inference services"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "httpx>=0.27",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.5",
+  "structlog>=24.4",
+  "psutil>=6.1",
+  "nvidia-ml-py>=12.560 ; sys_platform == 'linux'",
+]
+
+[project.scripts]
+witchgrid = "witchgrid.__main__:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/witchgrid"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/witchgrid/cp/static" = "witchgrid/cp/static"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

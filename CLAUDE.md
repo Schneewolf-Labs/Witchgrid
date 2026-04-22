@@ -66,6 +66,30 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 - **Auth / multi-tenancy.** Single-operator / homelab v1 — **no auth.** Add API keys + per-tenant quotas if it grows beyond one operator.
 - **GPU sharing across non-AI workloads.** Out of scope for v1 — Witchgrid manages inference services it spawned, not arbitrary processes squatting on the GPU.
 
+## Relationship to Merlina (sibling Schneewolf Labs project)
+
+[Merlina](https://github.com/Schneewolf-Labs/Merlina) is the lab's fine-tuning UI — Python + FastAPI, supports ORPO/DPO/SimPO/CPO/IPO/KTO/SFT, integrates with HuggingFace + Weights & Biases + llama.cpp. Same stack as Witchgrid; naturally complementary.
+
+The intended composition: **Merlina trains, Witchgrid serves.**
+
+```
+flammen.ai data (chats, message_feedback, generation_attempts)
+   → Merlina fine-tunes (Mahou replacement, character-designer model,
+                         moderation classifier, etc.)
+       → Witchgrid registers + serves the trained model
+           → flammen.ai consumes via Witchgrid's routing API
+               → produces more data → loop
+```
+
+The "Mahou is the wrong shape for FlameGen designer pass" gap noted in flammen.ai's CLAUDE.md is the obvious first use case for this loop.
+
+Integration vectors (all deferred until both projects exist):
+1. **Merlina outputs → Witchgrid catalog.** When training completes, Merlina pings Witchgrid to register the new model as deployable. Lowest-friction.
+2. **Witchgrid as Merlina's compute provider.** Merlina submits training jobs through Witchgrid; CP allocates a GPU worker; runs the training subprocess. Lets Merlina share a GPU pool with inference.
+3. **Shared model storage.** Both lean on the same model directory tree (or HuggingFace org), so neither has to push files to the other.
+
+None of these require Witchgrid v1 code changes — just keep the model catalog shape generic enough that Merlina's outputs slot in cleanly.
+
 ## Relationship to flammen.ai
 
 Witchgrid is **not required** for flammen.ai to ship. flammen.ai (`~/Projects/flammenai/`) will run with hardcoded inference URLs (env vars) for v1 — `LLAMA_SERVER_URL`, `A1111_URL`. If/when Witchgrid lands, swapping flammen.ai over is a one-line config change: point those env vars at Witchgrid's routing API instead of the raw service URLs. Worker code doesn't change.
