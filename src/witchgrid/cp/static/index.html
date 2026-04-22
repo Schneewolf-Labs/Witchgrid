@@ -24,7 +24,58 @@
           <p class="muted">Polling…</p>
         </div>
       </section>
+
+      <section class="section">
+        <div class="section__head">
+          <h2>Services</h2>
+          <span id="services-count" class="muted">—</span>
+          <button id="open-spawn" class="btn btn--primary" type="button">+ Spawn</button>
+        </div>
+        <div id="services" class="grid">
+          <p class="muted">Nothing running.</p>
+        </div>
+      </section>
     </main>
+
+    <div id="spawn-backdrop" class="modal-backdrop" hidden>
+      <div class="modal">
+        <h3>Spawn service</h3>
+        <form id="spawn-form" class="form">
+          <label>
+            <span>Template</span>
+            <select name="template">
+              <option value="llama_server">llama_server</option>
+            </select>
+          </label>
+          <label>
+            <span>Node</span>
+            <select id="spawn-node" name="node_id"></select>
+          </label>
+          <label>
+            <span>Model path</span>
+            <input
+              type="text"
+              name="model_path"
+              placeholder="/home/you/AI/gguf_models/your-model.gguf"
+              required
+            />
+          </label>
+          <label>
+            <span>Context size</span>
+            <input type="number" name="context_size" value="8192" />
+          </label>
+          <label>
+            <span>GPU layers (-ngl)</span>
+            <input type="number" name="n_gpu_layers" value="999" />
+          </label>
+          <p id="spawn-error" class="error"></p>
+          <div class="modal__actions">
+            <button type="button" id="spawn-cancel" class="btn btn--ghost">Cancel</button>
+            <button type="submit" class="btn btn--primary">Spawn</button>
+          </div>
+        </form>
+      </div>
+    </div>
 
     <script src="/assets/app.js"></script>
   </body>

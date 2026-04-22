@@ -25,6 +25,41 @@ create table if not exists nodes (
     hardware          text not null                    -- JSON blob
 );
 create index if not exists nodes_last_heartbeat_idx on nodes(last_heartbeat_at);
+
+-- Spawned inference services. State machine:
+--   pending → starting → running
+--                     ↘  failed
+--   running → stopping → stopped
+create table if not exists services (
+    service_id     text primary key,
+    node_id        text not null references nodes(node_id) on delete cascade,
+    template       text not null,                      -- 'llama_server', etc.
+    config         text not null,                      -- JSON: model path, port, etc.
+    state          text not null,                      -- pending|starting|running|stopping|stopped|failed
+    pid            integer,
+    port           integer,
+    error          text,
+    created_at     text not null,
+    last_state_at  text not null
+);
+create index if not exists services_node_idx on services(node_id);
+create index if not exists services_state_idx on services(state);
+
+-- Commands queued for delivery to a node via heartbeat response.
+-- delivered_at marks "worker has been told"; completed_at marks
+-- "worker reported result back".
+create table if not exists commands (
+    command_id     text primary key,
+    node_id        text not null,
+    kind           text not null,                      -- spawn_service | stop_service
+    payload        text not null,                      -- JSON
+    issued_at      text not null,
+    delivered_at   text,
+    completed_at   text,
+    error          text
+);
+create index if not exists commands_node_undelivered_idx
+    on commands(node_id) where delivered_at is null;
 """
 
 

@@ -36,14 +36,55 @@ class RegisterResp(BaseModel):
     welcome: str = "joined the grid"
 
 
+class ServiceState(BaseModel):
+    """A service's current local state, as reported by the worker."""
+
+    service_id: str
+    state: str  # starting | running | stopping | stopped | failed
+    pid: int | None = None
+    port: int | None = None
+    error: str | None = None
+
+
+class CommandResult(BaseModel):
+    command_id: str
+    error: str | None = None
+
+
 class HeartbeatReq(BaseModel):
     hardware: Hardware
+    services: list[ServiceState] = Field(default_factory=list)
+    command_results: list[CommandResult] = Field(default_factory=list)
+
+
+class CommandToRun(BaseModel):
+    command_id: str
+    kind: str  # spawn_service | stop_service
+    payload: dict[str, Any]
 
 
 class HeartbeatResp(BaseModel):
     ok: bool = True
-    # Reserved for future: commands the CP wants this worker to run.
-    commands: list[dict[str, Any]] = Field(default_factory=list)
+    commands: list[CommandToRun] = Field(default_factory=list)
+
+
+class SpawnServiceReq(BaseModel):
+    node_id: str
+    template: str  # 'llama_server'
+    config: dict[str, Any]
+
+
+class ServiceView(BaseModel):
+    service_id: str
+    node_id: str
+    template: str
+    config: dict[str, Any]
+    state: str
+    pid: int | None
+    port: int | None
+    error: str | None
+    created_at: datetime
+    last_state_at: datetime
 
 
 class NodeView(BaseModel):
