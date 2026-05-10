@@ -1,0 +1,139 @@
+// http_server.hml — tiny HTTP/1.1 server for an internal control plane.
+//
+// Built on @stdlib/net.TcpListener. No keep-alive, no chunked transfer,
+// no streaming bodies, no TLS. Sufficient for JSON RPC + small HTML
+// pages on a trusted network. Dies on parse errors with 400.
+//
+// Handler shape:
+//   fn handler(req: Request) -> Response
+//   Request:  { method, path, headers (object), body (string) }
+//   Response: { status: i32, headers?: object, body?: string }
+//
+// Routes are matched exact path + exact method. No params, no globs —
+// add when needed.
+
+import { TcpListener } from "@stdlib/net";
+
+fn buf_to_string(buf): string {
+	// @stdlib/net hides __string_from_bytes; iterate bytes ourselves.
+	// Body is expected UTF-8; runes are unicode codepoints, so this
+	// is wrong for multi-byte chars but fine for ASCII JSON. Replace
+	// with a proper helper once we hit non-ASCII.
+	let out = "";
+	let i = 0;
+	while (i < buf.length) {
+		let r: rune = buf[i];
+		out = out + r;
+		i = i + 1;
+	}
+	return out;
+}
+
+export fn parse_request(stream): object {
+	let line = stream.read_line();
+	if (line == null || line.length == 0) {
+		return null;
+	}
+	let parts = line.split(" ");
+	if (parts.length < 2) {
+		return null;
+	}
+	let method = parts[0];
+	let path = parts[1];
+
+	let headers = {};
+	loop {
+		let h = stream.read_line();
+		if (h == null) { break; }
+		let trimmed = h.trim();
+		if (trimmed.length == 0) { break; }
+		let colon = trimmed.find(":");
+		if (colon > 0) {
+			let key = trimmed.substr(0, colon).trim().to_lower();
+			let value = trimmed.substr(colon + 1, trimmed.length - colon - 1).trim();
+			headers[key] = value;
+		}
+	}
+
+	let body = "";
+	if (headers.has("content-length")) {
+		let n = i32(headers["content-length"]);
+		if (n > 0) {
+			let buf = stream.read(n);
+			body = buf_to_string(buf);
+		}
+	}
+	return { method: method, path: path, headers: headers, body: body };
+}
+
+fn status_text(code: i32): string {
+	return match (code) {
+		200 => "OK",
+		201 => "Created",
+		204 => "No Content",
+		400 => "Bad Request",
+		404 => "Not Found",
+		405 => "Method Not Allowed",
+		500 => "Internal Server Error",
+		_ => "OK",
+	};
+}
+
+export fn write_response(stream, resp): null {
+	let status = resp.status;
+	let body = resp?.body ?? "";
+	let headers = resp?.headers ?? {};
+
+	if (body.length > 0 && !headers.has("content-type")) {
+		headers["content-type"] = "application/json";
+	}
+	headers["content-length"] = body.length;
+	headers["connection"] = "close";
+
+	stream.write("HTTP/1.1 " + status + " " + status_text(status) + "\r\n");
+	let keys = headers.keys();
+	for (k in keys) {
+		stream.write(k + ": " + headers[k] + "\r\n");
+	}
+	stream.write("\r\n");
+	if (body.length > 0) {
+		stream.write(body);
+	}
+	return null;
+}
+
+export fn dispatch(req, routes): object {
+	if (req == null) {
+		return { status: 400, body: "{\"error\":\"bad request\"}" };
+	}
+	for (route in routes) {
+		if (route.method == req.method && route.path == req.path) {
+			try {
+				return route.handler(req);
+			} catch (e) {
+				eprint("[error] " + req.method + " " + req.path + ": " + e);
+				return { status: 500, body: "{\"error\":\"internal\"}" };
+			}
+		}
+	}
+	return { status: 404, body: "{\"error\":\"not found\"}" };
+}
+
+// Serve forever on host:port. routes is array of { method, path, handler }.
+export fn serve(host: string, port: i32, routes): null {
+	let listener = TcpListener(host, port);
+	print("[http] listening on " + host + ":" + port);
+	loop {
+		let stream = listener.accept();
+		try {
+			let req = parse_request(stream);
+			let resp = dispatch(req, routes);
+			write_response(stream, resp);
+		} catch (e) {
+			eprint("[server] " + e);
+		}
+		stream.close();
+	}
+	return null;
+}
+

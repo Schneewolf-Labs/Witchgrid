@@ -1,0 +1,117 @@
+// cp.hml — Witchgrid control plane spike (Hemlock edition).
+//
+// Goal: prove out the stack — http server + sqlite + json + process spawn
+// work together cleanly enough to grow into v1.
+//
+// Endpoints:
+//   POST /register         { node_id, hostname, role, hardware }   → 200
+//   GET  /nodes                                                    → [...]
+//   GET  /healthz                                                  → ok
+//
+//   POST /services         { profile, model, port?, gpus? }        → 201
+//   GET  /services                                                 → [...]
+//   POST /services/stop    { id }                                  → 204
+//   GET  /profiles                                                 → [...]
+//
+// Run:    hemlock cp.hml
+// Build:  hemlockc cp.hml -o witchgrid && ./witchgrid
+
+import { open_db, exec, query, close_db } from "@stdlib/sqlite";
+import { parse, stringify } from "@stdlib/json";
+import { serve } from "./http_server";
+import { init_services_schema, make_handlers } from "./services";
+
+let DB_PATH = "witchgrid.db";
+let HOST = "0.0.0.0";
+let PORT = 8765;
+
+fn init_db(db): null {
+	exec(db, "create table if not exists nodes ("
+		+ "node_id text primary key,"
+		+ "hostname text not null,"
+		+ "role text not null,"
+		+ "hardware_json text not null,"
+		+ "registered_at text not null,"
+		+ "last_seen_at text not null"
+		+ ")", []);
+	return null;
+}
+
+// Globals are awkward but the spike's small enough to live with one.
+let DB = null;
+
+fn iso_now(): string {
+	// stdlib datetime gives us this; for the spike just use sqlite
+	// directly via a bound query.
+	let r = query(DB, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+fn handle_register(req): object {
+	let payload = parse(req.body);
+	let node_id = payload?.node_id;
+	let hostname = payload?.hostname;
+	if (node_id == null || hostname == null) {
+		return { status: 400, body: "{\"error\":\"node_id+hostname required\"}" };
+	}
+
+	let hw_json = stringify(payload?.hardware ?? {});
+	let now = iso_now();
+
+	exec(DB,
+		"insert into nodes (node_id, hostname, role, hardware_json, registered_at, last_seen_at) "
+		+ "values (?, ?, ?, ?, ?, ?) "
+		+ "on conflict(node_id) do update set "
+		+ "hostname=excluded.hostname, role=excluded.role, "
+		+ "hardware_json=excluded.hardware_json, last_seen_at=excluded.last_seen_at",
+		[node_id, hostname, payload?.role ?? "worker", hw_json, now, now]
+	);
+
+	let resp = { node_id: node_id, registered_at: now, welcome: "joined the grid" };
+	return { status: 200, body: stringify(resp) };
+}
+
+fn handle_list(req): object {
+	let rows = query(DB, "select node_id, hostname, role, hardware_json, registered_at, last_seen_at from nodes order by registered_at desc", []);
+	let out = [];
+	for (row in rows) {
+		out.push({
+			node_id: row.node_id,
+			hostname: row.hostname,
+			role: row.role,
+			hardware: parse(row.hardware_json),
+			registered_at: row.registered_at,
+			last_seen_at: row.last_seen_at,
+		});
+	}
+	return { status: 200, body: stringify(out) };
+}
+
+fn handle_health(req): object {
+	return { status: 200, body: "{\"status\":\"ok\"}" };
+}
+
+fn main(): null {
+	DB = open_db(DB_PATH);
+	init_db(DB);
+	init_services_schema(DB);
+	print("[cp] sqlite ready: " + DB_PATH);
+
+	let svc = make_handlers(DB);
+
+	let routes = [
+		{ method: "POST", path: "/register",      handler: handle_register },
+		{ method: "GET",  path: "/nodes",         handler: handle_list },
+		{ method: "GET",  path: "/healthz",       handler: handle_health },
+		{ method: "POST", path: "/services",      handler: svc.create },
+		{ method: "GET",  path: "/services",      handler: svc.list },
+		{ method: "POST", path: "/services/stop", handler: svc.stop },
+		{ method: "GET",  path: "/profiles",      handler: svc.profiles },
+	];
+
+	serve(HOST, PORT, routes);
+	close_db(DB);
+	return null;
+}
+
+main();

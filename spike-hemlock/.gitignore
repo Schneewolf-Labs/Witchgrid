@@ -1,0 +1,8 @@
+# Compiled binary (from `hemlockc cp.hml -o witchgrid`)
+witchgrid
+
+# Runtime sqlite state
+*.db
+*.db-journal
+*.db-shm
+*.db-wal

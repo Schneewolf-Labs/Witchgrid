@@ -1,0 +1,275 @@
+// services.hml — llama-server supervisor.
+//
+// The "fancy llama-server wrapper" pillar of Witchgrid v0.x: profile templates
+// encoding opinionated default flags (Merlina-style: 4-bit KV cache, 128K
+// context, no parallel slots), posix_spawn-detached children, sqlite-tracked
+// PIDs, SIGTERM-graceful shutdown.
+//
+// Spawn model: posix_spawn(["sh", "-c", "exec llama-server ... > log 2>&1"],
+// { setsid: true }). The `exec` builtin in sh replaces the shell with
+// llama-server in-place — no extra fork, the PID we hold IS llama-server's.
+// `setsid: true` makes the child a session leader so it survives the
+// supervisor going away. The sh wrapper stays only because Hemlock's stdlib
+// doesn't yet expose a raw-fd file-open (would let us pass `stdout: log_fd`
+// directly and drop sh entirely).
+//
+// Endpoints registered by cp.hml:
+//   POST /services            { profile, model, port?, gpus? }    → 201 {id,...}
+//   GET  /services                                                → [ {...} ]
+//   POST /services/stop       { id }                              → 204
+//   GET  /profiles                                                → [profile names]
+
+import { posix_spawn, kill } from "@stdlib/process";
+import { SIGTERM } from "@stdlib/signal";
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { parse, stringify } from "@stdlib/json";
+
+// IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
+// keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
+// libcrypto. The post-#531 codegen handles two FFI libs cleanly, but one
+// fewer dynamic dep on the deploy box is still worth keeping.
+fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(16)) as id", []);
+	return r[0].id;
+}
+
+// ── profiles ──────────────────────────────────────────────────────────
+// Encode the Merlina-style defaults. These are the *whole point* of v0.x:
+// no consumer should ever have to remember `--cache-type-k q4_0`.
+//
+// Object-literal keys must be bare identifiers in Hemlock; build via
+// bracket-assign so the *external* profile names can use dashes (which
+// is how operators write them and how URLs want them).
+
+fn build_profiles(): object {
+	let p = {};
+
+	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
+	// this quant for most chat workloads). Single slot — RP models hate
+	// slot-shared sampler state.
+	p["chat-mahou"] = {
+		binary: "llama-server",
+		flags: ["-c", "131072",
+				"--cache-type-k", "q4_0",
+				"--cache-type-v", "q4_0",
+				"-np", "1",
+				"-ngl", "99",
+				"-fa", "on"],
+		default_port: 8080,
+	};
+
+	// CPU profile — Q8 KV (quality > speed for grammar-constrained
+	// design pass), tighter context (designer prompts are short).
+	p["designer-cpu"] = {
+		binary: "llama-server",
+		flags: ["-c", "8192",
+				"--cache-type-k", "q8_0",
+				"--cache-type-v", "q8_0"],
+		default_port: 8081,
+	};
+
+	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
+	p["memory-phoenix"] = {
+		binary: "llama-server",
+		flags: ["-c", "32768",
+				"--cache-type-k", "q4_0",
+				"--cache-type-v", "q4_0",
+				"-ngl", "99",
+				"-fa", "on"],
+		default_port: 8085,
+	};
+
+	return p;
+}
+
+let PROFILES = build_profiles();
+
+// ── schema ────────────────────────────────────────────────────────────
+
+export fn init_services_schema(db): null {
+	db_exec(db, "create table if not exists services ("
+		+ "id text primary key,"
+		+ "profile text not null,"
+		+ "model_path text not null,"
+		+ "pid integer not null,"
+		+ "port integer not null,"
+		+ "log_path text not null,"
+		+ "args_json text not null,"
+		+ "started_at text not null"
+		+ ")", []);
+	return null;
+}
+
+// ── helpers ───────────────────────────────────────────────────────────
+
+fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+fn join_args(args): string {
+	// Naive shell quoting: wrap each arg in single quotes, escape any
+	// embedded single quotes the standard way ('"'"'). Good enough for
+	// llama-server flags + filesystem paths.
+	let out = "";
+	let i = 0;
+	while (i < args.length) {
+		let a = args[i];
+		let escaped = a.replace_all("'", "'\\''");
+		if (i > 0) { out = out + " "; }
+		out = out + "'" + escaped + "'";
+		i = i + 1;
+	}
+	return out;
+}
+
+fn process_alive(pid: i32): bool {
+	try {
+		kill(pid, 0);
+		return true;
+	} catch (e) {
+		return false;
+	}
+}
+
+// ── core: spawn ───────────────────────────────────────────────────────
+
+export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus): object {
+	if (!PROFILES.has(profile_name)) {
+		throw "unknown profile: " + profile_name;
+	}
+	let prof = PROFILES[profile_name];
+
+	// Build full argv: binary + profile flags + -m model + --port port
+	let argv = [prof.binary];
+	let i = 0;
+	while (i < prof.flags.length) {
+		argv.push(prof.flags[i]);
+		i = i + 1;
+	}
+	argv.push("-m"); argv.push(model_path);
+	argv.push("--port"); argv.push("" + port);
+	argv.push("--host"); argv.push("0.0.0.0");
+
+	let id = new_id(db);
+	let log_path = "/tmp/witchgrid-" + id + ".log";
+
+	// CUDA_VISIBLE_DEVICES from the gpus param (array of i32). Empty array
+	// means "all GPUs"; non-empty pins explicitly.
+	let env_prefix = "";
+	if (gpus != null && gpus.length > 0) {
+		let csv = "";
+		let g = 0;
+		while (g < gpus.length) {
+			if (g > 0) { csv = csv + ","; }
+			csv = csv + gpus[g];
+			g = g + 1;
+		}
+		env_prefix = "CUDA_VISIBLE_DEVICES=" + csv + " ";
+	}
+
+	// `exec` in sh replaces the shell with llama-server in the same PID slot.
+	// posix_spawn returns immediately with that PID; setsid:true makes the
+	// child a session leader so it survives us going away.
+	let shell_cmd = env_prefix + "exec " + join_args(argv)
+		+ " > " + log_path + " 2>&1 < /dev/null";
+	let result = posix_spawn(["sh", "-c", shell_cmd], { setsid: true });
+	let pid = result.pid;
+	if (pid <= 0) {
+		throw "posix_spawn returned invalid pid: " + pid;
+	}
+
+	let now = iso_now(db);
+	db_exec(db,
+		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?)",
+		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now]);
+
+	return {
+		id: id,
+		profile: profile_name,
+		model_path: model_path,
+		pid: pid,
+		port: port,
+		log_path: log_path,
+		started_at: now,
+	};
+}
+
+export fn list_services(db): array {
+	let rows = query(db,
+		"select id, profile, model_path, pid, port, log_path, started_at "
+		+ "from services order by started_at desc", []);
+	let out = [];
+	for (row in rows) {
+		out.push({
+			id: row.id,
+			profile: row.profile,
+			model_path: row.model_path,
+			pid: row.pid,
+			port: row.port,
+			log_path: row.log_path,
+			started_at: row.started_at,
+			alive: process_alive(row.pid),
+		});
+	}
+	return out;
+}
+
+export fn stop_service(db, id: string): bool {
+	let rows = query(db, "select pid from services where id = ?", [id]);
+	if (rows.length == 0) {
+		return false;
+	}
+	let pid = rows[0].pid;
+	if (process_alive(pid)) {
+		try { kill(pid, SIGTERM); } catch (e) { /* race with exit; fine */ }
+	}
+	db_exec(db, "delete from services where id = ?", [id]);
+	return true;
+}
+
+// ── HTTP handlers ─────────────────────────────────────────────────────
+
+export fn make_handlers(db): object {
+	return {
+		create: fn(req): object {
+			let payload = parse(req.body);
+			let profile = payload?.profile;
+			let model = payload?.model;
+			if (profile == null || model == null) {
+				return { status: 400, body: "{\"error\":\"profile+model required\"}" };
+			}
+			let port = payload?.port;
+			if (port == null) {
+				port = PROFILES[profile].default_port;
+			}
+			let gpus = payload?.gpus ?? [];
+			try {
+				let svc = spawn_service(db, profile, model, port, gpus);
+				return { status: 201, body: stringify(svc) };
+			} catch (e) {
+				return { status: 400, body: stringify({ error: "" + e }) };
+			}
+		},
+		list: fn(req): object {
+			return { status: 200, body: stringify(list_services(db)) };
+		},
+		stop: fn(req): object {
+			let payload = parse(req.body);
+			let id = payload?.id;
+			if (id == null) {
+				return { status: 400, body: "{\"error\":\"id required\"}" };
+			}
+			let ok = stop_service(db, id);
+			if (!ok) {
+				return { status: 404, body: "{\"error\":\"not found\"}" };
+			}
+			return { status: 204, body: "" };
+		},
+		profiles: fn(req): object {
+			let names = PROFILES.keys();
+			return { status: 200, body: stringify(names) };
+		},
+	};
+}
