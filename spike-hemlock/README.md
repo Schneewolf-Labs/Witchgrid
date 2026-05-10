@@ -7,7 +7,7 @@ A port of the smallest useful slice of Witchgrid v0.3 to [Hemlock](https://hemla
 ## What's here
 
 - `http_server.hml` — minimal HTTP/1.1 server on `@stdlib/net.TcpListener`. ~120 lines. Routes match exact `(method, path)`. No keep-alive, no chunked, no TLS.
-- `services.hml` — llama-server supervisor. Profile templates with opinionated defaults (4-bit KV cache, 128K context, single slot, GPU-pinned), `posix_spawn`-detached children (via `sh -c "exec ... > log"` so the PID slot ends up holding llama-server, with `setsid: true` for terminal detachment), sqlite-tracked PIDs.
+- `services.hml` — llama-server supervisor. Profile templates with opinionated defaults (4-bit KV cache, 128K context, single slot, GPU-pinned), `posix_spawn` directly on argv (no shell wrapper) with raw fds for log/dev-null redirection via `fs.open_fd`, `setsid: true` for terminal detachment, `setenv`/`unsetenv` around the spawn for transient `CUDA_VISIBLE_DEVICES` (parent's env stays clean), sqlite-tracked PIDs.
 - `cp.hml` — control plane. Endpoints:
   - `POST /register` — upsert a node into sqlite
   - `GET  /nodes` — list registered nodes

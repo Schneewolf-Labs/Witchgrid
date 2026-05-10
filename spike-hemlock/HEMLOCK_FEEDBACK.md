@@ -83,19 +83,20 @@ This works (the `&` detaches, `echo $!` returns the child PID, the parent shell 
 
 For Witchgrid we use `posix_spawn(["sh", "-c", "exec llama-server ... > log 2>&1"], { setsid: true })`. The shell wrapper stays only because we can't open a log file *as an fd* from Hemlock yet — `fs.open(path, mode)` returns a `File` object, not an `i32`. See ⚠️ #5 follow-up below.
 
-### 4b. ⚠️ OPEN follow-up — no `fs.open_fd(path, mode) -> i32`
+### 4b. ✅ FIXED follow-up — `fs.open_fd` + `fs.fileno` (PR #534)
 
-To fully drop the shell wrapper from a process supervisor, we'd want:
+Both shipped exactly as proposed. Witchgrid's services.hml now does direct posix_spawn with no shell wrapper:
 
 ```hemlock
-let log_fd = fs.open_fd("/tmp/svc.log", "w");   // O_WRONLY|O_CREAT|O_TRUNC
-let r = posix_spawn(["llama-server", ...], {
-    stdout: log_fd, stderr: log_fd, setsid: true,
+let log_fd = open_fd(log_path, "w");
+let null_fd = open_fd("/dev/null", "r");
+let r = posix_spawn(argv, {
+    stdin: null_fd, stdout: log_fd, stderr: log_fd, setsid: true,
 });
-fd_close(log_fd);  // parent's copy; child's dup2'd copies survive
+fd_close(log_fd); fd_close(null_fd);
 ```
 
-Equivalently: expose `fileno(file)` so `fs.open()`'s File object can yield its fd. Either works. Without it, anyone composing posix_spawn with file redirection has to round-trip through `["sh", "-c", "..."]` for the open + dup2 step.
+Verified end-to-end: PPID of llama-server is the witchgrid binary directly (no sh in the chain), `CUDA_VISIBLE_DEVICES` propagates to the child via setenv-around-spawn and the parent's environ stays clean. Shell-injection surface area dropped to zero.
 
 ---
 

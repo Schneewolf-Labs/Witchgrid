@@ -5,13 +5,14 @@
 // context, no parallel slots), posix_spawn-detached children, sqlite-tracked
 // PIDs, SIGTERM-graceful shutdown.
 //
-// Spawn model: posix_spawn(["sh", "-c", "exec llama-server ... > log 2>&1"],
-// { setsid: true }). The `exec` builtin in sh replaces the shell with
-// llama-server in-place — no extra fork, the PID we hold IS llama-server's.
-// `setsid: true` makes the child a session leader so it survives the
-// supervisor going away. The sh wrapper stays only because Hemlock's stdlib
-// doesn't yet expose a raw-fd file-open (would let us pass `stdout: log_fd`
-// directly and drop sh entirely).
+// Spawn model: open the log file and /dev/null as raw fds via fs.open_fd,
+// hand them to posix_spawn as stdout/stderr/stdin redirects, set setsid:true
+// so the child becomes its own session leader and survives us going away.
+// No shell wrapper, no argv quoting, no shell-injection surface.
+//
+// CUDA_VISIBLE_DEVICES: setenv on the parent immediately before spawn
+// (children inherit env), unsetenv immediately after. cp.hml's HTTP loop
+// is single-threaded so there's no race window.
 //
 // Endpoints registered by cp.hml:
 //   POST /services            { profile, model, port?, gpus? }    → 201 {id,...}
@@ -21,6 +22,9 @@
 
 import { posix_spawn, kill } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
+import { setenv, unsetenv } from "@stdlib/env";
+import { open_fd } from "@stdlib/fs";
+import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 
@@ -107,22 +111,6 @@ fn iso_now(db): string {
 	return r[0].ts;
 }
 
-fn join_args(args): string {
-	// Naive shell quoting: wrap each arg in single quotes, escape any
-	// embedded single quotes the standard way ('"'"'). Good enough for
-	// llama-server flags + filesystem paths.
-	let out = "";
-	let i = 0;
-	while (i < args.length) {
-		let a = args[i];
-		let escaped = a.replace_all("'", "'\\''");
-		if (i > 0) { out = out + " "; }
-		out = out + "'" + escaped + "'";
-		i = i + 1;
-	}
-	return out;
-}
-
 fn process_alive(pid: i32): bool {
 	try {
 		kill(pid, 0);
@@ -154,10 +142,17 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 	let id = new_id(db);
 	let log_path = "/tmp/witchgrid-" + id + ".log";
 
-	// CUDA_VISIBLE_DEVICES from the gpus param (array of i32). Empty array
-	// means "all GPUs"; non-empty pins explicitly.
-	let env_prefix = "";
-	if (gpus != null && gpus.length > 0) {
+	// Open the log file (truncate) and /dev/null (read) as raw fds so
+	// posix_spawn can dup2 them onto the child's std{in,out,err}.
+	let log_fd = open_fd(log_path, "w");
+	let null_fd = open_fd("/dev/null", "r");
+
+	// CUDA_VISIBLE_DEVICES via setenv around the spawn. posix_spawn's `env`
+	// opt would *replace* the parent env (losing PATH/HOME/etc), so we
+	// mutate the parent env transiently instead — children inherit, then
+	// we restore. Safe because cp.hml is single-threaded.
+	let pinned = (gpus != null && gpus.length > 0);
+	if (pinned) {
 		let csv = "";
 		let g = 0;
 		while (g < gpus.length) {
@@ -165,15 +160,22 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 			csv = csv + gpus[g];
 			g = g + 1;
 		}
-		env_prefix = "CUDA_VISIBLE_DEVICES=" + csv + " ";
+		setenv("CUDA_VISIBLE_DEVICES", csv);
 	}
 
-	// `exec` in sh replaces the shell with llama-server in the same PID slot.
-	// posix_spawn returns immediately with that PID; setsid:true makes the
-	// child a session leader so it survives us going away.
-	let shell_cmd = env_prefix + "exec " + join_args(argv)
-		+ " > " + log_path + " 2>&1 < /dev/null";
-	let result = posix_spawn(["sh", "-c", shell_cmd], { setsid: true });
+	let result = posix_spawn(argv, {
+		stdin: null_fd,
+		stdout: log_fd,
+		stderr: log_fd,
+		setsid: true,
+	});
+
+	if (pinned) {
+		unsetenv("CUDA_VISIBLE_DEVICES");
+	}
+	fd_close(log_fd);
+	fd_close(null_fd);
+
 	let pid = result.pid;
 	if (pid <= 0) {
 		throw "posix_spawn returned invalid pid: " + pid;
