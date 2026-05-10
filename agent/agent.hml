@@ -1,0 +1,125 @@
+// agent.hml — Witchgrid node agent.
+//
+// Runs on every box that hosts inference. On boot:
+//   1. Probe hardware (nvidia-smi if GPU box, empty if CPU-only).
+//   2. POST /register to the control plane with { node_id, hostname,
+//      role, hardware, agent_url } so CP knows where to reach us.
+//   3. Open sqlite, init the local services schema.
+//   4. Listen on AGENT_PORT for service-supervisor requests from CP.
+//
+// CP is the only intended caller — agents don't need to be reachable
+// from the public internet, just from CP. Bind to 0.0.0.0 by default
+// so a CP on another box on the LAN can reach us; override AGENT_HOST
+// to lock down further.
+//
+// Endpoints:
+//   POST /services         { profile, model, port?, gpus? }   → 201 {id,...}
+//   GET  /services                                            → [...]
+//   POST /services/stop    { id }                             → 204
+//   GET  /profiles                                            → [profile names]
+//   GET  /healthz                                             → ok
+//
+// Config (env vars):
+//   WITCHGRID_CP_URL       e.g. http://192.168.8.154:8765   (required)
+//   WITCHGRID_AGENT_URL    e.g. http://192.168.8.217:8766   (required;
+//                          what URL CP can reach this agent at — not
+//                          derivable, since the agent might be behind
+//                          NAT or have multiple interfaces)
+//   WITCHGRID_AGENT_HOST   bind address                       (default 0.0.0.0)
+//   WITCHGRID_AGENT_PORT   bind port                          (default 8766)
+//   WITCHGRID_NODE_ID      stable identifier                  (default $HOSTNAME)
+
+import { open_db, close_db } from "@stdlib/sqlite";
+import { stringify } from "@stdlib/json";
+import { getenv } from "@stdlib/env";
+import { exec_argv } from "@stdlib/process";
+import { post_json } from "@stdlib/http";
+import { serve } from "./http_server";
+import { init_services_schema, make_handlers } from "./services";
+import { probe } from "./hardware";
+
+let DB_PATH = "witchgrid-agent.db";
+
+fn require_env(name: string): string {
+	let v = getenv(name);
+	if (v == null || v.length == 0) {
+		eprint("[agent] missing required env var: " + name);
+		throw "missing env: " + name;
+	}
+	return v;
+}
+
+fn env_or(name: string, default_value: string): string {
+	let v = getenv(name);
+	if (v == null || v.length == 0) { return default_value; }
+	return v;
+}
+
+fn detect_hostname(): string {
+	try {
+		let r = exec_argv(["hostname"]);
+		if (r.exit_code == 0) { return r.output.trim(); }
+	} catch (e) { }
+	return "unknown";
+}
+
+fn register_with_cp(cp_url: string, payload): null {
+	let url = cp_url + "/register";
+	print("[agent] registering with CP at " + url);
+	try {
+		let resp = post_json(url, payload);
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			print("[agent] registered OK: " + resp.body);
+		} else {
+			eprint("[agent] CP returned " + resp.status_code + ": " + resp.body);
+		}
+	} catch (e) {
+		// Non-fatal: agent stays up, retry happens on the next operator-
+		// triggered re-register (heartbeat loop is a future slice).
+		eprint("[agent] register failed: " + e + " (continuing; CP can re-register us later)");
+	}
+	return null;
+}
+
+fn main(): null {
+	let cp_url     = require_env("WITCHGRID_CP_URL");
+	let agent_url  = require_env("WITCHGRID_AGENT_URL");
+	let host       = env_or("WITCHGRID_AGENT_HOST", "0.0.0.0");
+	let port_str   = env_or("WITCHGRID_AGENT_PORT", "8766");
+	let port       = i32(port_str);
+	let hostname   = detect_hostname();
+	let node_id    = env_or("WITCHGRID_NODE_ID", hostname);
+
+	let hw = probe();
+	print("[agent] " + node_id + " (" + hostname + ", " + hw.role + ") "
+		+ "with " + hw.gpus.length + " GPU(s)");
+
+	register_with_cp(cp_url, {
+		node_id:   node_id,
+		hostname:  hostname,
+		role:      hw.role,
+		hardware:  hw,
+		agent_url: agent_url,
+	});
+
+	let db = open_db(DB_PATH);
+	init_services_schema(db);
+	print("[agent] sqlite ready: " + DB_PATH);
+
+	let svc = make_handlers(db);
+	let routes = [
+		{ method: "POST", path: "/services",      handler: svc.create },
+		{ method: "GET",  path: "/services",      handler: svc.list },
+		{ method: "POST", path: "/services/stop", handler: svc.stop },
+		{ method: "GET",  path: "/profiles",      handler: svc.profiles },
+		{ method: "GET",  path: "/healthz",       handler: fn(req): object {
+			return { status: 200, body: "{\"status\":\"ok\"}" };
+		} },
+	];
+
+	serve(host, port, routes);
+	close_db(db);
+	return null;
+}
+
+main();

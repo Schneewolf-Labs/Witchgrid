@@ -1,0 +1,8 @@
+# Compiled binary (from `hemlockc agent.hml -o witchgrid-agent`)
+witchgrid-agent
+
+# Runtime sqlite state
+*.db
+*.db-journal
+*.db-shm
+*.db-wal

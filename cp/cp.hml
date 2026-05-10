@@ -1,29 +1,44 @@
-// cp.hml — Witchgrid control plane spike (Hemlock edition).
+// cp.hml — Witchgrid control plane.
 //
-// Goal: prove out the stack — http server + sqlite + json + process spawn
-// work together cleanly enough to grow into v1.
+// Owns the node registry. Service-supervisor work happens on agents
+// (one per node, see ../agent/); CP routes spawn/list/stop requests to
+// the agent that owns each service.
 //
 // Endpoints:
-//   POST /register         { node_id, hostname, role, hardware }   → 200
-//   GET  /nodes                                                    → [...]
-//   GET  /healthz                                                  → ok
+//   POST /register         { node_id, hostname, role, hardware,
+//                            agent_url }                         → 200
+//   GET  /nodes                                                  → [...]
+//   GET  /healthz                                                → ok
 //
-//   POST /services         { profile, model, port?, gpus? }        → 201
-//   GET  /services                                                 → [...]
-//   POST /services/stop    { id }                                  → 204
-//   GET  /profiles                                                 → [...]
+//   POST /services         { node_id, profile, model, port?,
+//                            gpus? }                             → 201
+//                          (proxied to the named agent)
+//   GET  /services                                               → [...]
+//                          (aggregated from every registered agent;
+//                           each entry tagged with node_id)
+//   POST /services/stop    { id, node_id }                       → 204
+//                          (proxied to the named agent)
+//
+//   * /v1/llama/{profile}/{...}                                  → proxy
+//                          (routes to a running llama-server with the
+//                           given profile; CP forwards the request
+//                           directly to llama-server, agents stay off
+//                           the inference data path)
 //
 // Run:    hemlock cp.hml
-// Build:  hemlockc cp.hml -o witchgrid && ./witchgrid
+// Build:  hemlockc cp.hml -o witchgrid-cp && ./witchgrid-cp
 
 import { open_db, exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
+import { post_json, get, request as http_request } from "@stdlib/http";
 import { serve } from "./http_server";
-import { init_services_schema, make_handlers } from "./services";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
 let PORT = 8765;
+
+// One global db handle — cp.hml is small enough to live with it.
+let DB = null;
 
 fn init_db(db): null {
 	exec(db, "create table if not exists nodes ("
@@ -31,21 +46,19 @@ fn init_db(db): null {
 		+ "hostname text not null,"
 		+ "role text not null,"
 		+ "hardware_json text not null,"
+		+ "agent_url text,"
 		+ "registered_at text not null,"
 		+ "last_seen_at text not null"
 		+ ")", []);
 	return null;
 }
 
-// Globals are awkward but the spike's small enough to live with one.
-let DB = null;
-
 fn iso_now(): string {
-	// stdlib datetime gives us this; for the spike just use sqlite
-	// directly via a bound query.
 	let r = query(DB, "select datetime('now') as ts", []);
 	return r[0].ts;
 }
+
+// ── node registry ────────────────────────────────────────────────────
 
 fn handle_register(req): object {
 	let payload = parse(req.body);
@@ -56,23 +69,28 @@ fn handle_register(req): object {
 	}
 
 	let hw_json = stringify(payload?.hardware ?? {});
+	let agent_url = payload?.agent_url;
 	let now = iso_now();
 
 	exec(DB,
-		"insert into nodes (node_id, hostname, role, hardware_json, registered_at, last_seen_at) "
-		+ "values (?, ?, ?, ?, ?, ?) "
+		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at) "
+		+ "values (?, ?, ?, ?, ?, ?, ?) "
 		+ "on conflict(node_id) do update set "
 		+ "hostname=excluded.hostname, role=excluded.role, "
-		+ "hardware_json=excluded.hardware_json, last_seen_at=excluded.last_seen_at",
-		[node_id, hostname, payload?.role ?? "worker", hw_json, now, now]
+		+ "hardware_json=excluded.hardware_json, agent_url=excluded.agent_url, "
+		+ "last_seen_at=excluded.last_seen_at",
+		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now]
 	);
 
-	let resp = { node_id: node_id, registered_at: now, welcome: "joined the grid" };
-	return { status: 200, body: stringify(resp) };
+	return { status: 200, body: stringify({
+		node_id: node_id, registered_at: now, welcome: "joined the grid",
+	})};
 }
 
-fn handle_list(req): object {
-	let rows = query(DB, "select node_id, hostname, role, hardware_json, registered_at, last_seen_at from nodes order by registered_at desc", []);
+fn handle_list_nodes(req): object {
+	let rows = query(DB,
+		"select node_id, hostname, role, hardware_json, agent_url, "
+		+ "registered_at, last_seen_at from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
 		out.push({
@@ -80,6 +98,7 @@ fn handle_list(req): object {
 			hostname: row.hostname,
 			role: row.role,
 			hardware: parse(row.hardware_json),
+			agent_url: row.agent_url,
 			registered_at: row.registered_at,
 			last_seen_at: row.last_seen_at,
 		});
@@ -91,22 +110,205 @@ fn handle_health(req): object {
 	return { status: 200, body: "{\"status\":\"ok\"}" };
 }
 
+// ── agent lookup ─────────────────────────────────────────────────────
+
+// Returns the agent_url for node_id, or null if the node isn't registered
+// or registered without an agent_url. Caller must check for null.
+fn lookup_agent(node_id: string) {
+	let rows = query(DB, "select agent_url from nodes where node_id = ?", [node_id]);
+	if (rows.length == 0 || rows[0].agent_url == null) {
+		return null;
+	}
+	return rows[0].agent_url;
+}
+
+fn list_all_agents(): array {
+	let rows = query(DB, "select node_id, agent_url from nodes "
+		+ "where agent_url is not null", []);
+	return rows;
+}
+
+// ── service proxy ────────────────────────────────────────────────────
+
+fn handle_spawn_proxy(req): object {
+	let payload = parse(req.body);
+	let node_id = payload?.node_id;
+	if (node_id == null) {
+		return { status: 400, body: "{\"error\":\"node_id required (capacity-aware placement is a future slice)\"}" };
+	}
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
+	}
+
+	// Forward exactly the spawn request the agent expects (drop node_id
+	// since the agent doesn't need it).
+	let agent_payload = {
+		profile: payload?.profile,
+		model:   payload?.model,
+		port:    payload?.port,
+		gpus:    payload?.gpus,
+	};
+	try {
+		let resp = post_json(agent_url + "/services", agent_payload);
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
+fn handle_stop_proxy(req): object {
+	let payload = parse(req.body);
+	let id = payload?.id;
+	let node_id = payload?.node_id;
+	if (id == null || node_id == null) {
+		return { status: 400, body: "{\"error\":\"id+node_id required\"}" };
+	}
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
+	}
+	try {
+		let resp = post_json(agent_url + "/services/stop", { id: id });
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
+fn handle_list_services(req): object {
+	// Aggregate from every registered agent. Each service is tagged with
+	// its owning node_id so subsequent stop calls know where to route.
+	let agents = list_all_agents();
+	let merged = [];
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/services", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let entries = parse(resp.body);
+				for (e in entries) {
+					e["node_id"] = a.node_id;
+					merged.push(e);
+				}
+			}
+		} catch (e) {
+			// Agent unreachable — skip; we'll surface in /nodes as a stale
+			// last_seen_at once heartbeats land.
+		}
+	}
+	return { status: 200, body: stringify(merged) };
+}
+
+// ── inference routing ────────────────────────────────────────────────
+// /v1/llama/{profile}/{...} → http://{agent_host}:{service_port}/{...}
+//
+// CP looks up a running service by profile, derives the llama-server URL
+// from the agent's host (we already store agent_url) and the service's
+// port, then forwards the request directly. Agents stay off the data path
+// — every chat reply going through the agent just to reach llama-server
+// would tax latency for no architectural benefit.
+
+let LLAMA_PREFIX = "/v1/llama/";
+
+// Strip the URL scheme + port off agent_url, leaving just the host.
+//   "http://192.168.8.154:8766" → "192.168.8.154"
+//   "http://localhost:8766"     → "localhost"
+fn extract_host(agent_url: string): string {
+	let rest = agent_url;
+	let scheme = rest.find("://");
+	if (scheme >= 0) { rest = rest.substr(scheme + 3, rest.length - scheme - 3); }
+	let slash = rest.find("/");
+	if (slash >= 0) { rest = rest.substr(0, slash); }
+	let colon = rest.find(":");
+	if (colon >= 0) { rest = rest.substr(0, colon); }
+	return rest;
+}
+
+// Pick the first running service matching this profile. Returns
+// { agent_host, port } or null. Round-robin / placement is a later slice.
+fn find_service_for_profile(profile_name: string) {
+	let agents = list_all_agents();
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/services", null);
+			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
+			let entries = parse(resp.body);
+			for (e in entries) {
+				if (e?.profile == profile_name && e?.alive == true) {
+					return {
+						agent_host: extract_host(a.agent_url),
+						port: e.port,
+					};
+				}
+			}
+		} catch (err) {
+			// Agent unreachable; try next.
+		}
+	}
+	return null;
+}
+
+fn handle_llama_proxy(req): object {
+	// req.path is "/v1/llama/chat-mahou/completion"; split off the profile
+	// and the suffix that goes to llama-server.
+	let after = req.path.substr(LLAMA_PREFIX.length,
+		req.path.length - LLAMA_PREFIX.length);
+	let slash = after.find("/");
+	let profile_name = "";
+	let suffix = "";
+	if (slash < 0) {
+		profile_name = after;
+		suffix = "/";
+	} else {
+		profile_name = after.substr(0, slash);
+		suffix = after.substr(slash, after.length - slash);
+	}
+	if (profile_name.length == 0) {
+		return { status: 400, body: "{\"error\":\"profile required: /v1/llama/{profile}/{path}\"}" };
+	}
+
+	let target = find_service_for_profile(profile_name);
+	if (target == null) {
+		return { status: 503, body: stringify({
+			error: "no running service for profile: " + profile_name,
+		})};
+	}
+
+	let target_url = "http://" + target.agent_host + ":" + target.port + suffix;
+	// Forward as JSON for now — every llama-server endpoint we care about
+	// (completion, chat/completions, embeddings) takes JSON. Generalize when
+	// we add image gen / multipart paths.
+	let headers = ["Content-Type: application/json"];
+	try {
+		let resp = http_request(req.method, target_url, req.body, headers);
+		// Body might be JSON or text — pass through unchanged. Status from
+		// llama-server is the final word.
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({
+			error: "llama-server unreachable at " + target_url + ": " + e,
+		})};
+	}
+}
+
+// ── boot ─────────────────────────────────────────────────────────────
+
 fn main(): null {
 	DB = open_db(DB_PATH);
 	init_db(DB);
-	init_services_schema(DB);
 	print("[cp] sqlite ready: " + DB_PATH);
-
-	let svc = make_handlers(DB);
 
 	let routes = [
 		{ method: "POST", path: "/register",      handler: handle_register },
-		{ method: "GET",  path: "/nodes",         handler: handle_list },
+		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes },
 		{ method: "GET",  path: "/healthz",       handler: handle_health },
-		{ method: "POST", path: "/services",      handler: svc.create },
-		{ method: "GET",  path: "/services",      handler: svc.list },
-		{ method: "POST", path: "/services/stop", handler: svc.stop },
-		{ method: "GET",  path: "/profiles",      handler: svc.profiles },
+		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
+		{ method: "GET",  path: "/services",      handler: handle_list_services },
+		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
+		// Inference routing — prefix-matches anything under /v1/llama/.
+		// method "*" means any HTTP method is forwarded.
+		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
+		  prefix: true },
 	];
 
 	serve(HOST, PORT, routes);
