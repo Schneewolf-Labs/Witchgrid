@@ -59,7 +59,7 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 
 ## Open design decisions
 
-- **Language.** Python (matches AI ecosystem, easy CUDA/diffusers/transformers/nvidia-smi integration, fast iteration) vs Go/Rust (single binary, low overhead, better daemon ergonomics) vs Node (consistency with sibling Node projects). **Leaning Python** for v1; rewrite-for-perf later if it becomes a real product.
+- **Language: Hemlock** ([hemlang.dev](https://hemlang.dev)). Python prototype shipped through v0.3 (now in `legacy-python/`); v1 is being built in Hemlock because the deploy story (single ~1 MB ELF, deps `libm/libffi/libcrypto/libc` universal on every Linux box) is dramatically better for "agent that drops onto every box in the fleet." `nvidia-smi --query-gpu` over `exec()` covers the GPU introspection that diffusers/transformers would have given us in Python. The 7-issue language-evaluation writeup that informed this lives in `docs/hemlock-feedback-archive.md` — all seven items are now resolved upstream in Hemlock 2.1.x.
 - **Service templating format.** Hand-written shell vs declarative YAML vs systemd unit generation. Probably **YAML descriptors** + a small executor.
 - **Model storage.** Catalog only knows where models live on each node — does Witchgrid push models around to other nodes (sync), or just refuse to schedule jobs on nodes that don't have them? **Read-only catalog v1**, push later if it earns its keep.
 - **Concurrent loading on a single GPU.** Naive VRAM accounting (subtract claimed VRAM from total) gets you 80% of the way; precise accounting needs talking to CUDA, which is hairy. **Start naive.**
@@ -101,14 +101,22 @@ flammen.ai is the **first consumer** Witchgrid is designed against. The features
 
 ## Status
 
-Project not yet started. This document is the starting point.
+**v0.3 Python shipped** (`legacy-python/`): control plane + node agent + dashboard + spawn/stop + round-robin routing. Frozen — no new features there.
 
-## Roadmap (proposed; needs sign-off)
+**v1 Hemlock build in progress** (`cp/`): node registry + service supervisor are working, both on the interpreter and the compiled binary, end-to-end tested against real `llama-server`. Next slice is the agent split.
 
-1. **Single-node control plane + node agent.** Agent registers with control plane, reports hardware. No service spawning yet — just visibility.
-2. **Dashboard MVP.** Read-only view of nodes + their state.
-3. **Service templates + spawn API.** Define `llama-server` and A1111 as templates; control plane can start/stop them on a node.
-4. **Multi-node.** Second node agent; control plane handles >1.
-5. **Routing API.** OpenAI-compatible endpoint that proxies to a running instance.
-6. **Capacity-aware placement.** Pick the right node for a request based on free VRAM + loaded models.
-7. **Model catalog + scanning.** Discover available models on each node.
+## Roadmap
+
+Near-term, in order:
+
+1. **Agent split.** Extract the service supervisor from `cp/` into `agent/`. CP routes spawn jobs to the appropriate agent over HTTP instead of running them in-process. This unlocks every multi-node feature below.
+2. **Hardware introspection.** Agent calls `nvidia-smi --query-gpu=name,memory.total,memory.free,uuid --format=csv,noheader` and reports per-GPU state on `/register` and via heartbeat. CP stores in the node registry.
+3. **Routing API.** Port the v0.3 `POST /v1/llama/{model}/*` proxy to Hemlock. Round-robin across registered instances. This is the moment flammen.ai can swap from per-service URLs to a single `WITCHGRID_URL`.
+4. **Capability introspection.** Parse `llama-server --help` once per binary at registration time, store the flag set in sqlite, derive argv from intent (`flash_attention: true`) instead of hardcoding `-fa on`. Profiles outlast llama.cpp upgrades. See `docs/llama-cpp-as-managed-runtime.md` for the long form.
+5. **Capacity-aware placement.** Use per-GPU free VRAM + a model spec (size, KV-cache budget) to pick (node, GPU set) for spawn requests. Naive accounting (subtract claimed VRAM) gets 80% of the value.
+6. **Health checks + routing exclusion.** Liveness probe on each registered service; wedged ones drop out of the round-robin pool.
+7. **Auto-spawn on first request.** If a route comes in for `mahou` and no instance is running, the placement algorithm picks a node + spawns transparently. Converts model-swap from "deploy" to "request."
+8. **Dashboard.** htmx + jinja2 (Hemlock has it), server-rendered. Read-only view first; manual controls layered on.
+9. **Model catalog.** Each agent scans known dirs (`~/AI/gguf_models`, A1111 checkpoints) and reports what's *available*, not just loaded.
+
+Longer-term — see `docs/llama-cpp-as-managed-runtime.md` for the "Witchgrid as the llama.cpp manager" brainstorm (vendoring binaries, prebuilt download, source build, eventual auto-canary). Not v1, but the architecture should leave room.
