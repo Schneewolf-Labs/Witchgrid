@@ -4,11 +4,15 @@ Built a small HTTP control plane (~250 lines across `http_server.hml`, `cp.hml`,
 
 These are the friction points worth filing as separate issues.
 
-> **Update 2026-05-10**:
-> - Items #1, #2, #3 fixed by **c5ced27** ("fix three compiler-strictness parity gaps").
-> - Item #4 fixed by **#533** (`posix_spawn` primitive landed in `@stdlib/process`).
-> - Item #5 fixed by **#531** (per-library FFI handles).
-> Items #6 and #7 still open. Witchgrid spike now uses `posix_spawn(["sh","-c","exec ... > log 2>&1"], { setsid: true })` — `exec` in sh keeps the PID slot, `setsid` detaches as session leader. Verified `ps -p $PID -o sid` returns SID == PID, so detachment works. The shell wrapper stays only because there's no raw-fd file-open API yet (see suggested follow-up at the end).
+> **Update 2026-05-10** (final): every item below now resolved upstream.
+> - Items #1, #2, #3: c5ced27 ("fix three compiler-strictness parity gaps")
+> - Item #4: #533 (`posix_spawn` primitive in `@stdlib/process`)
+> - Item #4b follow-up: #534 (`fs.open_fd` + `fs.fileno` raw-fd file open)
+> - Item #5: #531 (per-library FFI handles — closes the silent-corruption-on-two-imports bug)
+> - Items #6, #7: #535 (string-literal object-literal keys + `obj?[key]` safe-index)
+> - Bonus: build-system fix in flight ([fix-incremental-build-deps branch](https://github.com/hemlang/hemlock/pull/new/fix-incremental-build-deps)) — Makefile didn't track header deps, so any header-touching commit silently produced miscompiled binaries on incremental `make`.
+>
+> Witchgrid spike now: direct `posix_spawn(argv, { stdin: null_fd, stdout: log_fd, stderr: log_fd, setsid: true })` with no shell wrapper anywhere. Object-literal profile names use the natural string-key syntax. **Hemlock 2.1.x is fully ready for v1 of Witchgrid.**
 
 ---
 
@@ -141,7 +145,7 @@ This isn't a theoretical issue — we hit it the first time we ran the compiled 
 
 ---
 
-## 6. ⚠️ OPEN — Object literal keys must be bare identifiers, not strings
+## 6. ✅ FIXED — Object literal keys must be bare identifiers (PR #535)
 
 **Severity:** Low — workaround is fine, but the parser error is misleading.
 
@@ -164,9 +168,9 @@ Fine, but the parser error `Expect field name` doesn't suggest the bracket-assig
 
 ---
 
-## 7. (Minor) — `obj["key"]` throws on missing key, asymmetric to other dynamic-typed languages
+## 7. ✅ FIXED — `obj["key"]` asymmetry (PR #535, same change as #6)
 
-`obj.foo` requires `obj?.foo` for optional access (rightly, post-c5ced27). `obj["foo"]` does too — but the error doesn't suggest `?.` for the bracket form, and there's no `obj?["foo"]` syntax. Workaround: `obj.has("foo")` first. Just an ergonomics observation.
+`obj?[key]` safe-index syntax shipped alongside the string-key fix. Symmetric with `obj?.foo`.
 
 ---
 

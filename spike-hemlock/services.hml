@@ -40,18 +40,12 @@ fn new_id(db): string {
 // ── profiles ──────────────────────────────────────────────────────────
 // Encode the Merlina-style defaults. These are the *whole point* of v0.x:
 // no consumer should ever have to remember `--cache-type-k q4_0`.
-//
-// Object-literal keys must be bare identifiers in Hemlock; build via
-// bracket-assign so the *external* profile names can use dashes (which
-// is how operators write them and how URLs want them).
 
-fn build_profiles(): object {
-	let p = {};
-
+let PROFILES = {
 	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
 	// this quant for most chat workloads). Single slot — RP models hate
 	// slot-shared sampler state.
-	p["chat-mahou"] = {
+	"chat-mahou": {
 		binary: "llama-server",
 		flags: ["-c", "131072",
 				"--cache-type-k", "q4_0",
@@ -60,20 +54,20 @@ fn build_profiles(): object {
 				"-ngl", "99",
 				"-fa", "on"],
 		default_port: 8080,
-	};
+	},
 
 	// CPU profile — Q8 KV (quality > speed for grammar-constrained
 	// design pass), tighter context (designer prompts are short).
-	p["designer-cpu"] = {
+	"designer-cpu": {
 		binary: "llama-server",
 		flags: ["-c", "8192",
 				"--cache-type-k", "q8_0",
 				"--cache-type-v", "q8_0"],
 		default_port: 8081,
-	};
+	},
 
 	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
-	p["memory-phoenix"] = {
+	"memory-phoenix": {
 		binary: "llama-server",
 		flags: ["-c", "32768",
 				"--cache-type-k", "q4_0",
@@ -81,12 +75,8 @@ fn build_profiles(): object {
 				"-ngl", "99",
 				"-fa", "on"],
 		default_port: 8085,
-	};
-
-	return p;
-}
-
-let PROFILES = build_profiles();
+	},
+};
 
 // ── schema ────────────────────────────────────────────────────────────
 

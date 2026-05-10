@@ -2,7 +2,7 @@
 
 A port of the smallest useful slice of Witchgrid v0.3 to [Hemlock](https://hemlang.dev) — node registry plus the "fancy llama-server wrapper" pillar. Goal: feel out whether the language is ergonomic enough to commit Witchgrid v1 to it.
 
-**Verdict: yes.** Both the interpreter and the compiled 1 MB binary spawn a real `llama-server`, route a completion through it, and SIGTERM-stop it cleanly. Five language-level rough edges hit during the build — **all five now fixed upstream** (parity gaps via c5ced27, FFI lib collision via #531, posix_spawn primitive via #533). One minor follow-up still open: a raw-fd file open so process supervisors can drop the `sh -c` wrapper. See `HEMLOCK_FEEDBACK.md`.
+**Verdict: yes.** Both the interpreter and the compiled 1 MB binary spawn a real `llama-server`, route a completion through it, and SIGTERM-stop it cleanly. Seven language-level rough edges hit during the build — **all seven now fixed upstream** (parity gaps via c5ced27, FFI lib collision via #531, posix_spawn via #533, raw-fd file open via #534, string object-literal keys + `obj?[key]` via #535). See `HEMLOCK_FEEDBACK.md` for the full writeup.
 
 ## What's here
 
