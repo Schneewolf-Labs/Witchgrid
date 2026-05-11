@@ -1,0 +1,93 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Witchgrid pins Hemlock by version because the runtime gets fixes that
+# matter to us (e.g. 2.2.1's HTTP POST body fix; without it, agent <-> CP
+# proxy calls send empty bodies). Bump this when we adopt a new feature.
+env:
+  HEMLOCK_VERSION: 2.2.1
+
+jobs:
+  build:
+    name: build cp + agent + inspect
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hemlock runtime deps
+        # The compiled witchgrid binaries dlopen libffi/libssl/libwebsockets/
+        # libz at startup. Use -dev packages so we don't have to chase the
+        # libwebsockets soname on whatever Ubuntu image GitHub is running
+        # this week.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libffi-dev libssl-dev libwebsockets-dev zlib1g-dev
+
+      - name: Install Hemlock ${{ env.HEMLOCK_VERSION }}
+        run: |
+          # Install to a writable prefix and add it to PATH for later steps.
+          # Skip the interactive PATH-modification prompt.
+          curl -fsSL https://raw.githubusercontent.com/hemlang/hemlock/main/install.sh \
+            | bash -s -- --version "v${HEMLOCK_VERSION}" \
+                         --prefix "${HOME}/.local" \
+                         --no-modify-path
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify Hemlock version
+        run: |
+          hemlock --version
+          hemlockc --version
+          # Fail fast if install grabbed the wrong version (e.g. install.sh
+          # silently fell back to "latest").
+          hemlockc --version | grep -q "${HEMLOCK_VERSION}" \
+            || { echo "Wrong Hemlock version installed"; exit 1; }
+
+      - name: Build cp
+        run: |
+          cd cp
+          hemlockc cp.hml -o witchgrid-cp
+          file witchgrid-cp
+          ls -la witchgrid-cp
+
+      - name: Build agent
+        run: |
+          cd agent
+          hemlockc agent.hml -o witchgrid-agent
+          file witchgrid-agent
+          ls -la witchgrid-agent
+
+      - name: Build inspect
+        run: |
+          cd cp
+          hemlockc inspect.hml -o witchgrid-inspect
+          file witchgrid-inspect
+          ls -la witchgrid-inspect
+
+      - name: Smoke test — CP starts and answers /healthz
+        run: |
+          ./cp/witchgrid-cp > /tmp/cp.log 2>&1 &
+          CP_PID=$!
+          # Poll, don't sleep blindly. Fail loud if it doesn't come up.
+          for i in 1 2 3 4 5; do
+            if curl -fsS http://localhost:8765/healthz 2>/dev/null; then
+              echo
+              echo "CP healthy"
+              kill $CP_PID
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "CP didn't answer /healthz; log was:"
+          cat /tmp/cp.log
+          kill $CP_PID 2>/dev/null
+          exit 1
+
+      # No agent smoke test yet — agent's main() does a synchronous POST
+      # /register to CP at boot, so booting it without a CP would block
+      # until the HTTP timeout. When heartbeats land we can boot agent +
+      # CP together and round-trip /nodes here.
