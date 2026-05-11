@@ -73,7 +73,14 @@ llama-servers, Jupyter, A1111, ad-hoc workloads. Witchgrid is the
 
 22b. **~~`file_stat()` runtime version did `exit(1)` instead of throwing catchable.~~** *Fixed in cf67fd8.* CP's `pick_placement` had a defensive `fs.exists()` pre-check; the catch-around-`read_metadata` it was substituting for now actually works.
 
-23. **CP's `/v1/llama/{profile}/*` proxy garbles the response body when llama-server returns non-trivial JSON.** Verified end-to-end: client gets a body that python's `json.loads` rejects with `Expecting ',' delimiter` mid-string. Hitting llama-server directly works fine. Likely the same rune-vs-byte handling that bit `process_alive` — somewhere in the proxy path we're indexing bytes as runes and corrupting multi-byte UTF-8 sequences. Need to audit the http_request → response.body chain.
+23. **~~CP's `/v1/llama/{profile}/*` proxy garbles non-ASCII response bodies.~~** *Fixed.* Two bugs compounding:
+    - `http_server.write_response` set `Content-Length: body.length` (codepoints) instead of `body.byte_length` (bytes), truncating non-ASCII responses mid-stream.
+    - `http_server.buf_to_string` (used to build `req.body` from the raw socket bytes) treated each UTF-8 byte as its own rune. Re-encoding when forwarding to llama-server doubled high bytes — `0xC3 0xA9` for "é" went out as `0xC3 0x83 0xC2 0xA9`. The model then generated mojibake-shaped responses to match the corrupted prompt. Fixed by switching to `__string_from_bytes(buf)` (the runtime's proper UTF-8 decoder).
+    - Test: POST a /completion through CP with a prompt containing `é à ç` and assert the model's response (which will itself contain non-ASCII output) is valid UTF-8 and parses as JSON.
+
+24. **`pick_port` auto-bumping starts at the profile's `default_port` (8080 for chat-mahou) without checking whether THE AGENT'S OWN PORT or other Witchgrid-spawned-but-orphaned-llama-servers are sitting on it.** Hit this on schneewolf where a previous auto-spawn had grabbed port 8766 (the agent's port!) — agent restarted, couldn't bind, fell over. Two related fixes needed:
+    - Reserve the agent's own listen port: refuse to spawn services on the same port the agent is bound to.
+    - When the agent boots, scan its services table for rows whose pid no longer exists, treat as zombies, garbage-collect them.
 
 ## How to test
 

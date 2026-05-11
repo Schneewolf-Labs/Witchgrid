@@ -14,19 +14,18 @@
 
 import { TcpListener } from "@stdlib/net";
 
+// Decode a buffer of UTF-8 bytes into a Hemlock string with proper
+// codepoints. The naive byte-as-rune approach we used before was wrong
+// for any non-ASCII content: each UTF-8 byte (e.g. 0xC3 from "é"'s
+// 0xC3 0xA9 sequence) became its own rune, so the resulting string
+// when re-encoded for the wire produced double-UTF-8 mojibake (the
+// French chat completion "écrire" went out as "Ã©crire" and the model
+// happily generated mojibake-shaped responses to match).
+//
+// __string_from_bytes is the runtime builtin for this; not currently
+// exported through any @stdlib module wrapper.
 fn buf_to_string(buf): string {
-	// @stdlib/net hides __string_from_bytes; iterate bytes ourselves.
-	// Body is expected UTF-8; runes are unicode codepoints, so this
-	// is wrong for multi-byte chars but fine for ASCII JSON. Replace
-	// with a proper helper once we hit non-ASCII.
-	let out = "";
-	let i = 0;
-	while (i < buf.length) {
-		let r: rune = buf[i];
-		out = out + r;
-		i = i + 1;
-	}
-	return out;
+	return __string_from_bytes(buf);
 }
 
 export fn parse_request(stream): object {
@@ -87,7 +86,11 @@ export fn write_response(stream, resp): null {
 	if (body.length > 0 && !headers.has("content-type")) {
 		headers["content-type"] = "application/json";
 	}
-	headers["content-length"] = body.length;
+	// Content-Length is BYTES on the wire, not codepoints. body.length
+	// is rune count, which under-reports for any non-ASCII content
+	// (e.g. an llama-server completion response with French / Spanish
+	// / emoji output) and the client truncates the body mid-stream.
+	headers["content-length"] = body.byte_length;
 	headers["connection"] = "close";
 
 	stream.write("HTTP/1.1 " + status + " " + status_text(status) + "\r\n");
