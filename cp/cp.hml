@@ -32,6 +32,7 @@ import { open_db, exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 import { post_json, get, request as http_request } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
+import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb } from "./gguf";
 
@@ -165,8 +166,31 @@ fn fetch_profile(profile_name: string) {
 	return null;
 }
 
-// Returns { node_id, agent_url, gpu_index, est_mb } or null if nothing fits.
+// Returns one of:
+//   { node_id, agent_url, gpu_index, est_mb }   -- a placement
+//   { error: "...", status: 4xx|5xx }           -- a structured error
+//   null                                         -- no fit found, retry later
+//
+// model_path is the path AS THE AGENT'S BOX SEES IT. For multi-box setups
+// where the operator hasn't shared the model directory across all agents,
+// CP can't read the file directly. We pre-check `exists` and bail out with
+// a structured error rather than calling read_metadata — the runtime's
+// file_stat does `exit(1)` on missing files (Hemlock parity gap; interp
+// throws catchable, compiled binary doesn't), so a `try` around
+// read_metadata wouldn't actually catch the crash.
+//
+// Long-term fix: push model introspection to the agent (POST /inspect on
+// the agent), since the agent always has the file.
 fn pick_placement(model_path: string, profile) {
+	if (!exists(model_path)) {
+		return { error: "CP cannot read model file at '" + model_path + "'. "
+			+ "This usually means the path exists on the agent's box but not on "
+			+ "CP's box. Until agent-side model introspection lands, either "
+			+ "(a) make the model accessible at the same path on CP's box "
+			+ "(NFS / bind mount / scp), or (b) pin placement explicitly with "
+			+ "node_id + gpus + port and skip auto-placement.",
+			status: 422 };
+	}
 	let g = read_metadata(model_path);
 	let est = estimate_vram_mb(g, i32(profile.context), profile.kv_type);
 	let needed_mb = est.total_mb;
@@ -237,6 +261,9 @@ fn handle_spawn_proxy(req): object {
 			})};
 		}
 		let pick = pick_placement(model, profile);
+		if (pick?.error != null) {
+			return { status: pick.status, body: stringify({ error: pick.error }) };
+		}
 		if (pick == null) {
 			return { status: 503, body: stringify({
 				error: "no GPU has enough free VRAM for " + profile_name
@@ -423,6 +450,10 @@ fn auto_spawn(profile_name: string) {
 	}
 
 	let pick = pick_placement(profile.default_model, profile);
+	if (pick?.error != null) {
+		return { error: { status: pick.status,
+			body: stringify({ error: pick.error }) }};
+	}
 	if (pick == null) {
 		return { error: { status: 503, body: stringify({
 			error: "auto-spawn declined: no GPU has free VRAM for "
