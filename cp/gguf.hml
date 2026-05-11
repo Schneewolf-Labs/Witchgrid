@@ -1,0 +1,406 @@
+// gguf.hml — minimal GGUF v3 metadata parser for Witchgrid placement.
+//
+// Reads enough of a .gguf file to answer two questions:
+//   1. How big is this model on the GPU once loaded?
+//   2. How much VRAM does its KV cache eat per token?
+//
+// Together those let CP do capacity-aware placement: pick a (node, GPU
+// set) where (model_weights + context * kv_per_token + activation_overhead)
+// fits in free VRAM.
+//
+// Format reference: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
+//
+// Layout (all little-endian):
+//   "GGUF"                                             4 bytes
+//   version: u32                                       (we support v3)
+//   tensor_count: u64
+//   metadata_kv_count: u64
+//   metadata_kv[metadata_kv_count]:
+//     key_length: u64
+//     key: utf8[key_length]
+//     value_type: u32                                  (see GGUF_TYPE_*)
+//     value: variant by type
+//   tensor_info[tensor_count]:                         (we skip this)
+//     name_length: u64; name: utf8; n_dims: u32;
+//     dims: u64[n_dims]; type: u32; offset: u64
+//   ... tensor data follows after padding ...
+//
+// Why we don't walk tensor_info: file_size minus header size approximates
+// total weight bytes within a few percent for any quant ≥ 4-bit, which is
+// the regime we care about. Walking ~hundreds of tensor headers just to
+// sum up dim products + lookup ggml_type bytes/elem doesn't earn its keep
+// here. Add it if we need per-layer cost or per-tensor offload control.
+
+import { open, file_stat } from "@stdlib/fs";
+
+// ── GGUF metadata value types ────────────────────────────────────────
+let GGUF_TYPE_UINT8   = 0;
+let GGUF_TYPE_INT8    = 1;
+let GGUF_TYPE_UINT16  = 2;
+let GGUF_TYPE_INT16   = 3;
+let GGUF_TYPE_UINT32  = 4;
+let GGUF_TYPE_INT32   = 5;
+let GGUF_TYPE_FLOAT32 = 6;
+let GGUF_TYPE_BOOL    = 7;
+let GGUF_TYPE_STRING  = 8;
+let GGUF_TYPE_ARRAY   = 9;
+let GGUF_TYPE_UINT64  = 10;
+let GGUF_TYPE_INT64   = 11;
+let GGUF_TYPE_FLOAT64 = 12;
+
+// Bytes per scalar (excluding STRING and ARRAY).
+fn scalar_size(t: i32): i32 {
+	if (t == GGUF_TYPE_UINT8 || t == GGUF_TYPE_INT8 || t == GGUF_TYPE_BOOL) { return 1; }
+	if (t == GGUF_TYPE_UINT16 || t == GGUF_TYPE_INT16) { return 2; }
+	if (t == GGUF_TYPE_UINT32 || t == GGUF_TYPE_INT32 || t == GGUF_TYPE_FLOAT32) { return 4; }
+	if (t == GGUF_TYPE_UINT64 || t == GGUF_TYPE_INT64 || t == GGUF_TYPE_FLOAT64) { return 8; }
+	return 0;  // STRING/ARRAY handled separately
+}
+
+// ── byte-order helpers (we read into a buffer then index it ourselves
+//    because @stdlib/bytes.read_uXX_le takes a `ptr`, not a `buffer`)
+
+fn buf_u32_le(buf, offset: i32): i64 {
+	let b0: i64 = buf[offset];
+	let b1: i64 = buf[offset + 1];
+	let b2: i64 = buf[offset + 2];
+	let b3: i64 = buf[offset + 3];
+	return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+fn buf_u64_le(buf, offset: i32): i64 {
+	let lo: i64 = buf_u32_le(buf, offset);
+	let hi: i64 = buf_u32_le(buf, offset + 4);
+	return lo | (hi << 32);
+}
+
+// ── streaming scalar read (advances the file cursor) ────────────────
+
+fn read_u32(f): i64 {
+	let buf = f.read_bytes(4);
+	return buf_u32_le(buf, 0);
+}
+
+fn read_u64(f): i64 {
+	let buf = f.read_bytes(8);
+	return buf_u64_le(buf, 0);
+}
+
+fn read_string(f): string {
+	let n = i32(read_u64(f));
+	if (n == 0) { return ""; }
+	let buf = f.read_bytes(n);
+	let out = "";
+	let i = 0;
+	while (i < n) {
+		let r: rune = buf[i];
+		out = out + r;
+		i = i + 1;
+	}
+	return out;
+}
+
+// ── value reader: returns parsed value for scalar/string types,
+//    null for arrays (we only skip past them — see skip_value_inplace) ─
+
+fn read_scalar_value(f, t: i32) {
+	if (t == GGUF_TYPE_UINT32 || t == GGUF_TYPE_INT32) { return read_u32(f); }
+	if (t == GGUF_TYPE_UINT64 || t == GGUF_TYPE_INT64) { return read_u64(f); }
+	if (t == GGUF_TYPE_UINT8  || t == GGUF_TYPE_INT8 || t == GGUF_TYPE_BOOL) {
+		let buf = f.read_bytes(1);
+		let v: i64 = buf[0];
+		return v;
+	}
+	if (t == GGUF_TYPE_UINT16 || t == GGUF_TYPE_INT16) {
+		let buf = f.read_bytes(2);
+		let lo: i64 = buf[0];
+		let hi: i64 = buf[1];
+		return lo | (hi << 8);
+	}
+	if (t == GGUF_TYPE_FLOAT32) {
+		// We don't currently use any f32 metadata for placement; skip past
+		// the 4 bytes and return null. Adding a real f32 decoder needs a
+		// bit-cast (memcpy u32 → f32) that Hemlock doesn't expose cleanly
+		// from a buffer yet.
+		f.read_bytes(4);
+		return null;
+	}
+	if (t == GGUF_TYPE_FLOAT64) {
+		f.read_bytes(8);
+		return null;
+	}
+	if (t == GGUF_TYPE_STRING) {
+		return read_string(f);
+	}
+	throw "unsupported scalar gguf type: " + t;
+}
+
+// Skip past a value of the given type without parsing it. For arrays this
+// recurses into each element (advancing the cursor element-by-element).
+fn skip_value(f, t: i32): null {
+	if (t == GGUF_TYPE_STRING) {
+		let n = i32(read_u64(f));
+		if (n > 0) { f.read_bytes(n); }  // discard
+		return null;
+	}
+	if (t == GGUF_TYPE_ARRAY) {
+		let elem_t = i32(read_u32(f));
+		let count = i32(read_u64(f));
+		let i = 0;
+		while (i < count) {
+			skip_value(f, elem_t);
+			i = i + 1;
+		}
+		return null;
+	}
+	let s = scalar_size(t);
+	if (s > 0) {
+		f.read_bytes(s);
+		return null;
+	}
+	throw "unsupported gguf type for skip: " + t;
+}
+
+// ── public API ──────────────────────────────────────────────────────
+
+// Parse the GGUF header + metadata KV array. Returns an object with a
+// `meta` map of every interesting key (we skip past tokenizer vocabs and
+// other large arrays without storing them) plus header counts and the
+// file size on disk.
+//
+// Throws on bad magic / unsupported version / IO error.
+export fn read_metadata(path: string): object {
+	let stat = file_stat(path);
+	let file_size = stat.size;
+
+	let f = open(path, "r");
+	let magic = f.read_bytes(4);
+	if (magic[0] != 71 || magic[1] != 71 || magic[2] != 85 || magic[3] != 70) {
+		f.close();
+		throw "not a GGUF file: " + path;
+	}
+	let version = i32(read_u32(f));
+	if (version != 3) {
+		f.close();
+		throw "unsupported GGUF version " + version + " (this parser handles v3)";
+	}
+	let tensor_count = read_u64(f);
+	let kv_count = i32(read_u64(f));
+
+	// Keys we want to keep. Anything else gets skipped past so we don't
+	// retain megabytes of tokenizer vocab in memory. This list covers
+	// everything `estimate_vram_mb` needs plus a few descriptive bits.
+	let want = {
+		"general.architecture": true,
+		"general.name": true,
+		"general.quantization_version": true,
+		"general.file_type": true,
+	};
+	// Architecture-specific keys are like {arch}.context_length, but we
+	// don't know the arch yet on the first pass. Strategy: keep every
+	// key whose value is a small scalar (skip arrays + strings > 256b).
+	// Cheap and complete.
+
+	let meta = {};
+	let i = 0;
+	while (i < kv_count) {
+		let key = read_string(f);
+		let t = i32(read_u32(f));
+		// Always store small scalars + short strings; skip everything else.
+		if (t == GGUF_TYPE_ARRAY) {
+			skip_value(f, t);
+		} else if (t == GGUF_TYPE_STRING) {
+			let s = read_string(f);
+			if (s.length <= 256 || want?[key] == true) {
+				meta[key] = s;
+			}
+			// (long strings like chat templates are dropped on the floor)
+		} else {
+			let v = read_scalar_value(f, t);
+			meta[key] = v;
+		}
+		i = i + 1;
+	}
+	f.close();
+
+	return {
+		path: path,
+		file_size: file_size,
+		version: version,
+		tensor_count: tensor_count,
+		metadata_kv_count: kv_count,
+		meta: meta,
+	};
+}
+
+// ── VRAM estimation ─────────────────────────────────────────────────
+
+// Return the {arch}-prefixed key (e.g. "llama.block_count" for arch=llama),
+// or null if the key isn't present.
+fn arch_key(meta, arch: string, suffix: string) {
+	let k = arch + "." + suffix;
+	if (meta.has(k)) { return meta[k]; }
+	return null;
+}
+
+// Bytes per element for a KV cache type. q4_0 / q8_0 have block overhead
+// (32-element blocks with one scale); use the effective bits/element.
+fn kv_bytes_per_elem(kv_type: string): f64 {
+	if (kv_type == "f16" || kv_type == "fp16") { return 2.0; }
+	if (kv_type == "f32" || kv_type == "fp32") { return 4.0; }
+	if (kv_type == "q8_0") { return 1.125; }   // 1 byte data + 0.125 for f16 scale per 32 elems
+	if (kv_type == "q4_0") { return 0.5625; }  // 0.5 byte data + 0.0625 for f16 scale per 32 elems
+	if (kv_type == "q5_0") { return 0.6875; }
+	throw "unknown kv cache type: " + kv_type;
+}
+
+// Per-token KV cache cost in bytes — the "rate" that determines how much
+// extra VRAM each additional token costs. Pulled out of estimate_vram_mb
+// because max_context_tokens needs it without going through the full
+// estimation chain.
+export fn kv_per_token_bytes(parsed: object, kv_type: string): f64 {
+	let meta = parsed.meta;
+	let arch = meta?["general.architecture"];
+	if (arch == null) { throw "no general.architecture in metadata"; }
+	let n_layers   = arch_key(meta, arch, "block_count");
+	let n_heads    = arch_key(meta, arch, "attention.head_count");
+	let n_kv_heads = arch_key(meta, arch, "attention.head_count_kv");
+	let embed_dim  = arch_key(meta, arch, "embedding_length");
+	if (n_layers == null || n_heads == null || embed_dim == null) {
+		throw "missing required architecture metadata for " + arch;
+	}
+	if (n_kv_heads == null) { n_kv_heads = n_heads; }
+	let head_dim: i64 = embed_dim / n_heads;
+	let bpe = kv_bytes_per_elem(kv_type);
+	return 2.0 * f64(n_layers) * f64(n_kv_heads) * f64(head_dim) * bpe;
+}
+
+// What the GGUF metadata *claims* the trained context length is. This is
+// a fact about the file, not a recommendation — see safe_context() for the
+// number CP should actually use for placement.
+export fn claimed_context(parsed: object): i64 {
+	let meta = parsed.meta;
+	let arch = meta?["general.architecture"];
+	if (arch == null) { throw "no general.architecture in metadata"; }
+	let ctx = arch_key(meta, arch, "context_length");
+	if (ctx == null) { return 0; }
+	return ctx;
+}
+
+// Override table for models whose GGUF metadata lies about context_length.
+// Lookup is by (architecture, claimed_context) — narrow enough to avoid
+// false positives. Add entries as we discover them.
+//
+// Known cases:
+//   Mistral-Nemo: HuggingFace config.json originally had
+//     max_position_embeddings = 1024000 (the upstream RoPE theta hint, not
+//     a real training context). It got fixed upstream, but every GGUF
+//     quantized before the fix carries the wrong value. Real trained
+//     context is 131072 = 2^17.
+//
+// Returns the corrected context if a known bad case matches, or 0 if no
+// override applies.
+fn known_bad_context_override(arch: string, claimed: i64): i64 {
+	if (arch == "llama" && claimed == 1024000) {
+		// Mistral-Nemo carries arch=llama in GGUF (it's a llama-shaped
+		// model). 1024000 is the smoking-gun bad value.
+		return 131072;
+	}
+	return 0;
+}
+
+// The context length CP should actually treat as the model's max for
+// placement decisions. Applies the known-bad override on top of the
+// metadata claim.
+export fn safe_context(parsed: object): i64 {
+	let meta = parsed.meta;
+	let arch = meta?["general.architecture"];
+	if (arch == null) { throw "no general.architecture in metadata"; }
+	let claimed = claimed_context(parsed);
+	let override = known_bad_context_override(arch, claimed);
+	if (override > 0) { return override; }
+	return claimed;
+}
+
+// Inverse of estimate_vram_mb: given free VRAM, return the largest context
+// (in tokens) that fits. Caps at the model's trained context length so we
+// don't recommend an oversized window the model wasn't trained for.
+//
+//   max_ctx ≈ floor((available_mb - weights_mb - activation_overhead_mb)
+//                   * 1048576 / kv_per_token_b)
+//
+// Returns 0 if the model + activation overhead alone exceeds available VRAM
+// (model won't load on this GPU at all). Caller should treat 0 as "skip".
+export fn max_context_tokens(parsed: object, available_vram_mb: f64,
+                             kv_type: string,
+                             activation_overhead_mb: f64): i64 {
+	let weights_mb: f64 = f64(parsed.file_size) / 1048576.0;
+	let headroom_mb: f64 = available_vram_mb - weights_mb - activation_overhead_mb;
+	if (headroom_mb <= 0.0) { return 0; }
+
+	let kv_b = kv_per_token_bytes(parsed, kv_type);
+	if (kv_b <= 0.0) { return 0; }
+
+	let ctx_f: f64 = (headroom_mb * 1048576.0) / kv_b;
+	let ctx: i64 = i64(ctx_f);
+
+	// Cap at safe context — anything beyond is RoPE-extension territory,
+	// AND we apply the known-bad-metadata override so models that lie
+	// about their trained length (e.g. Mistral-Nemo's 1024000) don't
+	// fool us into recommending an unusable window.
+	let safe = safe_context(parsed);
+	if (safe > 0 && ctx > safe) { ctx = safe; }
+	return ctx;
+}
+
+// Estimate VRAM in megabytes for serving a given context length with a
+// given KV cache quant. Returns { weights_mb, kv_per_token_b, kv_total_mb,
+// activation_overhead_mb, total_mb } so callers can see the breakdown.
+//
+// Rough rules of thumb baked in:
+//   - weights_mb ≈ file size minus a small header (the header is < 1 MB
+//     for any model we care about; rounding error at scale).
+//   - kv_per_token = 2 (k+v) * n_layers * n_kv_heads * head_dim * bytes_per_elem
+//     where head_dim = embedding_length / n_attention_heads
+//   - activation overhead ≈ 1 GB (compute buffers, batch state). Very
+//     rough; refine empirically once we have per-model evidence.
+export fn estimate_vram_mb(parsed: object, context_tokens: i32, kv_type: string): object {
+	let meta = parsed.meta;
+	let arch = meta?["general.architecture"];
+	if (arch == null) {
+		throw "no general.architecture in metadata";
+	}
+
+	let n_layers   = arch_key(meta, arch, "block_count");
+	let n_heads    = arch_key(meta, arch, "attention.head_count");
+	let n_kv_heads = arch_key(meta, arch, "attention.head_count_kv");
+	let embed_dim  = arch_key(meta, arch, "embedding_length");
+	if (n_layers == null || n_heads == null || embed_dim == null) {
+		throw "missing required architecture metadata for " + arch;
+	}
+	if (n_kv_heads == null) { n_kv_heads = n_heads; }  // non-GQA models
+
+	let head_dim: i64 = embed_dim / n_heads;
+	let bpe = kv_bytes_per_elem(kv_type);
+	let kv_per_token_b: f64 = 2.0 * f64(n_layers) * f64(n_kv_heads) * f64(head_dim) * bpe;
+
+	let weights_mb: f64 = f64(parsed.file_size) / 1048576.0;
+	let kv_total_mb: f64 = (kv_per_token_b * f64(context_tokens)) / 1048576.0;
+	let activation_overhead_mb: f64 = 1024.0;
+
+	return {
+		architecture: arch,
+		n_layers: n_layers,
+		n_heads: n_heads,
+		n_kv_heads: n_kv_heads,
+		embedding_length: embed_dim,
+		head_dim: head_dim,
+		kv_type: kv_type,
+		context_tokens: context_tokens,
+		weights_mb: weights_mb,
+		kv_per_token_b: kv_per_token_b,
+		kv_total_mb: kv_total_mb,
+		activation_overhead_mb: activation_overhead_mb,
+		total_mb: weights_mb + kv_total_mb + activation_overhead_mb,
+	};
+}

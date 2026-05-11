@@ -1,0 +1,71 @@
+// inspect.hml — standalone CLI for inspecting a .gguf file.
+//
+// Usage:
+//   witchgrid-inspect <path-to-model.gguf>
+//
+// Prints architecture, weights size, per-token KV cost, and max context
+// that fits on common GPU sizes (16 / 24 / 48 / 80 GB). Independent of
+// the rest of Witchgrid — useful for "do I need a bigger card?" planning.
+
+import { read_metadata, kv_per_token_bytes, claimed_context, safe_context, max_context_tokens } from "./gguf";
+
+fn fmt_mb(mb: f64): string {
+	let gb = mb / 1024.0;
+	return "" + mb + " MB (" + gb + " GB)";
+}
+
+fn print_max_ctx(g, gpu_label: string, free_mb: f64): null {
+	print("  " + gpu_label + " (" + free_mb + " MB free):");
+	print("    q4_0 KV: " + max_context_tokens(g, free_mb, "q4_0", 1024.0) + " tokens");
+	print("    fp16 KV: " + max_context_tokens(g, free_mb, "f16",  1024.0) + " tokens");
+	return null;
+}
+
+fn main(): null {
+	// args[0] is the program name (matches argv[0] convention).
+	if (args.length < 2) {
+		eprint("usage: witchgrid-inspect <path-to-model.gguf>");
+		return null;
+	}
+	let path = args[1];
+
+	let g = read_metadata(path);
+	let arch = g.meta["general.architecture"];
+
+	let claimed = claimed_context(g);
+	let safe = safe_context(g);
+
+	print("=== " + path);
+	print("  arch:       " + arch);
+	print("  name:       " + (g.meta["general.name"] ?? "(unset)"));
+	print("  file size:  " + fmt_mb(f64(g.file_size) / 1048576.0));
+	print("  tensors:    " + g.tensor_count);
+	if (claimed != safe) {
+		print("  ctx claim:  " + claimed + " tokens (METADATA LIE — see below)");
+		print("  ctx safe:   " + safe + " tokens (override applied)");
+	} else {
+		print("  trained ctx: " + claimed + " tokens");
+	}
+	print("");
+
+	print("=== shape ===");
+	print("  layers:     " + g.meta[arch + ".block_count"]);
+	print("  embed_dim:  " + g.meta[arch + ".embedding_length"]);
+	print("  heads:      " + g.meta[arch + ".attention.head_count"]);
+	print("  kv heads:   " + g.meta[arch + ".attention.head_count_kv"]);
+	print("");
+
+	print("=== KV cache cost ===");
+	print("  fp16: " + kv_per_token_bytes(g, "f16")  + " bytes/token");
+	print("  q4_0: " + kv_per_token_bytes(g, "q4_0") + " bytes/token");
+	print("");
+
+	print("=== max context on common GPUs (after weights + 1 GB activation) ===");
+	print_max_ctx(g, "16 GB card", 15500.0);   // 4060 Ti / 4070 Ti / 5070
+	print_max_ctx(g, "24 GB card", 23500.0);   // 3090 / 4090 / 7900 XTX
+	print_max_ctx(g, "48 GB card", 47000.0);   // A6000 / RTX 6000 Ada / L40
+	print_max_ctx(g, "80 GB card", 79000.0);   // A100 / H100 80GB
+	return null;
+}
+
+main();

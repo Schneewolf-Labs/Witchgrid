@@ -1,6 +1,7 @@
-# Compiled binary (from `hemlockc cp.hml -o witchgrid-cp`)
+# Compiled binaries
 witchgrid
 witchgrid-cp
+witchgrid-inspect
 
 # Runtime sqlite state
 *.db
