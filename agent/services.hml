@@ -23,10 +23,11 @@
 import { posix_spawn, kill } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
-import { open_fd } from "@stdlib/fs";
+import { open, open_fd, file_stat } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
+import { sleep } from "@stdlib/time";
 
 // IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
 // keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
@@ -122,14 +123,82 @@ fn iso_now(db): string {
 	return r[0].ts;
 }
 
+// kill(pid, 0) returns success for zombie processes (process exited but
+// not yet reaped), which makes it useless for "is this child still doing
+// work?" checks. waitpid(pid, WNOHANG) would reap and tell us truthfully,
+// but calling Hemlock's waitpid from this code path crashed the agent
+// process with `longjmp causes uninitialized stack frame` — likely an
+// interaction with the async heartbeat task's setjmp context. Workaround:
+// read /proc/<pid>/status, parse the State: line, treat Z (zombie) and
+// X (dead) as "not alive". Linux-specific; portability hit if we ever
+// support macOS agents.
+//
+// Two Hemlock subtleties worth knowing if this code surprises you:
+//   1. f.read() (no args) returns "" on /proc files because their stat
+//      size is 0 — must pass an explicit max-bytes for /proc reads.
+//   2. string[i] returns a rune, not a string. `c != " "` is always true
+//      (compares rune to string, mismatched types). Use rune literals
+//      with single quotes: `c != ' '`. Compiler warns on the mismatch
+//      but it's silent in the interpreter — easy to miss.
 fn process_alive(pid: i32): bool {
 	try {
-		kill(pid, 0);
-		return true;
+		let f = open("/proc/" + pid + "/status", "r");
+		let content = f.read(2048);
+		f.close();
+		if (content == null || content.length == 0) { return false; }
+		let idx = content.find("State:");
+		if (idx < 0) { return false; }
+		// Walk past "State:" + whitespace to the state character.
+		let i = idx + 6;
+		while (i < content.length) {
+			let c = content[i];
+			if (c != ' ' && c != '\t') { break; }
+			i = i + 1;
+		}
+		if (i >= content.length) { return false; }
+		let state = content[i];
+		// R(unning), S(leeping), D(uninterruptible), I(idle) → alive.
+		// Z(ombie), X(dead), T(stopped) → not alive for our purposes.
+		return state != 'Z' && state != 'X' && state != 'T';
 	} catch (e) {
+		// /proc/<pid>/status missing → process gone.
 		return false;
 	}
 }
+
+// Read up to `max_bytes` from the end of a file. Best-effort — returns
+// empty string on any error so callers can use it inline without their
+// own try/catch (we use this in the spawn-failed error path; the original
+// failure is the interesting bit, not whether we could read its log).
+fn read_log_tail(path: string, max_bytes: i32): string {
+	try {
+		let stat = file_stat(path);
+		let f = open(path, "r");
+		let start = 0;
+		if (stat.size > max_bytes) { start = i32(stat.size) - max_bytes; }
+		f.seek(start);
+		let content = f.read();
+		f.close();
+		if (content == null) { return ""; }
+		return content;
+	} catch (e) {
+		return "";
+	}
+}
+
+// How long to wait before deciding the child crashed-on-launch.
+//
+// Choosing this is a tradeoff. Too short and we false-pass spawns that
+// will fail their socket bind a moment later (llama-server runs CUDA
+// init *before* binding, which on a multi-GPU box takes ~1s — we get
+// past the grace check, then bind fails, then we've already returned
+// 201). Too long and we tax every successful spawn with that latency.
+//
+// 2.0s is empirical: covers post-CUDA-init bind failures on schneewolf
+// (4× 4060 Ti, ~1s CUDA enumeration) with margin, while a successful
+// 12B model spawn takes 15-30s of mmap + GPU upload, so the grace is
+// noise on top.
+let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
 // ── core: spawn ───────────────────────────────────────────────────────
 
@@ -189,7 +258,31 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 
 	let pid = result.pid;
 	if (pid <= 0) {
-		throw "posix_spawn returned invalid pid: " + pid;
+		return { spawn_error: "posix_spawn returned invalid pid: " + pid };
+	}
+
+	// Did the child immediately exit? Common causes: contended port,
+	// missing model file, missing CUDA runtime, malformed args. Without
+	// this check, we'd return 201 + a pid that's already a zombie, and
+	// the caller wouldn't know until the next /v1/llama/* request fails
+	// or the next agent /services list shows alive=false. Surface it now.
+	//
+	// Returning a structured error rather than `throw`-ing because Hemlock's
+	// exception path interacts badly with the async heartbeat task — the
+	// throw triggered "longjmp causes uninitialized stack frame" abort
+	// in the agent process. Worth filing upstream; in the meantime,
+	// non-throwing error returns sidestep the issue.
+	sleep(SPAWN_FAILURE_GRACE_SECONDS);
+	if (!process_alive(pid)) {
+		let tail = read_log_tail(log_path, 4096);
+		let msg = "spawn died immediately (pid " + pid + " exited within "
+			+ SPAWN_FAILURE_GRACE_SECONDS + "s)";
+		if (tail.length > 0) {
+			msg = msg + "; log tail:\n" + tail;
+		} else {
+			msg = msg + " (no log output captured at " + log_path + ")";
+		}
+		return { spawn_error: msg };
 	}
 
 	let now = iso_now(db);
@@ -260,6 +353,11 @@ export fn make_handlers(db): object {
 			let gpus = payload?.gpus ?? [];
 			try {
 				let svc = spawn_service(db, profile, model, port, gpus);
+				if (svc?.spawn_error != null) {
+					// 502 because the upstream binary (llama-server) failed
+					// during startup, not because the request was malformed.
+					return { status: 502, body: stringify({ error: svc.spawn_error }) };
+				}
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
 				return { status: 400, body: stringify({ error: "" + e }) };

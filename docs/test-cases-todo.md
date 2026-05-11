@@ -58,6 +58,16 @@ llama-servers, Jupyter, A1111, ad-hoc workloads. Witchgrid is the
 
 16. **Multiple spawn requests on the same profile pick different ports.** Already verified manually (port autoinc 8080 → 8081 when first is occupied). Lock it in.
 
+## Hemlock language pitfalls (would have caught with tests)
+
+20. **`file.read()` with no args returns "" on `/proc` pseudo-files.** The stat-size of /proc files is 0, and `read()` honors that. Workaround: always pass an explicit max-bytes for /proc reads. Hit this writing `process_alive` — the code looked correct but always returned false because the state line was never found in the empty read.
+
+21. **`string[i]` returns a `rune`, not a `string`.** Comparing a rune to a string literal (`c != " "`) is mismatched types — compiler warns, interpreter silent. Always use rune literals (`c != ' '`) for string-character comparisons. Bit me twice in `process_alive`'s whitespace skip + state-char comparison; both conditions silently always-true.
+
+22. **`throw` from a code path that runs concurrently with an async task crashes the process** with `longjmp causes uninitialized stack frame`. The agent has a heartbeat `async fn` running detached on a worker thread; throwing from the main HTTP handler during that window aborts the whole process. Workaround in our code: structured error returns (`return { spawn_error: msg };`) instead of throw. Worth filing upstream on Hemlock side.
+
+23. **CP's `/v1/llama/{profile}/*` proxy garbles the response body when llama-server returns non-trivial JSON.** Verified end-to-end: client gets a body that python's `json.loads` rejects with `Expecting ',' delimiter` mid-string. Hitting llama-server directly works fine. Likely the same rune-vs-byte handling that bit `process_alive` — somewhere in the proxy path we're indexing bytes as runes and corrupting multi-byte UTF-8 sequences. Need to audit the http_request → response.body chain.
+
 ## How to test
 
 Hemlock has the `@stdlib/test` shape; small fixture GGUFs can be checked in (a few KB each — header only, no tensor data — synthetic). Network tests need a CP+agent harness that spins up both in-process or as subprocesses; defer until we have the harness pattern figured out.
