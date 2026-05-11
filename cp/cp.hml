@@ -32,6 +32,7 @@ import { open_db, exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 import { post_json, get, request as http_request } from "@stdlib/http";
 import { serve } from "./http_server";
+import { read_metadata, estimate_vram_mb } from "./gguf";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -128,29 +129,134 @@ fn list_all_agents(): array {
 	return rows;
 }
 
+// ── placement ────────────────────────────────────────────────────────
+// First-fit. Walks every registered agent and every GPU on it, picks the
+// first GPU whose free_mb ≥ required_mb. No bin-packing across multiple
+// GPUs yet (single-GPU spawn only); we'll add tensor-parallel split when
+// flammen.ai actually has a model that needs more VRAM than any single
+// card on the fleet.
+
+// Fetch a profile's metadata (context, kv_type, default_port) from any
+// registered agent. Profiles are baked into the agent binary today, so
+// asking the first reachable agent is fine. Returns null if no agent is
+// reachable or the profile name isn't known.
+fn fetch_profile(profile_name: string) {
+	let agents = list_all_agents();
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/profiles", null);
+			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
+			let profiles = parse(resp.body);
+			if (profiles.has(profile_name)) {
+				return profiles[profile_name];
+			}
+		} catch (e) { }
+	}
+	return null;
+}
+
+// Returns { node_id, agent_url, gpu_index, est_mb } or null if nothing fits.
+fn pick_placement(model_path: string, profile) {
+	let g = read_metadata(model_path);
+	let est = estimate_vram_mb(g, i32(profile.context), profile.kv_type);
+	let needed_mb = est.total_mb;
+
+	let rows = query(DB,
+		"select node_id, agent_url, hardware_json from nodes "
+		+ "where agent_url is not null order by registered_at desc", []);
+
+	for (row in rows) {
+		let hw = parse(row.hardware_json);
+		let gpus = hw?.gpus ?? [];
+		for (gpu in gpus) {
+			if (f64(gpu.free_mb) >= needed_mb) {
+				return {
+					node_id: row.node_id,
+					agent_url: row.agent_url,
+					gpu_index: gpu.index,
+					est_mb: needed_mb,
+				};
+			}
+		}
+	}
+	return null;
+}
+
+// Pick a port the chosen agent isn't already using. Walks the agent's
+// running services and bumps past any conflict, defaulting to the
+// profile's default_port when nothing is running yet.
+fn pick_port(agent_url: string, default_port: i32): i32 {
+	let port = default_port;
+	try {
+		let resp = get(agent_url + "/services", null);
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			let services = parse(resp.body);
+			let used = {};
+			for (s in services) { used["" + s.port] = true; }
+			while (used.has("" + port)) { port = port + 1; }
+		}
+	} catch (e) { }
+	return port;
+}
+
 // ── service proxy ────────────────────────────────────────────────────
 
 fn handle_spawn_proxy(req): object {
 	let payload = parse(req.body);
-	let node_id = payload?.node_id;
-	if (node_id == null) {
-		return { status: 400, body: "{\"error\":\"node_id required (capacity-aware placement is a future slice)\"}" };
+	let profile_name = payload?.profile;
+	let model = payload?.model;
+	if (profile_name == null || model == null) {
+		return { status: 400, body: "{\"error\":\"profile+model required\"}" };
 	}
+
+	let node_id = payload?.node_id;
+	let gpus = payload?.gpus;
+	let port = payload?.port;
+
+	// If the operator didn't pin (node_id, gpus), do capacity-aware
+	// placement: read GGUF → estimate VRAM at profile.context → first-fit
+	// across registered nodes' free GPU memory.
+	if (node_id == null || gpus == null) {
+		let profile = fetch_profile(profile_name);
+		if (profile == null) {
+			return { status: 400, body: stringify({
+				error: "unknown profile (no agent advertises it): " + profile_name,
+			})};
+		}
+		let pick = pick_placement(model, profile);
+		if (pick == null) {
+			return { status: 503, body: stringify({
+				error: "no GPU has enough free VRAM for " + profile_name
+					+ " + this model at context " + profile.context,
+			})};
+		}
+		node_id = pick.node_id;
+		gpus = [pick.gpu_index];
+		if (port == null) { port = pick_port(pick.agent_url, profile.default_port); }
+	}
+
 	let agent_url = lookup_agent(node_id);
 	if (agent_url == null) {
 		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
 	}
 
-	// Forward exactly the spawn request the agent expects (drop node_id
-	// since the agent doesn't need it).
+	// Forward to the agent (which doesn't need node_id; it knows it's local).
 	let agent_payload = {
-		profile: payload?.profile,
-		model:   payload?.model,
-		port:    payload?.port,
-		gpus:    payload?.gpus,
+		profile: profile_name,
+		model:   model,
+		port:    port,
+		gpus:    gpus,
 	};
 	try {
 		let resp = post_json(agent_url + "/services", agent_payload);
+		// Tag the placement decision into the response body so the client
+		// can see what CP picked. Only do this on success.
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			let body = parse(resp.body);
+			body["node_id"] = node_id;
+			body["placed_by"] = "cp";
+			return { status: resp.status_code, body: stringify(body) };
+		}
 		return { status: resp.status_code, body: resp.body };
 	} catch (e) {
 		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };

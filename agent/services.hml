@@ -40,6 +40,11 @@ fn new_id(db): string {
 // ── profiles ──────────────────────────────────────────────────────────
 // Encode the Merlina-style defaults. These are the *whole point* of v0.x:
 // no consumer should ever have to remember `--cache-type-k q4_0`.
+//
+// `context` and `kv_type` are duplicated from the flags array because
+// CP needs them as structured data for placement (max-VRAM math). The
+// flags array remains the source of truth for what we actually exec.
+// If you change one, change the other — small-enough surface to hand-sync.
 
 let PROFILES = {
 	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
@@ -54,6 +59,8 @@ let PROFILES = {
 				"-ngl", "99",
 				"-fa", "on"],
 		default_port: 8080,
+		context: 131072,
+		kv_type: "q4_0",
 	},
 
 	// CPU profile — Q8 KV (quality > speed for grammar-constrained
@@ -64,6 +71,8 @@ let PROFILES = {
 				"--cache-type-k", "q8_0",
 				"--cache-type-v", "q8_0"],
 		default_port: 8081,
+		context: 8192,
+		kv_type: "q8_0",
 	},
 
 	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
@@ -75,6 +84,8 @@ let PROFILES = {
 				"-ngl", "99",
 				"-fa", "on"],
 		default_port: 8085,
+		context: 32768,
+		kv_type: "q4_0",
 	},
 };
 
@@ -260,8 +271,21 @@ export fn make_handlers(db): object {
 			return { status: 204, body: "" };
 		},
 		profiles: fn(req): object {
+			// Return the full profile map so CP can use context/kv_type for
+			// placement math, not just names. Skip the binary `flags` array
+			// (the agent's responsibility, not CP's concern) to keep the
+			// payload small.
+			let out = {};
 			let names = PROFILES.keys();
-			return { status: 200, body: stringify(names) };
+			for (n in names) {
+				let p = PROFILES[n];
+				out[n] = {
+					default_port: p.default_port,
+					context: p.context,
+					kv_type: p.kv_type,
+				};
+			}
+			return { status: 200, body: stringify(out) };
 		},
 	};
 }
