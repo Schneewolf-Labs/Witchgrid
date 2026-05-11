@@ -1,20 +1,27 @@
-// dashboard.hml — single-page operator UI for CP.
+// dashboard.hml — htmx fragment renderers for the operator dashboard.
 //
-// GET /            full HTML shell (htmx + pico css from CDN, no build step)
-// GET /ui/nodes    htmx fragment: registered nodes + per-GPU free VRAM
-// GET /ui/services htmx fragment: running services across all agents
-// GET /ui/profiles htmx fragment: known profiles + auto-spawn status
+// The static surface (HTML shell, CSS, JS, logo) lives in dashboard/
+// and assets/ as normal source files; scripts/embed_assets.sh bakes
+// them into cp/embedded_assets.hml at build time. This file only
+// contains the *dynamic* HTML — the auto-refreshing nodes / services
+// / profiles tables — because they need to interpolate live data.
 //
-// Each fragment auto-refreshes every 5 seconds via hx-trigger=load,every 5s.
-// Operators can stop a service via the inline button (POST /services/stop
-// → CP proxies to the owning agent → SIGTERM).
+// HTMX hits these endpoints (wired in cp.hml) every 5s:
+//   GET /ui/nodes    → render_nodes(...)
+//   GET /ui/services → render_services(...)
+//   GET /ui/profiles → render_profiles(...)
 //
-// Design choices: zero build step. htmx + Pico from CDN. Hand-rolled HTML
-// strings instead of jinja templates because the surface is tiny and one
-// fewer stdlib dep keeps the binary lean. Refactor when we add a third
-// page that wants real templating.
+// Hand-built string concatenation rather than a template engine — the
+// surface is small enough that an extra dep (jinja) wouldn't earn its
+// keep. Reach for jinja when there's a third dynamic page.
 
-import { parse, stringify } from "@stdlib/json";
+// Re-export the static assets so cp.hml can hand them to the asset routes
+// without importing them itself. Single import surface for the dashboard.
+import { INDEX_HTML, STYLES_CSS, SPAWN_FORM_JS, LOGO_SVG } from "./embedded_assets";
+export let SHELL_HTML = INDEX_HTML;
+export let SHELL_CSS = STYLES_CSS;
+export let SHELL_JS = SPAWN_FORM_JS;
+export let LOGO = LOGO_SVG;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -46,9 +53,8 @@ fn fmt_mb(mb): string {
 	return "" + i32(n) + " MB";
 }
 
-// Compose a CSS color token from VRAM utilization. Used for the free-mb
-// progress bars — green when plenty free, amber when getting tight, red
-// when nearly full.
+// CSS color token from VRAM utilization. Used for the free-mb bars —
+// green when plenty free, amber when tight, red when nearly full.
 fn vram_color(free_mb, total_mb): string {
 	let pct = (f64(free_mb) / f64(total_mb)) * 100.0;
 	if (pct >= 50.0) { return "var(--pico-color-green-500)"; }
@@ -56,153 +62,10 @@ fn vram_color(free_mb, total_mb): string {
 	return "var(--pico-color-red-500)";
 }
 
-// HTTP wrapper — sets content-type so the browser doesn't squint.
-fn html_resp(body: string): object {
-	return {
-		status: 200,
-		body: body,
-		headers: { "content-type": "text/html; charset=utf-8" },
-	};
-}
-
-// ── shell page ───────────────────────────────────────────────────────
-
-// Alpine-driven spawn form. Pure-client state for the form fields,
-// fetches /profiles once on init to populate the dropdown, POSTs to
-// /services on submit. The auto-refreshing services table picks up
-// the new row on its next 5s tick — no need to manually re-render.
-let SPAWN_FORM_SCRIPT = "function spawnForm(){return{"
-	+ "profiles:{},profileName:'',model:'',advanced:false,"
-	+ "node_id:'',port:'',gpus:'',message:'',isError:false,busy:false,"
-	+ "async init(){"
-	+   "try{const r=await fetch('/profiles');this.profiles=await r.json();}"
-	+   "catch(e){this.message='could not load profiles: '+e;this.isError=true;}"
-	+ "},"
-	+ "onProfileChange(){"
-	+   "const p=this.profiles[this.profileName];"
-	+   "if(p&&p.default_model){this.model=p.default_model;}"
-	+   "else if(p){this.model='';}"
-	+ "},"
-	+ "async submit(){"
-	+   "this.busy=true;this.message='';"
-	+   "const body={profile:this.profileName,model:this.model};"
-	+   "if(this.node_id)body.node_id=this.node_id;"
-	+   "if(this.port)body.port=parseInt(this.port);"
-	+   "if(this.gpus){"
-	+     "body.gpus=this.gpus.split(',').map(s=>parseInt(s.trim())).filter(n=>!isNaN(n));"
-	+   "}"
-	+   "try{"
-	+     "const r=await fetch('/services',{method:'POST',"
-	+       "headers:{'content-type':'application/json'},body:JSON.stringify(body)});"
-	+     "const d=await r.json();"
-	+     "this.isError=!r.ok;"
-	+     "if(r.ok){this.message='spawned '+d.id.slice(0,8)+' on '+d.node_id+' port '+d.port;}"
-	+     "else{this.message=d.error||('HTTP '+r.status);}"
-	+   "}catch(e){this.isError=true;this.message='request failed: '+e;}"
-	+   "this.busy=false;"
-	+ "}"
-	+ "}}";
-
-let SHELL = "<!doctype html>\n"
-	+ "<html lang=\"en\">\n"
-	+ "<head>\n"
-	+ "  <meta charset=\"utf-8\">\n"
-	+ "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-	+ "  <title>witchgrid</title>\n"
-	+ "  <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css\">\n"
-	+ "  <script src=\"https://unpkg.com/htmx.org@2.0.4\"></script>\n"
-	+ "  <script defer src=\"https://unpkg.com/alpinejs@3.14.3/dist/cdn.min.js\"></script>\n"
-	+ "  <script>" + SPAWN_FORM_SCRIPT + "</script>\n"
-	+ "  <style>\n"
-	+ "    main { padding: 1rem 2rem; max-width: 1200px; }\n"
-	+ "    h1 { font-family: 'Courier New', monospace; letter-spacing: -1px; margin: 0 0 0.5rem; }\n"
-	+ "    .meta { color: var(--pico-muted-color); font-size: 0.85em; }\n"
-	+ "    section { margin-top: 2rem; }\n"
-	+ "    table { font-size: 0.9em; }\n"
-	+ "    table th { text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.05em; color: var(--pico-muted-color); }\n"
-	+ "    .gpu-row { display: flex; align-items: center; gap: 0.5rem; margin: 2px 0; font-family: monospace; font-size: 0.85em; }\n"
-	+ "    .gpu-bar { flex: 1; height: 8px; background: var(--pico-card-background-color); border-radius: 4px; overflow: hidden; max-width: 200px; }\n"
-	+ "    .gpu-bar > div { height: 100%; transition: width 0.3s; }\n"
-	+ "    .gpu-name { min-width: 180px; opacity: 0.8; font-size: 0.85em; }\n"
-	+ "    .gpu-mem { min-width: 110px; text-align: right; font-variant-numeric: tabular-nums; }\n"
-	+ "    .stale { color: var(--pico-color-red-500); font-weight: bold; }\n"
-	+ "    .alive-yes { color: var(--pico-color-green-500); }\n"
-	+ "    .alive-no { color: var(--pico-color-red-500); }\n"
-	+ "    .empty { color: var(--pico-muted-color); font-style: italic; padding: 1rem 0; }\n"
-	+ "    .id { font-family: monospace; font-size: 0.85em; opacity: 0.7; }\n"
-	+ "    .stop-btn { padding: 0.2rem 0.6rem; font-size: 0.85em; margin: 0; }\n"
-	+ "    code { font-size: 0.85em; }\n"
-	+ "    form.spawn { display: grid; grid-template-columns: 200px 1fr auto; gap: 0.75rem; align-items: end; }\n"
-	+ "    form.spawn label { margin: 0; font-size: 0.85em; }\n"
-	+ "    form.spawn input, form.spawn select { margin: 0; }\n"
-	+ "    form.spawn details { grid-column: 1 / -1; }\n"
-	+ "    form.spawn details > div { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.75rem; padding-top: 0.5rem; }\n"
-	+ "    form.spawn .msg { grid-column: 1 / -1; margin: 0; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 0.9em; }\n"
-	+ "    form.spawn .msg.ok { background: var(--pico-color-green-50); color: var(--pico-color-green-700); }\n"
-	+ "    form.spawn .msg.err { background: var(--pico-color-red-50); color: var(--pico-color-red-700); white-space: pre-wrap; font-family: monospace; font-size: 0.8em; }\n"
-	+ "  </style>\n"
-	+ "</head>\n"
-	+ "<body>\n"
-	+ "  <main>\n"
-	+ "    <h1>witchgrid</h1>\n"
-	+ "    <p class=\"meta\">control plane · live every 5s</p>\n"
-	+ "\n"
-	+ "    <section>\n"
-	+ "      <h2>Spawn</h2>\n"
-	+ "      <form class=\"spawn\" x-data=\"spawnForm()\" @submit.prevent=\"submit()\">\n"
-	+ "        <div>\n"
-	+ "          <label for=\"prof\">profile</label>\n"
-	+ "          <select id=\"prof\" x-model=\"profileName\" @change=\"onProfileChange()\" required>\n"
-	+ "            <option value=\"\">— select —</option>\n"
-	+ "            <template x-for=\"name in Object.keys(profiles)\" :key=\"name\">\n"
-	+ "              <option :value=\"name\" x-text=\"name\"></option>\n"
-	+ "            </template>\n"
-	+ "          </select>\n"
-	+ "        </div>\n"
-	+ "        <div>\n"
-	+ "          <label for=\"mdl\">model path</label>\n"
-	+ "          <input id=\"mdl\" type=\"text\" x-model=\"model\" placeholder=\"/path/to/model.gguf\" required>\n"
-	+ "        </div>\n"
-	+ "        <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'spawn'\"></button>\n"
-	+ "        <details>\n"
-	+ "          <summary>advanced (pin placement)</summary>\n"
-	+ "          <div>\n"
-	+ "            <input type=\"text\" x-model=\"node_id\" placeholder=\"node_id (auto)\">\n"
-	+ "            <input type=\"text\" x-model=\"gpus\" placeholder=\"gpus, e.g. 0,2 (auto)\">\n"
-	+ "            <input type=\"number\" x-model=\"port\" placeholder=\"port (auto)\">\n"
-	+ "          </div>\n"
-	+ "        </details>\n"
-	+ "        <p class=\"msg\" :class=\"isError ? 'err' : 'ok'\" x-show=\"message\" x-text=\"message\"></p>\n"
-	+ "      </form>\n"
-	+ "    </section>\n"
-	+ "\n"
-	+ "    <section>\n"
-	+ "      <h2>Nodes</h2>\n"
-	+ "      <div hx-get=\"/ui/nodes\" hx-trigger=\"load, every 5s\">loading…</div>\n"
-	+ "    </section>\n"
-	+ "\n"
-	+ "    <section>\n"
-	+ "      <h2>Services</h2>\n"
-	+ "      <div hx-get=\"/ui/services\" hx-trigger=\"load, every 5s\">loading…</div>\n"
-	+ "    </section>\n"
-	+ "\n"
-	+ "    <section>\n"
-	+ "      <h2>Profiles</h2>\n"
-	+ "      <div hx-get=\"/ui/profiles\" hx-trigger=\"load, every 5s\">loading…</div>\n"
-	+ "    </section>\n"
-	+ "  </main>\n"
-	+ "</body>\n"
-	+ "</html>\n";
-
-export fn handle_dashboard(req): object {
-	return html_resp(SHELL);
-}
-
 // ── /ui/nodes fragment ───────────────────────────────────────────────
 
 // nodes_data: [{node_id, hostname, role, hardware: {gpus: [...]},
 //               agent_url, registered_at, last_seen_at, age_seconds}]
-// Renders one row per node, with GPU bars nested inside.
 export fn render_nodes(nodes_data, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
@@ -269,9 +132,9 @@ export fn render_services(services_data): string {
 			let tail = parts[parts.length - 1];
 			if (tail.length > 0) { model = tail; }
 		}
-		// Stop button: plain fetch() rather than htmx so we don't need the
-		// json-enc extension loaded. The dashboard's auto-refresh picks
-		// up the row removal on the next 5s tick.
+		// Stop button: plain fetch() onclick rather than htmx so we don't
+		// need the json-enc extension loaded. Auto-refresh picks up the
+		// row removal on the next 5s tick.
 		let stop_js = "if(confirm('Stop " + esc(s.profile) + " on "
 			+ esc(s.node_id) + "?'))"
 			+ "fetch('/services/stop',{method:'POST',"

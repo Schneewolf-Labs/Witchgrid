@@ -35,7 +35,7 @@ import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb } from "./gguf";
-import { handle_dashboard, render_nodes, render_services, render_profiles } from "./dashboard";
+import { render_nodes, render_services, render_profiles, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -646,6 +646,34 @@ fn handle_list_profiles(req): object {
 	return { status: 200, body: stringify(aggregated_profiles()) };
 }
 
+// Static assets — HTML shell + CSS + JS + logo, all baked into the
+// binary at build time via scripts/embed_assets.sh. Served with a
+// modest cache lifetime (the only way to change them is to rebuild
+// and redeploy, but we still want operators iterating on the dashboard
+// to see fresh bytes within seconds, not a day).
+let ASSET_CACHE = "public, max-age=60";
+
+fn handle_dashboard_html(req): object {
+	return { status: 200, body: SHELL_HTML,
+		headers: { "content-type": "text/html; charset=utf-8",
+			"cache-control": ASSET_CACHE } };
+}
+fn handle_dashboard_css(req): object {
+	return { status: 200, body: SHELL_CSS,
+		headers: { "content-type": "text/css; charset=utf-8",
+			"cache-control": ASSET_CACHE } };
+}
+fn handle_dashboard_js(req): object {
+	return { status: 200, body: SHELL_JS,
+		headers: { "content-type": "application/javascript; charset=utf-8",
+			"cache-control": ASSET_CACHE } };
+}
+fn handle_logo(req): object {
+	return { status: 200, body: LOGO,
+		headers: { "content-type": "image/svg+xml",
+			"cache-control": ASSET_CACHE } };
+}
+
 // ── boot ─────────────────────────────────────────────────────────────
 
 fn main(): null {
@@ -660,8 +688,12 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
-		// Dashboard + JSON profiles (the form needs structured data)
-		{ method: "GET",  path: "/",              handler: handle_dashboard },
+		// Dashboard shell + static assets (all baked into the binary)
+		{ method: "GET",  path: "/",                       handler: handle_dashboard_html },
+		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css },
+		{ method: "GET",  path: "/assets/spawn_form.js",   handler: handle_dashboard_js },
+		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo },
+		// Dashboard live fragments + JSON profiles (the form needs structured data)
 		{ method: "GET",  path: "/ui/nodes",      handler: handle_ui_nodes },
 		{ method: "GET",  path: "/ui/services",   handler: handle_ui_services },
 		{ method: "GET",  path: "/ui/profiles",   handler: handle_ui_profiles },
