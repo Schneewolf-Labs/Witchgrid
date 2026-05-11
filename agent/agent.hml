@@ -41,6 +41,7 @@ import { sleep } from "@stdlib/time";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
 import { probe } from "./hardware";
+import { introspect } from "./capabilities";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -152,6 +153,19 @@ fn main(): null {
 	}
 	print("[agent] sqlite ready: " + DB_PATH);
 
+	// Introspect the local llama-server binary once at boot so CP can
+	// ask "does this agent's binary support flash_attention?" without
+	// each request re-running --help. Cached for the agent's lifetime;
+	// restart the agent after a llama.cpp upgrade to refresh.
+	let llama_caps = {};
+	try {
+		llama_caps = introspect("llama-server");
+		print("[agent] llama-server: " + llama_caps.keys().length + " flags");
+	} catch (e) {
+		eprint("[agent] llama-server introspection failed: " + e
+			+ " (capabilities unavailable; spawning still works)");
+	}
+
 	// Pass our own listen port as reserved so spawn_service refuses to
 	// land an llama-server there (the OS would let two binds compete and
 	// our future restart would lose).
@@ -161,6 +175,11 @@ fn main(): null {
 		{ method: "GET",  path: "/services",      handler: svc.list },
 		{ method: "POST", path: "/services/stop", handler: svc.stop },
 		{ method: "GET",  path: "/profiles",      handler: svc.profiles },
+		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
+			return { status: 200, body: stringify({
+				"llama-server": llama_caps,
+			})};
+		} },
 		{ method: "GET",  path: "/healthz",       handler: fn(req): object {
 			return { status: 200, body: "{\"status\":\"ok\"}" };
 		} },

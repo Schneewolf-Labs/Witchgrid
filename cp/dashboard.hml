@@ -157,6 +157,67 @@ export fn render_services(services_data): string {
 	return html;
 }
 
+// ── /ui/capabilities fragment ────────────────────────────────────────
+//
+// caps_data: { node_id → { binary → { flag_name → flag_info } } }
+// Renders a per-node summary: the binaries each agent introspected and
+// how many flags each one exposes. Detailed flag listing is collapsed
+// behind a <details> so the section stays compact for fleets with
+// hundreds of flags per binary.
+export fn render_capabilities(caps_data): string {
+	let nodes = caps_data.keys();
+	if (nodes.length == 0) {
+		return "<p class=\"empty\">No agents have reported capabilities yet.</p>";
+	}
+	let html = "";
+	for (node in nodes) {
+		html = html + "<h3 style=\"margin-top:1.25rem;font-size:1em\">"
+			+ esc(node) + "</h3>";
+		let binaries = caps_data[node];
+		let bnames = binaries.keys();
+		if (bnames.length == 0) {
+			html = html + "<p class=\"empty\">No binaries introspected.</p>";
+			continue;
+		}
+		for (b in bnames) {
+			let flags = binaries[b];
+			let fnames = flags.keys();
+			html = html + "<details style=\"margin-bottom:0.5rem\">"
+				+ "<summary><code>" + esc(b) + "</code> — "
+				+ fnames.length + " flags</summary>"
+				+ "<table style=\"margin-top:0.5rem\">"
+				+ "<thead><tr><th>flag</th><th>aliases</th><th>value</th><th>description</th></tr></thead>"
+				+ "<tbody>";
+			for (flag_name in fnames) {
+				let f = flags[flag_name];
+				let aliases = "";
+				let i = 1;  // skip primary (already shown in flag column)
+				while (i < f.longs.length) {
+					if (i > 1) { aliases = aliases + " "; }
+					aliases = aliases + "<code>" + esc(f.longs[i]) + "</code>";
+					i = i + 1;
+				}
+				let short_str = "";
+				if (f.short != null) {
+					short_str = "<code>" + esc(f.short) + "</code> ";
+				}
+				let value_str = "";
+				if (f.value != null) {
+					value_str = "<code>" + esc(f.value) + "</code>";
+				}
+				html = html + "<tr>"
+					+ "<td>" + short_str + "<code>" + esc(f.longs[0]) + "</code></td>"
+					+ "<td>" + aliases + "</td>"
+					+ "<td>" + value_str + "</td>"
+					+ "<td style=\"font-size:0.85em\">" + esc(f.description) + "</td>"
+					+ "</tr>";
+			}
+			html = html + "</tbody></table></details>";
+		}
+	}
+	return html;
+}
+
 // ── /ui/profiles fragment ────────────────────────────────────────────
 
 // profiles_data: object map { name → { default_port, context, kv_type,

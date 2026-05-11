@@ -70,6 +70,12 @@ export let INDEX_HTML = "<!doctype html>
       <h2>Profiles</h2>
       <div hx-get=\"/ui/profiles\" hx-trigger=\"load, every 5s\">loading…</div>
     </section>
+
+    <section>
+      <h2>Capabilities</h2>
+      <p class=\"meta\" style=\"margin-left:0\">What flags each agent's binaries actually support. Refreshed when an agent restarts.</p>
+      <div hx-get=\"/ui/capabilities\" hx-trigger=\"load, every 30s\">loading…</div>
+    </section>
   </main>
 </body>
 </html>

@@ -1,0 +1,237 @@
+// capabilities.hml — parse `llama-server --help` into a structured
+// flag map so CP can ask "does this binary support flash_attention?"
+// instead of guessing from llama.cpp version numbers.
+//
+// Why: llama.cpp's CLI surface drifts. `-fa` was a bare boolean for a
+// while, then started requiring `-fa on|off|auto`. Profiles that
+// hardcoded the right form for one version silently break on the next.
+// Capability introspection lets profiles declare INTENT (e.g.
+// flash_attention: true) and lets the agent translate that to whatever
+// the local binary's flag form actually is. That translation is the
+// next slice — this slice just builds the data layer.
+//
+// Format we parse — `llama-server --help` lines look like:
+//
+//   -fa,   --flash-attn [on|off|auto]       set Flash Attention use ...
+//   -t,    --threads N                      number of CPU threads ...
+//   --version                               show version and build info
+//   --cpu-strict <0|1>                      use strict CPU placement ...
+//
+// Each line has: optional short flag (-x or -xx, with trailing comma),
+// one or more long flags (--foo, --foo-alias), optional value
+// placeholder (a bare token like N/M, an angle-bracket enum like
+// <0|1>, or a square-bracket enum like [on|off|auto]), then the
+// description aligned in a far column.
+//
+// Output shape, per flag (using the FIRST long name as the key):
+//   {
+//     "flash-attn": {
+//       short: "-fa",            (or null)
+//       longs: ["--flash-attn"], (always at least one)
+//       value: "[on|off|auto]",  (or null if boolean / no value)
+//       description: "set Flash Attention use ('on', 'off', 'auto', default: 'auto')"
+//     },
+//     ...
+//   }
+
+import { exec_argv } from "@stdlib/process";
+
+// A token starts a flag def if it looks like "-x", "-xx,", "--foo",
+// "--foo,". Continuation/section lines won't start that way.
+fn is_flag_token(tok: string): bool {
+	if (tok.length < 2) { return false; }
+	let c = tok[0];
+	if (c != '-') { return false; }
+	// Reject "--" alone or things like "-1" that aren't flag names
+	let c1 = tok[1];
+	if (c1 == '-') { return tok.length >= 3; }  // long
+	// short: char after - must be a letter
+	return (c1 >= 'a' && c1 <= 'z') || (c1 >= 'A' && c1 <= 'Z');
+}
+
+// Strip a single trailing comma (from "-fa," or "--help,")
+fn strip_comma(s: string): string {
+	if (s.length > 0 && s[s.length - 1] == ',') {
+		return s.substr(0, s.length - 1);
+	}
+	return s;
+}
+
+// Heuristic: does this token look like a value-shape placeholder?
+// Value shapes in llama-server's --help take a few forms:
+//   - bracket-enum: <0|1>, [on|off|auto]
+//   - all-caps single word: N, M, TYPE, PORT, LOGDIR
+//   - hyphenated lowercase: lo-hi
+// Anything else is the first word of the description.
+fn is_value_shape(tok: string): bool {
+	if (tok.length == 0) { return false; }
+	let c = tok[0];
+	if (c == '<' || c == '[') { return true; }
+	// All upper-case letters (and digits + underscores) → placeholder.
+	let i = 0;
+	let all_upper = true;
+	while (i < tok.length) {
+		let cc = tok[i];
+		let is_upper = (cc >= 'A' && cc <= 'Z');
+		let is_digit = (cc >= '0' && cc <= '9');
+		let is_und = (cc == '_');
+		if (!(is_upper || is_digit || is_und)) {
+			all_upper = false;
+			break;
+		}
+		i = i + 1;
+	}
+	if (all_upper) { return true; }
+	// Hyphenated lowercase like "lo-hi"
+	if (tok.find("-") > 0) {
+		let j = 0;
+		let ok = true;
+		while (j < tok.length) {
+			let cc = tok[j];
+			let is_lower = (cc >= 'a' && cc <= 'z');
+			if (cc != '-' && !is_lower) { ok = false; break; }
+			j = j + 1;
+		}
+		if (ok) { return true; }
+	}
+	return false;
+}
+
+// Tokenize a line on whitespace runs. Drops empty tokens. Single
+// pass, no allocation per char.
+fn whitespace_tokens(line: string): array {
+	let out = [];
+	let i = 0;
+	let n = line.length;
+	while (i < n) {
+		// skip whitespace
+		while (i < n) {
+			let c = line[i];
+			if (c != ' ' && c != '\t') { break; }
+			i = i + 1;
+		}
+		if (i >= n) { break; }
+		let start = i;
+		while (i < n) {
+			let c = line[i];
+			if (c == ' ' || c == '\t') { break; }
+			i = i + 1;
+		}
+		out.push(line.substr(start, i - start));
+	}
+	return out;
+}
+
+// Parse a single flag-def line (already known to start with "-").
+// Walks the whitespace-separated tokens classifying each as flag /
+// value-shape / description-word. Description starts at the first
+// token that is neither a flag (-X / --foo) nor a value shape.
+fn parse_flag_line(line: string) {
+	let trimmed = line.trim();
+	if (trimmed.length == 0 || trimmed[0] != '-') { return null; }
+
+	let tokens = whitespace_tokens(trimmed);
+	if (tokens.length == 0) { return null; }
+
+	let short = null;
+	let longs = [];
+	let value = null;
+	let desc_start = tokens.length;  // index where description begins
+
+	let j = 0;
+	while (j < tokens.length) {
+		let tok = tokens[j];
+		let bare = strip_comma(tok);
+		if (bare.length >= 2 && bare[0] == '-' && bare[1] == '-') {
+			longs.push(bare);
+			j = j + 1;
+		} else if (is_flag_token(bare)) {
+			if (short == null) { short = bare; }
+			j = j + 1;
+		} else if (is_value_shape(tok)) {
+			// Value placeholder. There's only ever one in llama-server's
+			// --help format. After this, everything is description.
+			value = tok;
+			j = j + 1;
+			desc_start = j;
+			break;
+		} else {
+			// First word of the description.
+			desc_start = j;
+			break;
+		}
+	}
+	if (longs.length == 0) { return null; }
+
+	let desc = "";
+	if (desc_start < tokens.length) {
+		let parts = [];
+		let k = desc_start;
+		while (k < tokens.length) { parts.push(tokens[k]); k = k + 1; }
+		desc = parts.join(" ");
+	}
+
+	return {
+		short: short,
+		longs: longs,
+		value: value,
+		description: desc,
+	};
+}
+
+// Parse the full --help output into { primary_long_name → flag_info }.
+// Skips section headers ("----- common params -----"), ignores
+// continuation lines (heavily-indented description wrap-arounds), and
+// drops anything before the first flag (CUDA init noise etc.).
+export fn parse_help(output: string): object {
+	let flags = {};
+	let lines = output.split("\n");
+	let in_flags = false;
+	for (line in lines) {
+		// Strip CR if present (some llama-server builds use CRLF)
+		let l = line;
+		if (l.length > 0 && l[l.length - 1] == '\r') {
+			l = l.substr(0, l.length - 1);
+		}
+		// Skip section dividers
+		let trimmed = l.trim();
+		if (trimmed.length >= 5
+		    && trimmed[0] == '-' && trimmed[1] == '-'
+		    && trimmed[2] == '-' && trimmed[3] == '-'
+		    && trimmed[4] == '-') { continue; }
+		// Continuation lines are indented past column 30-ish; we don't
+		// currently capture wrapped description text. Skip cheaply: if
+		// the trimmed line doesn't start with '-', it's not a flag def.
+		if (trimmed.length == 0 || trimmed[0] != '-') {
+			continue;
+		}
+		let parsed = parse_flag_line(l);
+		if (parsed == null) { continue; }
+		// Key is the first long-name (with -- prefix stripped) so look-
+		// ups like caps["flash-attn"] are natural.
+		let primary = parsed.longs[0];
+		let key = primary.substr(2, primary.length - 2);
+		flags[key] = parsed;
+		in_flags = true;
+	}
+	return flags;
+}
+
+// Run `<binary> --help` and return the parsed flag map. CUDA-enabled
+// builds spit GPU-init lines to stderr first; we capture both streams
+// so we can ignore them and still get the help block.
+export fn introspect(binary: string): object {
+	let r = null;
+	try {
+		r = exec_argv([binary, "--help"]);
+	} catch (e) {
+		throw "could not run " + binary + " --help: " + e;
+	}
+	// Some builds print --help to stdout, some to stderr (lws / cuda
+	// init goes to stderr too). Concatenate to be safe.
+	let combined = r.output;
+	if (r?.stderr != null && r.stderr.length > 0) {
+		combined = combined + "\n" + r.stderr;
+	}
+	return parse_help(combined);
+}

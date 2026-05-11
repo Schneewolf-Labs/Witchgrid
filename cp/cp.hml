@@ -35,7 +35,7 @@ import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb } from "./gguf";
-import { render_nodes, render_services, render_profiles, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
+import { render_nodes, render_services, render_profiles, render_capabilities, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -639,6 +639,27 @@ fn handle_ui_profiles(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
+// Per-node capability map: { node_id → { binary → { flag → flag_info } } }
+// Each agent introspects its own binaries at boot; CP just fans out.
+fn aggregated_capabilities(): object {
+	let agents = list_all_agents();
+	let out = {};
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/capabilities", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				out[a.node_id] = parse(resp.body);
+			}
+		} catch (e) { }
+	}
+	return out;
+}
+
+fn handle_ui_capabilities(req): object {
+	return { status: 200, body: render_capabilities(aggregated_capabilities()),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
 // JSON profiles endpoint — for the dashboard's Alpine-driven spawn form
 // (profile dropdown auto-fills the model field from the profile's
 // default_model). Same shape the agents return, but merged.
@@ -694,10 +715,11 @@ fn main(): null {
 		{ method: "GET",  path: "/assets/spawn_form.js",   handler: handle_dashboard_js },
 		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo },
 		// Dashboard live fragments + JSON profiles (the form needs structured data)
-		{ method: "GET",  path: "/ui/nodes",      handler: handle_ui_nodes },
-		{ method: "GET",  path: "/ui/services",   handler: handle_ui_services },
-		{ method: "GET",  path: "/ui/profiles",   handler: handle_ui_profiles },
-		{ method: "GET",  path: "/profiles",      handler: handle_list_profiles },
+		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes },
+		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services },
+		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles },
+		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities },
+		{ method: "GET",  path: "/profiles",        handler: handle_list_profiles },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
