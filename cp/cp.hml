@@ -35,6 +35,7 @@ import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb } from "./gguf";
+import { handle_dashboard, render_nodes, render_services, render_profiles } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -541,6 +542,81 @@ fn handle_llama_proxy(req): object {
 	}
 }
 
+// ── dashboard data fetchers ─────────────────────────────────────────
+// Thin wrappers that pull live data the dashboard fragments need.
+// Kept here (rather than in dashboard.hml) because they touch the DB
+// and the cross-agent fan-out — concerns that belong with CP.
+
+fn nodes_for_dashboard(): array {
+	let rows = query(DB,
+		"select node_id, hostname, role, hardware_json, agent_url, "
+		+ "registered_at, last_seen_at, "
+		+ "cast((julianday('now') - julianday(last_seen_at)) * 86400 as integer) as age_seconds "
+		+ "from nodes order by registered_at desc", []);
+	let out = [];
+	for (row in rows) {
+		out.push({
+			node_id: row.node_id,
+			hostname: row.hostname,
+			role: row.role,
+			hardware: parse(row.hardware_json),
+			agent_url: row.agent_url,
+			last_seen_at: row.last_seen_at,
+			age_seconds: row.age_seconds,
+		});
+	}
+	return out;
+}
+
+fn handle_ui_nodes(req): object {
+	let body = render_nodes(nodes_for_dashboard(), STALE_NODE_SECONDS);
+	return { status: 200, body: body,
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+fn handle_ui_services(req): object {
+	// Reuse the JSON aggregator's logic — call the agents, build the
+	// merged list, hand to the renderer.
+	let agents = list_all_agents();
+	let merged = [];
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/services", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let entries = parse(resp.body);
+				for (e in entries) {
+					e["node_id"] = a.node_id;
+					merged.push(e);
+				}
+			}
+		} catch (e) { }
+	}
+	return { status: 200, body: render_services(merged),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+fn handle_ui_profiles(req): object {
+	// Profile maps from each reachable agent merged into one. In v1
+	// every agent ships the same profile set, so "first wins" is fine;
+	// when profiles diverge per agent we'll need a smarter UI.
+	let agents = list_all_agents();
+	let merged = {};
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/profiles", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let profiles = parse(resp.body);
+				let names = profiles.keys();
+				for (n in names) {
+					if (!merged.has(n)) { merged[n] = profiles[n]; }
+				}
+			}
+		} catch (e) { }
+	}
+	return { status: 200, body: render_profiles(merged),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
 // ── boot ─────────────────────────────────────────────────────────────
 
 fn main(): null {
@@ -555,6 +631,11 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
+		// Dashboard
+		{ method: "GET",  path: "/",              handler: handle_dashboard },
+		{ method: "GET",  path: "/ui/nodes",      handler: handle_ui_nodes },
+		{ method: "GET",  path: "/ui/services",   handler: handle_ui_services },
+		{ method: "GET",  path: "/ui/profiles",   handler: handle_ui_profiles },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
