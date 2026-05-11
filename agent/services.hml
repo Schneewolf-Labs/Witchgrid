@@ -125,30 +125,19 @@ fn iso_now(db): string {
 
 // kill(pid, 0) returns success for zombie processes (process exited but
 // not yet reaped), which makes it useless for "is this child still doing
-// work?" checks. waitpid(pid, WNOHANG) would reap and tell us truthfully,
-// but calling Hemlock's waitpid from this code path crashed the agent
-// process with `longjmp causes uninitialized stack frame` — likely an
-// interaction with the async heartbeat task's setjmp context. Workaround:
-// read /proc/<pid>/status, parse the State: line, treat Z (zombie) and
-// X (dead) as "not alive". Linux-specific; portability hit if we ever
-// support macOS agents.
-//
-// Two Hemlock subtleties worth knowing if this code surprises you:
-//   1. f.read() (no args) returns "" on /proc files because their stat
-//      size is 0 — must pass an explicit max-bytes for /proc reads.
-//   2. string[i] returns a rune, not a string. `c != " "` is always true
-//      (compares rune to string, mismatched types). Use rune literals
-//      with single quotes: `c != ' '`. Compiler warns on the mismatch
-//      but it's silent in the interpreter — easy to miss.
+// work?" checks. Read /proc/<pid>/status and parse the State: line —
+// Z (zombie), X (dead), T (stopped) all mean "not alive" for placement
+// purposes. Linux-specific; portability hit if we ever support macOS
+// agents (waitpid(pid, WNOHANG) would be the cross-platform answer
+// once Hemlock 2.2.x is settled).
 fn process_alive(pid: i32): bool {
 	try {
 		let f = open("/proc/" + pid + "/status", "r");
-		let content = f.read(2048);
+		let content = f.read();
 		f.close();
 		if (content == null || content.length == 0) { return false; }
 		let idx = content.find("State:");
 		if (idx < 0) { return false; }
-		// Walk past "State:" + whitespace to the state character.
 		let i = idx + 6;
 		while (i < content.length) {
 			let c = content[i];
@@ -157,11 +146,8 @@ fn process_alive(pid: i32): bool {
 		}
 		if (i >= content.length) { return false; }
 		let state = content[i];
-		// R(unning), S(leeping), D(uninterruptible), I(idle) → alive.
-		// Z(ombie), X(dead), T(stopped) → not alive for our purposes.
 		return state != 'Z' && state != 'X' && state != 'T';
 	} catch (e) {
-		// /proc/<pid>/status missing → process gone.
 		return false;
 	}
 }
@@ -258,7 +244,7 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 
 	let pid = result.pid;
 	if (pid <= 0) {
-		return { spawn_error: "posix_spawn returned invalid pid: " + pid };
+		throw "posix_spawn returned invalid pid: " + pid;
 	}
 
 	// Did the child immediately exit? Common causes: contended port,
@@ -266,12 +252,6 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 	// this check, we'd return 201 + a pid that's already a zombie, and
 	// the caller wouldn't know until the next /v1/llama/* request fails
 	// or the next agent /services list shows alive=false. Surface it now.
-	//
-	// Returning a structured error rather than `throw`-ing because Hemlock's
-	// exception path interacts badly with the async heartbeat task — the
-	// throw triggered "longjmp causes uninitialized stack frame" abort
-	// in the agent process. Worth filing upstream; in the meantime,
-	// non-throwing error returns sidestep the issue.
 	sleep(SPAWN_FAILURE_GRACE_SECONDS);
 	if (!process_alive(pid)) {
 		let tail = read_log_tail(log_path, 4096);
@@ -282,7 +262,7 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 		} else {
 			msg = msg + " (no log output captured at " + log_path + ")";
 		}
-		return { spawn_error: msg };
+		throw msg;
 	}
 
 	let now = iso_now(db);
@@ -353,14 +333,15 @@ export fn make_handlers(db): object {
 			let gpus = payload?.gpus ?? [];
 			try {
 				let svc = spawn_service(db, profile, model, port, gpus);
-				if (svc?.spawn_error != null) {
-					// 502 because the upstream binary (llama-server) failed
-					// during startup, not because the request was malformed.
-					return { status: 502, body: stringify({ error: svc.spawn_error }) };
-				}
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
-				return { status: 400, body: stringify({ error: "" + e }) };
+				// 502 vs 400: a port-bind / missing-model / OOM error from
+				// llama-server is upstream failure (502), not a client-input
+				// error. The "spawn died immediately" prefix is the marker.
+				let msg = "" + e;
+				let status = 400;
+				if (msg.find("spawn died") >= 0) { status = 502; }
+				return { status: status, body: stringify({ error: msg }) };
 			}
 		},
 		list: fn(req): object {
