@@ -5,7 +5,10 @@
 //   2. POST /register to the control plane with { node_id, hostname,
 //      role, hardware, agent_url } so CP knows where to reach us.
 //   3. Open sqlite, init the local services schema.
-//   4. Listen on AGENT_PORT for service-supervisor requests from CP.
+//   4. Spawn a detached heartbeat task that re-registers every
+//      HEARTBEAT_SECONDS with refreshed hardware (live free_mb counts
+//      so CP placement sees current state, not boot snapshot).
+//   5. Listen on AGENT_PORT for service-supervisor requests from CP.
 //
 // CP is the only intended caller — agents don't need to be reachable
 // from the public internet, just from CP. Bind to 0.0.0.0 by default
@@ -34,11 +37,17 @@ import { stringify } from "@stdlib/json";
 import { getenv } from "@stdlib/env";
 import { exec_argv } from "@stdlib/process";
 import { post_json } from "@stdlib/http";
+import { sleep } from "@stdlib/time";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers } from "./services";
 import { probe } from "./hardware";
 
 let DB_PATH = "witchgrid-agent.db";
+
+// 30s gives CP enough resolution that placement sees current free_mb
+// without burning excessive RPC. CP's stale-node cutoff is 90s (3x
+// this) so a single missed heartbeat doesn't flap us out of placement.
+let HEARTBEAT_SECONDS = 30;
 
 fn require_env(name: string): string {
 	let v = getenv(name);
@@ -74,9 +83,36 @@ fn register_with_cp(cp_url: string, payload): null {
 			eprint("[agent] CP returned " + resp.status_code + ": " + resp.body);
 		}
 	} catch (e) {
-		// Non-fatal: agent stays up, retry happens on the next operator-
-		// triggered re-register (heartbeat loop is a future slice).
-		eprint("[agent] register failed: " + e + " (continuing; CP can re-register us later)");
+		// Non-fatal: agent stays up, the heartbeat loop will re-try.
+		// CP-down at agent boot is fine; we'll show up on first heartbeat.
+		eprint("[agent] register failed: " + e + " (continuing; heartbeat will retry)");
+	}
+	return null;
+}
+
+// Heartbeat task. Runs detached on a worker thread. Re-probes hardware
+// each tick so CP's placement sees current free_mb, not boot-time
+// snapshot. Transient CP failures are swallowed — we'll succeed on the
+// next tick. The only way to stop the loop is process exit.
+async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
+                        agent_url: string, interval_seconds: i32): null {
+	loop {
+		sleep(f64(interval_seconds));
+		let hw = probe();
+		try {
+			let resp = post_json(cp_url + "/register", {
+				node_id:   node_id,
+				hostname:  hostname,
+				role:      hw.role,
+				hardware:  hw,
+				agent_url: agent_url,
+			});
+			if (resp.status_code < 200 || resp.status_code >= 300) {
+				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
+			}
+		} catch (e) {
+			eprint("[heartbeat] CP unreachable: " + e);
+		}
 	}
 	return null;
 }
@@ -101,6 +137,12 @@ fn main(): null {
 		hardware:  hw,
 		agent_url: agent_url,
 	});
+
+	// Detached heartbeat task — fire-and-forget, runs until process exit.
+	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
+	               HEARTBEAT_SECONDS);
+	detach(hb);
+	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
 	let db = open_db(DB_PATH);
 	init_services_schema(db);

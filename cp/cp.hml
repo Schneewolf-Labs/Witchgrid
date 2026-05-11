@@ -123,9 +123,18 @@ fn lookup_agent(node_id: string) {
 	return rows[0].agent_url;
 }
 
+// 90s = 3x the agent's 30s heartbeat interval. Gives one missed
+// heartbeat of slack so a transient network blip doesn't drop a node
+// out of placement, but a genuinely-dead agent falls out within a
+// minute and a half.
+let STALE_NODE_SECONDS = 90;
+
 fn list_all_agents(): array {
-	let rows = query(DB, "select node_id, agent_url from nodes "
-		+ "where agent_url is not null", []);
+	let rows = query(DB,
+		"select node_id, agent_url from nodes "
+		+ "where agent_url is not null "
+		+ "and last_seen_at > datetime('now', ?)",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
 	return rows;
 }
 
@@ -163,7 +172,10 @@ fn pick_placement(model_path: string, profile) {
 
 	let rows = query(DB,
 		"select node_id, agent_url, hardware_json from nodes "
-		+ "where agent_url is not null order by registered_at desc", []);
+		+ "where agent_url is not null "
+		+ "and last_seen_at > datetime('now', ?) "
+		+ "order by registered_at desc",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
 
 	for (row in rows) {
 		let hw = parse(row.hardware_json);
