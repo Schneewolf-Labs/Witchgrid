@@ -30,13 +30,18 @@ jobs:
 
       - name: Install Hemlock ${{ env.HEMLOCK_VERSION }}
         run: |
-          # Install to a writable prefix and add it to PATH for later steps.
-          # Skip the interactive PATH-modification prompt.
+          # NOTE: install to /usr/local rather than ~/.local — install.sh
+          # puts stdlib at ${PREFIX}/lib/hemlock/stdlib, but hemlockc only
+          # searches <exe-dir>/{stdlib,../stdlib}, cwd, and the hardcoded
+          # /usr/local/lib/hemlock/stdlib. With --prefix ~/.local none of
+          # those match and every @stdlib/* import errors out as
+          # "stdlib directory not found". /usr/local is the path that works
+          # without symlinks. (Filed upstream — when hemlockc gains a
+          # <exe-dir>/../lib/hemlock/stdlib search, switch back to ~/.local.)
           curl -fsSL https://raw.githubusercontent.com/hemlang/hemlock/main/install.sh \
-            | bash -s -- --version "v${HEMLOCK_VERSION}" \
-                         --prefix "${HOME}/.local" \
-                         --no-modify-path
-          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+            | sudo bash -s -- --version "v${HEMLOCK_VERSION}" \
+                              --prefix "/usr/local" \
+                              --no-modify-path
 
       - name: Verify Hemlock version
         run: |
