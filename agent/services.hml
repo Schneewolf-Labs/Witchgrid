@@ -116,6 +116,25 @@ export fn init_services_schema(db): null {
 	return null;
 }
 
+// Garbage-collect rows for services whose pid no longer points at a
+// live process. Catches the case where the agent restarted but a
+// previously-spawned llama-server is gone (crashed, or operator killed
+// it externally). Without this, GET /services would keep reporting
+// alive=false for every dead row, and pick_port would still treat
+// those ports as "in use" and bump past them — leaking port numbers
+// over time. Returns the number of rows deleted (for logging).
+export fn reap_zombie_services(db): i32 {
+	let rows = query(db, "select id, pid from services", []);
+	let reaped = 0;
+	for (row in rows) {
+		if (!process_alive(row.pid)) {
+			db_exec(db, "delete from services where id = ?", [row.id]);
+			reaped = reaped + 1;
+		}
+	}
+	return reaped;
+}
+
 // ── helpers ───────────────────────────────────────────────────────────
 
 fn iso_now(db): string {
@@ -317,7 +336,12 @@ export fn stop_service(db, id: string): bool {
 
 // ── HTTP handlers ─────────────────────────────────────────────────────
 
-export fn make_handlers(db): object {
+// reserved_ports: ports the agent must refuse to spawn services on,
+// regardless of who asks. The agent's own listen port is the obvious
+// one — letting an llama-server land there is how schneewolf orphaned
+// itself last session (a stray auto-spawn took 8766, agent restart
+// then couldn't bind, ssh-and-pkill required to recover).
+export fn make_handlers(db, reserved_ports): object {
 	return {
 		create: fn(req): object {
 			let payload = parse(req.body);
@@ -329,6 +353,17 @@ export fn make_handlers(db): object {
 			let port = payload?.port;
 			if (port == null) {
 				port = PROFILES[profile].default_port;
+			}
+			// Refuse to bind on reserved ports. Caller (CP's pick_port)
+			// should never send one of these, but defense in depth.
+			let i = 0;
+			while (i < reserved_ports.length) {
+				if (port == reserved_ports[i]) {
+					return { status: 409, body: stringify({
+						error: "port " + port + " is reserved by the agent itself",
+					})};
+				}
+				i = i + 1;
 			}
 			let gpus = payload?.gpus ?? [];
 			try {

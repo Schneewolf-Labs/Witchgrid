@@ -39,7 +39,7 @@ import { exec_argv } from "@stdlib/process";
 import { post_json } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
 import { serve } from "./http_server";
-import { init_services_schema, make_handlers } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
 import { probe } from "./hardware";
 
 let DB_PATH = "witchgrid-agent.db";
@@ -146,9 +146,16 @@ fn main(): null {
 
 	let db = open_db(DB_PATH);
 	init_services_schema(db);
+	let reaped = reap_zombie_services(db);
+	if (reaped > 0) {
+		print("[agent] reaped " + reaped + " zombie service rows from prior run");
+	}
 	print("[agent] sqlite ready: " + DB_PATH);
 
-	let svc = make_handlers(db);
+	// Pass our own listen port as reserved so spawn_service refuses to
+	// land an llama-server there (the OS would let two binds compete and
+	// our future restart would lose).
+	let svc = make_handlers(db, [port]);
 	let routes = [
 		{ method: "POST", path: "/services",      handler: svc.create },
 		{ method: "GET",  path: "/services",      handler: svc.list },
