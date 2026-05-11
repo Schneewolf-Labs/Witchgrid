@@ -45,6 +45,13 @@ fn new_id(db): string {
 // CP needs them as structured data for placement (max-VRAM math). The
 // flags array remains the source of truth for what we actually exec.
 // If you change one, change the other — small-enough surface to hand-sync.
+//
+// `default_model` is opt-in. When set, CP's routing API can auto-spawn
+// the profile on first request (POST /v1/llama/{profile}/completion
+// without a prior explicit POST /services). Set per-deployment because
+// the path is operator-specific. NULL means "explicit POST /services
+// required to bring this profile up." Future: read from a config file
+// or env so the binary doesn't carry deployment paths.
 
 let PROFILES = {
 	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
@@ -61,6 +68,7 @@ let PROFILES = {
 		default_port: 8080,
 		context: 131072,
 		kv_type: "q4_0",
+		default_model: "/mnt/BALTEUS/gguf_models/mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
 	},
 
 	// CPU profile — Q8 KV (quality > speed for grammar-constrained
@@ -73,6 +81,7 @@ let PROFILES = {
 		default_port: 8081,
 		context: 8192,
 		kv_type: "q8_0",
+		default_model: null,
 	},
 
 	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
@@ -86,6 +95,7 @@ let PROFILES = {
 		default_port: 8085,
 		context: 32768,
 		kv_type: "q4_0",
+		default_model: null,
 	},
 };
 
@@ -283,6 +293,7 @@ export fn make_handlers(db): object {
 					default_port: p.default_port,
 					context: p.context,
 					kv_type: p.kv_type,
+					default_model: p.default_model,
 				};
 			}
 			return { status: 200, body: stringify(out) };

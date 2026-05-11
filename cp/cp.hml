@@ -31,6 +31,7 @@
 import { open_db, exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 import { post_json, get, request as http_request } from "@stdlib/http";
+import { sleep } from "@stdlib/time";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb } from "./gguf";
 
@@ -366,6 +367,102 @@ fn find_service_for_profile(profile_name: string) {
 	return null;
 }
 
+// Wait for a freshly-spawned llama-server to flip from "Loading model" to
+// 200 on /health. Returns true on ready, false on timeout. 60s ceiling
+// covers a 12B model on a fast GPU; bigger models on slower disks may
+// need more — make configurable when that bites.
+let AUTOSPAWN_READY_TIMEOUT_SECONDS = 60;
+
+fn wait_for_service_ready(host: string, port: i32): bool {
+	let url = "http://" + host + ":" + port + "/health";
+	let waited = 0;
+	while (waited < AUTOSPAWN_READY_TIMEOUT_SECONDS) {
+		try {
+			let r = get(url, null);
+			if (r.status_code == 200) { return true; }
+			// 503 with "Loading model" body is the normal in-flight state;
+			// keep polling. Any other status is a real problem but we'll
+			// keep trying until timeout to ride out transient issues.
+		} catch (e) {
+			// Connection refused while llama-server's still binding the
+			// socket. Same — keep polling.
+		}
+		sleep(1.0);
+		waited = waited + 1;
+	}
+	return false;
+}
+
+// Triggered when handle_llama_proxy gets a request for a profile that
+// has no running service. Looks up the profile's default_model, runs
+// the same placement path as explicit POST /services, posts the spawn
+// to the chosen agent, then blocks on /health until the new instance
+// answers (or we hit the timeout).
+//
+// Returns { agent_host, port } on success, or an HTTP-shaped error
+// object {status, body} the caller should propagate to the client.
+//
+// NOTE: this blocks CP's accept loop for the load-time of the model
+// (10-15s for 12B-class). Single-threaded HTTP means no other requests
+// get served during that window. Acceptable for v1 since auto-spawn
+// fires rarely (only on first request after agent restart). When this
+// becomes a problem, the fix is to make CP's accept loop spawn each
+// request handler on a worker thread.
+fn auto_spawn(profile_name: string) {
+	let profile = fetch_profile(profile_name);
+	if (profile == null) {
+		return { error: { status: 503, body: stringify({
+			error: "no agent advertises profile: " + profile_name,
+		})}};
+	}
+	if (profile?.default_model == null) {
+		return { error: { status: 503, body: stringify({
+			error: "no running service for profile " + profile_name
+				+ " and no default_model declared on it (operator must POST /services first)",
+		})}};
+	}
+
+	let pick = pick_placement(profile.default_model, profile);
+	if (pick == null) {
+		return { error: { status: 503, body: stringify({
+			error: "auto-spawn declined: no GPU has free VRAM for "
+				+ profile_name + " at context " + profile.context,
+		})}};
+	}
+	let port = pick_port(pick.agent_url, profile.default_port);
+	let agent_payload = {
+		profile: profile_name,
+		model:   profile.default_model,
+		port:    port,
+		gpus:    [pick.gpu_index],
+	};
+
+	print("[autospawn] " + profile_name + " on " + pick.node_id
+		+ " gpu=" + pick.gpu_index + " port=" + port);
+
+	let spawn_resp = null;
+	try {
+		spawn_resp = post_json(pick.agent_url + "/services", agent_payload);
+	} catch (e) {
+		return { error: { status: 502, body: stringify({
+			error: "auto-spawn: agent unreachable: " + e,
+		})}};
+	}
+	if (spawn_resp.status_code < 200 || spawn_resp.status_code >= 300) {
+		return { error: { status: spawn_resp.status_code, body: spawn_resp.body }};
+	}
+
+	let host = extract_host(pick.agent_url);
+	if (!wait_for_service_ready(host, port)) {
+		return { error: { status: 503, body: stringify({
+			error: "auto-spawned service did not become ready in "
+				+ AUTOSPAWN_READY_TIMEOUT_SECONDS + "s",
+		})}};
+	}
+	print("[autospawn] " + profile_name + " ready on " + host + ":" + port);
+	return { agent_host: host, port: port };
+}
+
 fn handle_llama_proxy(req): object {
 	// req.path is "/v1/llama/chat-mahou/completion"; split off the profile
 	// and the suffix that goes to llama-server.
@@ -387,9 +484,13 @@ fn handle_llama_proxy(req): object {
 
 	let target = find_service_for_profile(profile_name);
 	if (target == null) {
-		return { status: 503, body: stringify({
-			error: "no running service for profile: " + profile_name,
-		})};
+		// Auto-spawn path. Either succeeds (target gets a value), or hands
+		// back a {status, body} we propagate to the client unchanged.
+		let result = auto_spawn(profile_name);
+		if (result?.error != null) {
+			return result.error;
+		}
+		target = result;
 	}
 
 	let target_url = "http://" + target.agent_host + ":" + target.port + suffix;
