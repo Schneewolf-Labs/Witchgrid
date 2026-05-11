@@ -595,10 +595,10 @@ fn handle_ui_services(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
-fn handle_ui_profiles(req): object {
-	// Profile maps from each reachable agent merged into one. In v1
-	// every agent ships the same profile set, so "first wins" is fine;
-	// when profiles diverge per agent we'll need a smarter UI.
+// Aggregate /profiles across all reachable agents; first-seen wins on
+// name collisions. Used by both the JSON /profiles endpoint (for the
+// dashboard's spawn form) and the HTML /ui/profiles fragment.
+fn aggregated_profiles(): object {
 	let agents = list_all_agents();
 	let merged = {};
 	for (a in agents) {
@@ -613,8 +613,19 @@ fn handle_ui_profiles(req): object {
 			}
 		} catch (e) { }
 	}
-	return { status: 200, body: render_profiles(merged),
+	return merged;
+}
+
+fn handle_ui_profiles(req): object {
+	return { status: 200, body: render_profiles(aggregated_profiles()),
 		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+// JSON profiles endpoint — for the dashboard's Alpine-driven spawn form
+// (profile dropdown auto-fills the model field from the profile's
+// default_model). Same shape the agents return, but merged.
+fn handle_list_profiles(req): object {
+	return { status: 200, body: stringify(aggregated_profiles()) };
 }
 
 // ── boot ─────────────────────────────────────────────────────────────
@@ -631,11 +642,12 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
-		// Dashboard
+		// Dashboard + JSON profiles (the form needs structured data)
 		{ method: "GET",  path: "/",              handler: handle_dashboard },
 		{ method: "GET",  path: "/ui/nodes",      handler: handle_ui_nodes },
 		{ method: "GET",  path: "/ui/services",   handler: handle_ui_services },
 		{ method: "GET",  path: "/ui/profiles",   handler: handle_ui_profiles },
+		{ method: "GET",  path: "/profiles",      handler: handle_list_profiles },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
