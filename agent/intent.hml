@@ -1,0 +1,179 @@
+// intent.hml — translate witchgrid-level intents into llama-server CLI args
+// based on the local binary's parsed capabilities.
+//
+// The motivating problem: llama.cpp drops/renames flags between releases.
+// `-fa` was a bare boolean for a while, then started requiring
+// `-fa on|off|auto`. Profile templates that hardcode the right form for
+// one version silently break on the next.
+//
+// The fix: profiles declare INTENT in normalized witchgrid terms, e.g.
+//   intent: { context: 131072, kv_cache_k: "q4_0", flash_attention: true }
+// At spawn time, this module looks each intent up against the agent's
+// cached `--help` output and emits whatever argv shape THAT binary
+// actually accepts. Same profile, different binary, right argv.
+//
+// What kinds an intent can have (the third column of INTENTS):
+//   "value"            — pass the intent's value verbatim after the flag.
+//                        e.g. context: 131072 → ["-c", "131072"]
+//   "boolean_or_enum"  — magic for flags that used to be bare booleans
+//                        and are now enums. true → "on", false → "off",
+//                        any string → that string. If the binary's flag
+//                        takes no value (legacy boolean), emit the flag
+//                        alone for true, nothing for false.
+
+// ── intent → flag mapping ────────────────────────────────────────────
+// One row per witchgrid-level concept. Add an entry here when a profile
+// needs a new dimension; the profile then refers to it by its left-side
+// key. Keep this small and intentional — every entry is something we
+// promise to keep stable across llama.cpp upgrades.
+
+fn build_intents(): object {
+	let m = {};
+	m["context"] = {
+		flag: "ctx-size",
+		kind: "value",
+		help: "Prompt+generation context window. Maps to -c / --ctx-size N.",
+	};
+	m["kv_cache_k"] = {
+		flag: "cache-type-k",
+		kind: "value",
+		help: "Quantization for the K side of the KV cache (f16, q8_0, q4_0).",
+	};
+	m["kv_cache_v"] = {
+		flag: "cache-type-v",
+		kind: "value",
+		help: "Quantization for the V side of the KV cache.",
+	};
+	m["parallel_slots"] = {
+		flag: "parallel",
+		kind: "value",
+		help: "Number of parallel decode slots. Set to 1 for RP/chat models.",
+	};
+	m["gpu_layers"] = {
+		flag: "gpu-layers",
+		kind: "value",
+		help: "Layers to offload to GPU. 99 = all (llama.cpp clamps to model depth).",
+	};
+	m["flash_attention"] = {
+		flag: "flash-attn",
+		kind: "boolean_or_enum",
+		help: "FlashAttention. true → on, false → off, or pass 'auto' explicitly.",
+	};
+	m["host"] = {
+		flag: "host",
+		kind: "value",
+		help: "Bind address. Spawner overrides; here for completeness.",
+	};
+	m["port"] = {
+		flag: "port",
+		kind: "value",
+		help: "Bind port. Spawner overrides per-service.",
+	};
+	return m;
+}
+
+let INTENTS = build_intents();
+
+// Pick the canonical CLI form for a flag descriptor. Prefer the short
+// form when present (less argv noise, llama-server's own help shows
+// shorts first), fall back to the primary long.
+fn canonical_flag(cap_entry): string {
+	if (cap_entry?.short != null) { return cap_entry.short; }
+	return cap_entry.longs[0];
+}
+
+// Render a single (intent_name, value) pair into 0+ argv tokens, given
+// the binary's capability map. Throws with an actionable message when
+// the binary doesn't support the requested intent — operator should
+// either upgrade llama.cpp or drop that field from the profile.
+fn render_one(intent_name: string, intent_value, capabilities): array {
+	if (!INTENTS.has(intent_name)) {
+		throw "unknown intent '" + intent_name + "' in profile "
+			+ "(extend INTENTS in agent/intent.hml or move to extra_flags)";
+	}
+	let spec = INTENTS[intent_name];
+	if (!capabilities.has(spec.flag)) {
+		throw "binary does not support intent '" + intent_name
+			+ "' (looking for --" + spec.flag + " in --help output). "
+			+ "Either upgrade the binary or remove this intent from the profile.";
+	}
+	let cap = capabilities[spec.flag];
+	let flag_str = canonical_flag(cap);
+
+	if (spec.kind == "value") {
+		return [flag_str, "" + intent_value];
+	}
+
+	if (spec.kind == "boolean_or_enum") {
+		// Translate intent value into the canonical wire form.
+		let wire = null;
+		if (intent_value == true)  { wire = "on"; }
+		else if (intent_value == false) { wire = "off"; }
+		else { wire = "" + intent_value; }
+
+		if (cap.value == null) {
+			// Legacy boolean flag — emit the flag alone for "on", omit
+			// entirely for "off". Anything else is an error against this
+			// older binary.
+			if (wire == "on")  { return [flag_str]; }
+			if (wire == "off") { return []; }
+			throw "intent '" + intent_name + "' value '" + wire
+				+ "' is not supported by this binary's "
+				+ flag_str + " (legacy boolean form, only on/off accepted)";
+		}
+		// Enum form — pass the wire value through as the flag's argument.
+		return [flag_str, wire];
+	}
+
+	throw "unknown intent kind '" + spec.kind + "' for '" + intent_name + "'";
+}
+
+// Render the full argv tail for a profile (i.e. the part after the
+// binary name and the spawner-supplied -m/--port/--host args).
+//
+// intent_map: { context: 131072, flash_attention: true, ... }
+// extra_flags: optional array of raw strings appended verbatim — escape
+//              hatch for flags we haven't promoted to a named intent.
+// capabilities: the binary's parsed --help map.
+//
+// Iteration order over intent_map is map-key order, which Hemlock
+// preserves as insertion order. Profiles should put the more "obviously
+// influential" intents (context, gpu_layers) first so the rendered
+// command line reads naturally.
+export fn render_argv(intent_map, extra_flags, capabilities): array {
+	let argv = [];
+	let names = intent_map.keys();
+	for (n in names) {
+		let parts = render_one(n, intent_map[n], capabilities);
+		for (p in parts) { argv.push(p); }
+	}
+	if (extra_flags != null) {
+		for (f in extra_flags) { argv.push(f); }
+	}
+	return argv;
+}
+
+// Diagnostic: explain how a profile's intents would render against a
+// given capability map, without actually spawning anything. Returns a
+// human-readable multi-line string. Useful for the dashboard's profile
+// view (future) or for an operator running `witchgrid-inspect`.
+export fn explain(intent_map, capabilities): string {
+	let out = "";
+	let names = intent_map.keys();
+	for (n in names) {
+		try {
+			let parts = render_one(n, intent_map[n], capabilities);
+			let argv_str = "";
+			let i = 0;
+			while (i < parts.length) {
+				if (i > 0) { argv_str = argv_str + " "; }
+				argv_str = argv_str + parts[i];
+				i = i + 1;
+			}
+			out = out + "  " + n + " = " + intent_map[n] + " → " + argv_str + "\n";
+		} catch (e) {
+			out = out + "  " + n + " = " + intent_map[n] + " → ERROR: " + e + "\n";
+		}
+	}
+	return out;
+}

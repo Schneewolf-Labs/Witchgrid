@@ -166,10 +166,22 @@ fn main(): null {
 			+ " (capabilities unavailable; spawning still works)");
 	}
 
+	// Capabilities lookup closure — services.hml uses this to resolve
+	// each profile's intent map at spawn time. Captured-by-reference
+	// so a future on-demand reintrospect (post-llama.cpp-upgrade)
+	// would just need to mutate the table.
+	let caps_by_binary = { "llama-server": llama_caps };
+	fn capabilities_for(binary_name) {
+		if (caps_by_binary.has(binary_name)) {
+			return caps_by_binary[binary_name];
+		}
+		return {};
+	}
+
 	// Pass our own listen port as reserved so spawn_service refuses to
 	// land an llama-server there (the OS would let two binds compete and
 	// our future restart would lose).
-	let svc = make_handlers(db, [port]);
+	let svc = make_handlers(db, [port], capabilities_for);
 	let routes = [
 		{ method: "POST", path: "/services",      handler: svc.create },
 		{ method: "GET",  path: "/services",      handler: svc.list },

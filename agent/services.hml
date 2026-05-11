@@ -28,6 +28,7 @@ import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 import { sleep } from "@stdlib/time";
+import { render_argv } from "./intent";
 
 // IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
 // keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
@@ -42,17 +43,23 @@ fn new_id(db): string {
 // Encode the Merlina-style defaults. These are the *whole point* of v0.x:
 // no consumer should ever have to remember `--cache-type-k q4_0`.
 //
-// `context` and `kv_type` are duplicated from the flags array because
-// CP needs them as structured data for placement (max-VRAM math). The
-// flags array remains the source of truth for what we actually exec.
-// If you change one, change the other — small-enough surface to hand-sync.
+// Profiles are now INTENT-based. Each profile declares what it WANTS
+// (context window, KV cache quant, flash attention on/off, etc.) in
+// witchgrid-normalized terms; agent/intent.hml translates those into
+// whatever argv form the LOCAL llama-server binary accepts at spawn
+// time, looking each one up in the parsed --help capabilities. So a
+// profile that asks for `flash_attention: true` works on a 2024-era
+// llama.cpp (`-fa`) AND a 2026-era one (`-fa on`) without edits.
 //
-// `default_model` is opt-in. When set, CP's routing API can auto-spawn
-// the profile on first request (POST /v1/llama/{profile}/completion
-// without a prior explicit POST /services). Set per-deployment because
-// the path is operator-specific. NULL means "explicit POST /services
-// required to bring this profile up." Future: read from a config file
-// or env so the binary doesn't carry deployment paths.
+// extra_flags is the escape hatch — anything we haven't promoted to a
+// named intent (yet) goes there as raw strings, appended verbatim.
+//
+// context + kv_type still appear at the profile top level (duplicated
+// from intent.context / intent.kv_cache_k) because CP's placement math
+// needs them as plain data without round-tripping through the agent.
+//
+// default_model is opt-in. When set, CP's routing API can auto-spawn
+// the profile on first request. Path is per-deployment.
 
 let PROFILES = {
 	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
@@ -60,12 +67,15 @@ let PROFILES = {
 	// slot-shared sampler state.
 	"chat-mahou": {
 		binary: "llama-server",
-		flags: ["-c", "131072",
-				"--cache-type-k", "q4_0",
-				"--cache-type-v", "q4_0",
-				"-np", "1",
-				"-ngl", "99",
-				"-fa", "on"],
+		intent: {
+			context: 131072,
+			kv_cache_k: "q4_0",
+			kv_cache_v: "q4_0",
+			parallel_slots: 1,
+			gpu_layers: 99,
+			flash_attention: true,
+		},
+		extra_flags: [],
 		default_port: 8080,
 		context: 131072,
 		kv_type: "q4_0",
@@ -76,9 +86,12 @@ let PROFILES = {
 	// design pass), tighter context (designer prompts are short).
 	"designer-cpu": {
 		binary: "llama-server",
-		flags: ["-c", "8192",
-				"--cache-type-k", "q8_0",
-				"--cache-type-v", "q8_0"],
+		intent: {
+			context: 8192,
+			kv_cache_k: "q8_0",
+			kv_cache_v: "q8_0",
+		},
+		extra_flags: [],
 		default_port: 8081,
 		context: 8192,
 		kv_type: "q8_0",
@@ -88,11 +101,14 @@ let PROFILES = {
 	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
 	"memory-phoenix": {
 		binary: "llama-server",
-		flags: ["-c", "32768",
-				"--cache-type-k", "q4_0",
-				"--cache-type-v", "q4_0",
-				"-ngl", "99",
-				"-fa", "on"],
+		intent: {
+			context: 32768,
+			kv_cache_k: "q4_0",
+			kv_cache_v: "q4_0",
+			gpu_layers: 99,
+			flash_attention: true,
+		},
+		extra_flags: [],
 		default_port: 8085,
 		context: 32768,
 		kv_type: "q4_0",
@@ -207,19 +223,22 @@ let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
 // ── core: spawn ───────────────────────────────────────────────────────
 
-export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus): object {
+export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus, capabilities): object {
 	if (!PROFILES.has(profile_name)) {
 		throw "unknown profile: " + profile_name;
 	}
 	let prof = PROFILES[profile_name];
 
-	// Build full argv: binary + profile flags + -m model + --port port
-	let argv = [prof.binary];
-	let i = 0;
-	while (i < prof.flags.length) {
-		argv.push(prof.flags[i]);
-		i = i + 1;
+	// Build full argv: binary + intent-derived flags + extras + spawner-set
+	// model/port/host. capabilities is the parsed --help map for prof.binary
+	// — passed in rather than re-introspected per spawn.
+	if (capabilities == null || capabilities.keys().length == 0) {
+		throw "agent has no parsed capabilities for " + prof.binary
+			+ " (introspection may have failed at boot — check agent log)";
 	}
+	let argv = [prof.binary];
+	let derived = render_argv(prof.intent, prof?.extra_flags ?? [], capabilities);
+	for (a in derived) { argv.push(a); }
 	argv.push("-m"); argv.push(model_path);
 	argv.push("--port"); argv.push("" + port);
 	argv.push("--host"); argv.push("0.0.0.0");
@@ -341,7 +360,12 @@ export fn stop_service(db, id: string): bool {
 // one — letting an llama-server land there is how schneewolf orphaned
 // itself last session (a stray auto-spawn took 8766, agent restart
 // then couldn't bind, ssh-and-pkill required to recover).
-export fn make_handlers(db, reserved_ports): object {
+//
+// capabilities_for: function `(binary_name) → caps_map` so each spawn
+// can resolve its profile's intents against the right binary's --help
+// map. Passed as a closure so the agent can refresh on its own schedule
+// without us shipping a stale snapshot here.
+export fn make_handlers(db, reserved_ports, capabilities_for): object {
 	return {
 		create: fn(req): object {
 			let payload = parse(req.body);
@@ -367,7 +391,8 @@ export fn make_handlers(db, reserved_ports): object {
 			}
 			let gpus = payload?.gpus ?? [];
 			try {
-				let svc = spawn_service(db, profile, model, port, gpus);
+				let caps = capabilities_for(PROFILES[profile].binary);
+				let svc = spawn_service(db, profile, model, port, gpus, caps);
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
 				// 502 vs 400: a port-bind / missing-model / OOM error from
