@@ -3,6 +3,7 @@ name: build
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -33,6 +34,10 @@ jobs:
   build:
     name: build cp + agent + inspect
     runs-on: ubuntu-latest
+    permissions:
+      # Needed only for the tag-triggered release upload step below;
+      # main-branch + PR runs don't exercise it.
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -120,3 +125,36 @@ jobs:
       # /register to CP at boot, so booting it without a CP would block
       # until the HTTP timeout. When heartbeats land we can boot agent +
       # CP together and round-trip /nodes here.
+
+      # ── release artifacts ─────────────────────────────────────────
+      # Only on tag pushes (v*). Bundles all three binaries plus a
+      # SHA256SUMS so operators can verify their downloads, attaches
+      # them to the GitHub release for the tag.
+      - name: Bundle release artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p release
+          cp cp/witchgrid-cp release/
+          cp agent/witchgrid-agent release/
+          cp cp/witchgrid-inspect release/
+          cd release
+          sha256sum * > SHA256SUMS
+          ls -la
+          cat SHA256SUMS
+
+      - name: Create / update GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        # action-gh-release@v2 reads the tag from the ref, finds (or
+        # creates) the matching release, attaches files. generate_release_notes
+        # builds a notes blob from commits since the previous tag, which
+        # the operator can edit afterwards.
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/witchgrid-cp
+            release/witchgrid-agent
+            release/witchgrid-inspect
+            release/SHA256SUMS
+          draft: false
+          generate_release_notes: true
+          fail_on_unmatched_files: true
