@@ -4,7 +4,7 @@ Bugs / edge cases hit during development that don't have automated coverage yet.
 
 ## Multi-box and placement
 
-1. **CP must not crash when the spawn payload's `model` path is unreadable from CP's filesystem.** Discovered during the first sabre↔schneewolf smoke: schneewolf had Mahou at `/home/nbeerbower/AI/models/...`, sabre at `/mnt/BALTEUS/...`. Posting the schneewolf path to CP made `read_metadata` throw out of `pick_placement`, taking down the CP process. Now caught + returns 422 with a helpful message; assert that.
+1. **CP must not crash when the spawn payload's `model` path is unreadable from CP's filesystem.** Discovered during the first sabre↔schneewolf smoke: one box had Mahou at `~/AI/models/...`, the other at `/mnt/storage/...`. Posting the path-only-valid-on-one-box to CP made `read_metadata` throw out of `pick_placement`, taking down the CP process. Now caught + returns 422 with a helpful message; assert that.
 
 2. **Cross-box agent registration round-trips hardware faithfully.** Specifically: agent on box B, CP on box A, GET /nodes from box A reflects the actual `nvidia-smi` output on box B (gpu count, names, free_mb), not box A's hardware. Caught a bug where the agent reported the *agent box's* hardware but with the *CP box's* `agent_url` if the env vars were swapped — easy to misread.
 

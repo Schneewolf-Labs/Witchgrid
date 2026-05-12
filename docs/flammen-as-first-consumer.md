@@ -7,7 +7,7 @@ flammen.ai is the **first consumer** Witchgrid is designed against. The features
 ## The fleet, today
 
 ```
-VPS (flammen.ai)               Schneewolf (192.168.8.154)            NN900 (192.168.8.217)
+VPS (flammen.ai)               Schneewolf (10.0.0.10)                NN900 (10.0.0.20)
 ──────────────────             ──────────────────────────            ───────────────────
 NuxtFlammen   :3000            FlameWorker (GPU)                     A1111  :7860
 FlameWorker (CPU)              FlameGen                                NikuMixXL4
@@ -106,10 +106,10 @@ Witchgrid v1 is done when this works for flammen.ai:
 
 ```bash
 # Each consumer's .env changes from per-service URLs:
-LLAMA_SERVER_URL=http://192.168.8.154:8080      # before
-A1111_URL=http://192.168.8.217:7860              # before
-PHOENIX_URL=http://192.168.8.154:8085            # before
-LLAMA_DESIGNER_URL=http://192.168.8.154:8081     # before
+LLAMA_SERVER_URL=http://10.0.0.10:8080           # before
+A1111_URL=http://10.0.0.20:7860                  # before
+PHOENIX_URL=http://10.0.0.10:8085                # before
+LLAMA_DESIGNER_URL=http://10.0.0.10:8081         # before
 
 # To one base URL:
 WITCHGRID_URL=http://witchgrid:8000              # after

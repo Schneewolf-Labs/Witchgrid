@@ -147,7 +147,13 @@ fn seed_default_profiles(db): null {
 					repo: "flammenai/Mahou-1.5-mistral-nemo-12B-gguf",
 					file: "Mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
 				},
-				default_model: "/mnt/BALTEUS/gguf_models/mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
+				// default_model intentionally null — the path is
+				// deployment-specific. Operators set it via the
+				// dashboard editor if they want a legacy-path
+				// fallback; model_alias + catalog resolution is the
+				// modern path that doesn't pin to a filesystem
+				// layout.
+				default_model: null,
 			},
 		},
 		{
@@ -848,7 +854,7 @@ fn handle_list_services(req): object {
 let LLAMA_PREFIX = "/v1/llama/";
 
 // Strip the URL scheme + port off agent_url, leaving just the host.
-//   "http://192.168.8.154:8766" → "192.168.8.154"
+//   "http://10.0.0.20:8766" → "10.0.0.20"
 //   "http://localhost:8766"     → "localhost"
 fn extract_host(agent_url: string): string {
 	let rest = agent_url;

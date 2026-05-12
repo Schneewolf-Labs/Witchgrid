@@ -62,8 +62,8 @@ The same profile produces the right argv on a llama.cpp build where `-fa` is sti
 ## Config (env vars)
 
 ```
-WITCHGRID_CP_URL         http://192.168.8.154:8765    # required
-WITCHGRID_AGENT_URL      http://192.168.8.217:8766    # required (what URL CP calls us at)
+WITCHGRID_CP_URL         http://10.0.0.10:8765        # required
+WITCHGRID_AGENT_URL      http://10.0.0.20:8766        # required (what URL CP calls us at)
 WITCHGRID_AGENT_HOST     0.0.0.0                       # bind address (default 0.0.0.0)
 WITCHGRID_AGENT_PORT     8766                          # bind port (default 8766)
 WITCHGRID_NODE_ID        $HOSTNAME                     # stable identifier
