@@ -21,7 +21,14 @@ import { exec_argv } from "@stdlib/process";
 import { cpu_count, total_memory, free_memory } from "@stdlib/os";
 import { exists } from "@stdlib/fs";
 
-fn probe_gpus(): array {
+// Apple Silicon Metal cap: by default Metal can claim ~75% of system
+// RAM as VRAM via MTLDevice.recommendedMaxWorkingSetSize; we round
+// down to 66% as a placement-time conservative budget so the rest of
+// macOS keeps room to breathe. llama.cpp on Metal honors this same
+// cap for KV-cache + weights allocation.
+let APPLE_METAL_RAM_FRACTION: f64 = 0.66;
+
+fn probe_gpus_nvidia(): array {
 	// exec_argv captures stderr instead of leaking it to the terminal AND
 	// throws if the binary isn't on PATH — both branches mean "no GPUs."
 	let r = null;
@@ -52,6 +59,60 @@ fn probe_gpus(): array {
 		});
 	}
 	return gpus;
+}
+
+// Mac fallback. Apple Silicon GPUs have unified memory — there's no
+// separate VRAM pool, Metal allocates from the same physical RAM as
+// the rest of the system. We surface the M-series as a single GPU
+// entry so placement can target it like an NVIDIA card; total/free
+// are derived from the system RAM × APPLE_METAL_RAM_FRACTION.
+//
+// Detection: parse `system_profiler SPDisplaysDataType` for the
+// "Chipset Model:" line. That's stable across M1/M2/M3/M4 and
+// includes the full chip name ("Apple M1", "Apple M3 Pro", etc.).
+fn probe_gpus_metal(ram_total_mb: i32, ram_free_mb: i32): array {
+	let r = null;
+	try {
+		r = exec_argv(["system_profiler", "SPDisplaysDataType"]);
+	} catch (e) {
+		return [];
+	}
+	if (r.exit_code != 0 || r.output.length == 0) {
+		return [];
+	}
+	let chipset = "";
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let trimmed = line.trim();
+		// Only Apple Silicon GPUs report Metal — discrete AMD/NVIDIA
+		// on older Intel Macs would also appear here; we want the
+		// Apple chip specifically.
+		if (trimmed.starts_with("Chipset Model:")) {
+			let rest = trimmed.substr(14, trimmed.length - 14).trim();
+			if (rest.starts_with("Apple ")) {
+				chipset = rest;
+				break;
+			}
+		}
+	}
+	if (chipset.length == 0) { return []; }
+
+	let total_mb = i32(f64(ram_total_mb) * APPLE_METAL_RAM_FRACTION);
+	let free_mb  = i32(f64(ram_free_mb)  * APPLE_METAL_RAM_FRACTION);
+	if (free_mb > total_mb) { free_mb = total_mb; }
+	return [{
+		index:    0,
+		name:     chipset,
+		total_mb: total_mb,
+		free_mb:  free_mb,
+		uuid:     "metal-0",
+	}];
+}
+
+fn probe_gpus(ram_total_mb: i32, ram_free_mb: i32): array {
+	let nv = probe_gpus_nvidia();
+	if (nv.length > 0) { return nv; }
+	return probe_gpus_metal(ram_total_mb, ram_free_mb);
 }
 
 // `df -B1 <path>` output looks like (1024 = 1KB blocks; -B1 forces bytes):
@@ -131,21 +192,24 @@ export fn probe_disks(canonical, extras): array {
 // catalog isn't configured yet (early boot, or future CPU-only nodes
 // that don't host any models).
 export fn probe(canonical_dir, extra_dirs): object {
-	let gpus = probe_gpus();
+	// Convert bytes → MB up front so the wire payload is small ints,
+	// not 64-bit byte counts CP would have to divide every render.
+	// Compute RAM first so the Metal probe can derive its UMA cap.
+	let ram_total_b: i64 = total_memory();
+	let ram_free_b:  i64 = free_memory();
+	let ram_total_mb: i32 = i32(ram_total_b / 1048576);
+	let ram_free_mb:  i32 = i32(ram_free_b  / 1048576);
+
+	let gpus = probe_gpus(ram_total_mb, ram_free_mb);
 	let disks = probe_disks(canonical_dir, extra_dirs);
 	let role = "cpu";
 	if (gpus.length > 0) { role = "gpu"; }
 
-	// Convert bytes → MB up front so the wire payload is small ints,
-	// not 64-bit byte counts CP would have to divide every render.
-	let ram_total_b: i64 = total_memory();
-	let ram_free_b:  i64 = free_memory();
-
 	return {
 		role:         role,
 		cpu_cores:    cpu_count(),
-		ram_total_mb: i32(ram_total_b / 1048576),
-		ram_free_mb:  i32(ram_free_b  / 1048576),
+		ram_total_mb: ram_total_mb,
+		ram_free_mb:  ram_free_mb,
 		gpus:         gpus,
 		disks:        disks,
 	};
