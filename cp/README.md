@@ -21,11 +21,11 @@ POST /register         { node_id, hostname, role, hardware, agent_url }   → 20
 GET  /nodes                                                               → [...]
 
 # service supervisor (proxies to the appropriate agent by node_id)
-POST /services         { node_id?, profile, model?, port?, gpus? }        → 201
+POST /services         { node_id?, profile, model, port?, gpus? }         → 201
 GET  /services                                                            → [...]
 POST /services/stop    { id, node_id }                                    → 204
-GET  /profiles                                                            → [profile names]
-GET  /capabilities                                                        → { node_id: caps_map }
+GET  /profiles                                                            → { profile: { default_port, context, kv_type, default_model } }
+# no JSON /capabilities endpoint on CP yet; the dashboard uses /ui/capabilities
 
 # routing API
 POST /v1/llama/{profile}/<llama-server-path>                              → proxied
@@ -41,7 +41,7 @@ GET  /ui/nodes | /ui/services | /ui/profiles | /ui/capabilities           → HT
 GET  /healthz                                                             → ok
 ```
 
-`POST /services` without `node_id` triggers capacity-aware placement: CP picks the (node, GPU set) with the GGUF on disk and enough free VRAM, then proxies the spawn to that agent. With `node_id`, CP forwards verbatim — useful for explicit testing.
+`POST /services` requires `profile` and `model`. Without `node_id`/`gpus`, it triggers capacity-aware placement: CP reads the GGUF from its own filesystem, estimates the profile's VRAM requirement, picks the first stale-filtered node with a single GPU reporting enough `free_mb`, chooses a non-Witchgrid-conflicting port, then proxies the spawn to that agent. With `node_id` + `gpus`, CP skips placement and forwards the explicit request — useful for testing and for model paths that only exist on the agent.
 
 ## Build & run
 
@@ -56,7 +56,7 @@ hemlock cp.hml
 hemlockc cp.hml -o witchgrid-cp && ./witchgrid-cp
 ```
 
-Listens on `0.0.0.0:8765`. State persists in `witchgrid.db` (sqlite) — `cd` into `cp/` before running until `WITCHGRID_DATA_DIR` lands.
+Listens on `0.0.0.0:8765`. State persists in `witchgrid.db` (sqlite) relative to the process CWD — `cd` into `cp/` before running until `WITCHGRID_DATA_DIR` lands.
 
 ## End-to-end smoke (assumes one agent registered)
 
@@ -81,4 +81,4 @@ curl -X POST http://localhost:8765/services/stop \
 
 ## Hemlock requirements
 
-Built and tested against Hemlock 2.2.x. The full evolution from spike → here is captured in `../docs/hemlock-feedback-archive.md`.
+Built in Hemlock 2.2.x; CI currently pins the installer to `HEMLOCK_VERSION=2.2.1`. Several local source comments and historical notes reference fixes that landed in 2.2.2, so bumping the CI pin is an open documentation/build-alignment gap. The full evolution from spike → here is captured in `../docs/hemlock-feedback-archive.md`.

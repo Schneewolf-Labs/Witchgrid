@@ -1,6 +1,6 @@
 # Lessons from flammen.ai v1.0 → Witchgrid priorities
 
-flammen.ai shipped v1.0.0 on 2026-05-09 against a fleet of inference services hand-wired by env vars. This document captures the friction encountered during that build, sketches the scale-out scenarios flammen.ai is heading toward, and translates both into priorities for Witchgrid v1 — distinguishing what's already in v0.3 from what still needs building.
+flammen.ai shipped v1.0.0 on 2026-05-09 against a fleet of inference services hand-wired by env vars. This document captures the friction encountered during that build, sketches the scale-out scenarios flammen.ai is heading toward, and translates both into priorities for Witchgrid v1. This document was originally written against the Python prototype's v0.3 vocabulary; the Hemlock port now calls the current slice v0.1, so the status labels below are updated to reflect the repository as audited.
 
 flammen.ai is the **first consumer** Witchgrid is designed against. The features that ease its actual operational pain are the ones that earn v1's place.
 
@@ -71,25 +71,25 @@ These are forward-looking but already-named in the project:
 
 ## What this means for Witchgrid v1 priorities
 
-Mapping the pain above against what's already in v0.3 (control plane + node agent + dashboard + spawn/stop llama-server + routing API with round-robin):
+Mapping the pain above against what is already in Hemlock v0.1 (control plane + node agent + dashboard + spawn/stop llama-server + routing API + auto-spawn):
 
-### Already covered by v0.3 (just need to use them)
+### Already covered by Hemlock v0.1 (just need to use them)
 - Node registry + hardware reporting → **solves "what boxes do I have"**
 - Spawn/stop llama-server services → **solves "swap-and-restart toil"**
 - `/v1/llama/{model}/{path}` routing → **solves "every consumer hardcodes a URL"**
-- Round-robin across multiple instances of same model → **starts to formalize the failover-by-accident pattern**
+- First-live routing across multiple instances of the same profile → **starts to formalize the failover-by-accident pattern**. True round-robin/least-loaded balancing is still a gap.
 
 ### Gap-list to make flammen.ai an actual consumer (suggested v1 scope)
 
 1. **Engine support beyond llama.cpp.** A1111 has to be a first-class engine, not just llama-server. Same for moondream/transformers when FlameCaption migrates. Service template format should make adding an engine = config not code.
 
-2. **Capacity-aware placement.** The "VRAM-arithmetic-in-chat" pain is the most repeated friction. v1 should at minimum: declare a model spec (size, quant, context, KV-cache budget, FP8-required-yes/no), pick the box with matching arch + free VRAM, refuse to schedule otherwise. Naive accounting (subtract claimed VRAM from total reported) gets 80% of the value.
+2. **Capacity-aware placement.** Partially shipped for llama.cpp/GGUF: CP parses model metadata, estimates weights + KV-cache, and first-fits onto one GPU using agents' reported `free_mb`. Remaining v1 work: agent-side model inspection/catalogs so CP does not need shared paths, architecture constraints (FP8/Ada/etc.), multi-GPU splits, and broader engine support.
 
-3. **Health checks → routing exclusion.** Round-robin currently treats all registered instances as equally available. Add a liveness probe so a wedged llama-server stops getting traffic instead of timing out every other request.
+3. **Health checks → routing exclusion.** Partially shipped: CP only routes to agent-reported `alive=true` services and auto-spawn waits for llama-server `/health`. Remaining work: richer per-engine health checks and load-aware exclusion.
 
-4. **Auto-spawn on first request.** If a routing request comes in for `mahou` and no instance is running, the placement algorithm should pick a box and spawn one transparently. Today the spawn step is manual. This single feature converts model-swap from "deploy" to "request."
+4. **Auto-spawn on first request.** Shipped for llama.cpp profiles with `default_model`. Remaining work: model catalog aliases, non-llama engines, and better handling when the model path exists only on the target agent.
 
-5. **Live dashboard panel for "what's loaded right now."** Box → GPU → model → free VRAM, refreshed live. Replaces the SSH+nvidia-smi+grep dance and the "is the A6000 still serving Mahou?" anxiety. (v0.1 has a dashboard; this just needs to surface the data the agent already collects.)
+5. **Live dashboard panel for "what's loaded right now."** Shipped for nodes, services, profiles, and capabilities; it still needs engine-specific panels beyond llama.cpp.
 
 6. **Model catalog scanning.** Each node agent scans known dirs (`~/AI/gguf_models`, A1111 checkpoints, etc.) and reports what's *available*, not just what's loaded. Without this, "spawn Mahou on Schneewolf" requires the operator to know the file is there.
 

@@ -10,9 +10,9 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 
 - **Node registry** — every machine reports its hardware (GPU model, total/free VRAM via `nvidia-smi`) on register and on heartbeat (30 s). Stale (> 90 s) nodes drop out of placement decisions.
 - **Service supervisor** — agents `posix_spawn` `llama-server` with a real argv (no shell wrapper), `setsid: true` for terminal detach, raw fd redirection for log/dev-null, transient `CUDA_VISIBLE_DEVICES`. PIDs tracked in a per-agent sqlite. SIGTERM on stop. Zombie rows reaped on agent boot.
-- **Routing API** — `POST /v1/llama/{profile}/*` on CP proxies to a healthy instance for that profile, round-robin. If none exists, capacity-aware placement picks (node, GPU set) with the GGUF on disk + enough free VRAM, spawns transparently, then completes the request.
-- **Capacity-aware placement** — the GGUF metadata parser pulls model size + KV-cache footprint at decision time; placement picks the GPU set that fits. Naive accounting (subtract claimed VRAM from free) — gets 80% of the value without talking to CUDA.
-- **Capability introspection** — at agent boot, `llama-server --help` is parsed into `{flag → {short, longs, value, description}}` and exposed at `GET /capabilities`. CP aggregates per-node and renders in the dashboard.
+- **Routing API** — `POST /v1/llama/{profile}/*` on CP proxies to the first live instance for that profile. If none exists, capacity-aware placement picks a stale-filtered node plus one GPU with enough reported free VRAM, spawns transparently, waits for `/health`, then completes the request.
+- **Capacity-aware placement** — the GGUF metadata parser pulls model size + KV-cache footprint at decision time; placement is first-fit onto one GPU. Auto-placement currently requires CP to read the GGUF path itself, so model paths must be shared/mounted identically until agent-side inspection/model catalog work lands.
+- **Capability introspection** — at agent boot, `llama-server --help` is parsed into `{flag → {short, longs, value, description}}` and exposed at the agent's `GET /capabilities`. CP aggregates per-node for the dashboard.
 - **Intent-driven argv** — profile templates declare normalized intents (`flash_attention: true`, `kv_cache_k: "q4_0"`, `context: 131072`); at spawn time the agent translates each intent into the binary's actual flag form using its capability map. The same profile produces the right argv on different llama.cpp versions (legacy boolean `-fa` vs enum `-fa on|off|auto` is the canonical case).
 - **Dashboard** — HTMX-driven live view at `GET /` on CP. Nodes, services, profiles, capabilities tables. Spawn form (Alpine.js) for manual placement. Static assets live in `dashboard/` and `assets/`, embedded into the CP binary at build time via `scripts/embed_assets.sh`.
 
@@ -22,6 +22,14 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 - **Not a fine-tuning harness.** Doesn't manage training runs. See [Merlina](https://github.com/Schneewolf-Labs/Merlina) for the lab's training side; the intended composition is below.
 - **Not Kubernetes.** No pod scheduling, no networking abstractions, no manifests. Single-binary control plane + lightweight node agents over plain HTTP. No auth (single operator, LAN-only).
 - **Not for single-node setups.** If you have one machine, you don't need Witchgrid — just SSH and edit your scripts. The value kicks in at ≥2 nodes or when sharing a GPU between multiple workloads.
+
+## Documentation audit (current gaps)
+
+- Routing is **not** round-robin today; CP picks the first live matching service. Round-robin/least-loaded routing remains a gap.
+- Auto-placement is **single-GPU first-fit** and depends on `free_mb` reported by agents; it does not split one model across multiple GPUs.
+- CP-side GGUF inspection means auto-placement needs the model path readable from CP. Explicit `node_id` + `gpus` placement is the workaround for agent-only paths.
+- JSON capability aggregation exists on agents; CP only renders the aggregate in the dashboard fragment today.
+- Data files are CWD-relative (`witchgrid.db`, `witchgrid-agent.db`) until a data-dir env lands.
 
 ## Architecture
 
@@ -55,7 +63,7 @@ CP and agent each compile to a standalone ~7 MB ELF (`witchgrid-cp`, `witchgrid-
 
 | Component | Responsibility |
 |---|---|
-| **Control plane** (`cp/`) | Node registry, routing API, dashboard, GGUF introspection, capacity-aware placement. Exposes `/register`, `/nodes`, `/services` (proxy to agents), `/v1/llama/{profile}/*`, `/profiles`, `/capabilities`, `/healthz`, dashboard at `/`. |
+| **Control plane** (`cp/`) | Node registry, routing API, dashboard, GGUF introspection, capacity-aware placement. Exposes `/register`, `/nodes`, `/services` (proxy to agents), `/v1/llama/{profile}/*`, `/profiles`, `/healthz`, dashboard at `/`; capability aggregation is currently rendered at `/ui/capabilities`, not exposed as JSON. |
 | **Node agent** (`agent/`) | Hardware probe (nvidia-smi), capability introspection (`llama-server --help`), service supervisor (posix_spawn + setsid), heartbeat. Exposes `/services` (CRUD), `/profiles`, `/capabilities`, `/healthz`. |
 | **Profile templates** | Live in `agent/services.hml` `PROFILES`. Each profile is `{ binary, intent, extra_flags, default_port, default_model, ... }`. `intent` is a normalized map; `extra_flags` is the raw escape hatch. New profile = config not code. |
 | **Intent translator** (`agent/intent.hml`) | Maps witchgrid-level intents (`flash_attention`, `kv_cache_k`, …) to the binary's actual flag form using its capability map. Handles `boolean_or_enum` for flags that changed shape between llama.cpp versions. |
@@ -125,13 +133,13 @@ Plus operability/infra: spawn-failure visibility, port reservation, zombie reapi
 
 Open, in rough order:
 
-1. **Unit test suite.** Hemlock-side tests for the pure-function layers (gguf parser, intent translator, capabilities parser). See `docs/test-cases-todo.md` for the planned cases.
+1. **Expand the test suite.** Hemlock-side unit tests cover intent translation and capability parsing; GGUF parser cases plus CP/agent integration smokes are still open. See `docs/test-cases-todo.md` for the planned cases.
 2. **Model catalog.** Each agent scans known dirs (`~/AI/gguf_models`, A1111 checkpoints) and reports what's available by alias. Profiles reference aliases (`"model_alias": "mahou-12b-q5"`) instead of host-specific paths. Unblocks Merlina integration vector #1.
 3. **`WITCHGRID_DATA_DIR` env.** Pin sqlite location so it doesn't move when the binary is launched from a different CWD.
 4. **TCP-probe `pick_port`.** Detect non-Witchgrid port contention (other workloads on the box) before spawn rather than after the EADDRINUSE crash.
 5. **Release artifacts.** CI already builds; add a release job that uploads `witchgrid-cp` + `witchgrid-agent` + `witchgrid-inspect` on tag push.
 6. **SSE / streaming proxy.** When a consumer wants `stream: true`, the routing proxy needs to forward chunks instead of buffering. Deferred until a real consumer asks.
-7. **Health checks + routing exclusion.** Liveness probe on each registered service; wedged ones drop out of the round-robin pool.
+7. **Health checks + routing exclusion.** Basic `alive=true` filtering and auto-spawn `/health` waits exist; richer per-engine health checks and load-aware exclusion are still open.
 8. **Engines beyond llama.cpp.** AUTOMATIC1111 / ComfyUI / vLLM as additional `binary` types. Intent vocabulary will need engine-specific subsets.
 
 Longer-term — see `docs/llama-cpp-as-managed-runtime.md` for the "Witchgrid as the llama.cpp manager" brainstorm (vendoring binaries, prebuilt download, source build, eventual auto-canary).

@@ -10,14 +10,19 @@
 //   GET  /nodes                                                  → [...]
 //   GET  /healthz                                                → ok
 //
-//   POST /services         { node_id, profile, model, port?,
+//   POST /services         { node_id?, profile, model, port?,
 //                            gpus? }                             → 201
-//                          (proxied to the named agent)
+//                          (auto-placed when node_id/gpus omitted,
+//                           otherwise proxied to the named agent)
 //   GET  /services                                               → [...]
 //                          (aggregated from every registered agent;
 //                           each entry tagged with node_id)
 //   POST /services/stop    { id, node_id }                       → 204
 //                          (proxied to the named agent)
+//   GET  /profiles                                               → {...}
+//
+//   GET  /                                                      → dashboard
+//   GET  /ui/{nodes,services,profiles,capabilities}             → fragments
 //
 //   * /v1/llama/{profile}/{...}                                  → proxy
 //                          (routes to a running llama-server with the

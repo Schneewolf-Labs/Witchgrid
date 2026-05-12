@@ -34,7 +34,7 @@ In:
 Out (deliberate — these layers do I/O):
 - `services.spawn_service` — would need a fake binary to spawn; integration territory
 - `hardware.probe` — calls `nvidia-smi`
-- `capabilities.introspect` — calls a real `llama-server --help`; covered transitively when CI runs against a real binary
+- `capabilities.introspect` — calls a real `llama-server --help`; CI does **not** currently install or run a real llama.cpp binary, so this needs an integration smoke or fixture-backed fake binary
 - `gguf.read_metadata` — file I/O; would need a fixture GGUF (deferred)
 - HTTP routing — covered by the manual smoke in `cp/README.md`
 

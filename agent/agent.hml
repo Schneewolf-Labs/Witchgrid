@@ -19,7 +19,8 @@
 //   POST /services         { profile, model, port?, gpus? }   → 201 {id,...}
 //   GET  /services                                            → [...]
 //   POST /services/stop    { id }                             → 204
-//   GET  /profiles                                            → [profile names]
+//   GET  /profiles                                            → {profile: meta}
+//   GET  /capabilities                                        → {binary: flags}
 //   GET  /healthz                                             → ok
 //
 // Config (env vars):
@@ -163,7 +164,7 @@ fn main(): null {
 		print("[agent] llama-server: " + llama_caps.keys().length + " flags");
 	} catch (e) {
 		eprint("[agent] llama-server introspection failed: " + e
-			+ " (capabilities unavailable; spawning still works)");
+			+ " (capabilities unavailable; intent-based spawning will fail until this is fixed)");
 	}
 
 	// Capabilities lookup closure — services.hml uses this to resolve

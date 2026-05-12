@@ -16,10 +16,10 @@ Runs on every box that hosts inference. Probes hardware, registers with the cont
 ## Endpoints
 
 ```
-POST /services         { profile, model?, port?, gpus? }   → 201 {id, ...}
+POST /services         { profile, model, port?, gpus? }    → 201 {id, ...}
 GET  /services                                             → [...]
 POST /services/stop    { id }                              → 204
-GET  /profiles                                             → [profile names]
+GET  /profiles                                             → { profile: { default_port, context, kv_type, default_model } }
 GET  /capabilities                                         → { "llama-server": {...} }
 GET  /healthz                                              → ok
 ```
@@ -80,7 +80,7 @@ WITCHGRID_AGENT_URL=http://<this-host>:8766 \
   ./witchgrid-agent
 ```
 
-State persists in `witchgrid-agent.db` (sqlite). Re-registers every 30 s as heartbeat (CP's stale cutoff is 90 s).
+State persists in `witchgrid-agent.db` (sqlite) relative to the process CWD. Re-registers every 30 s as heartbeat (CP's stale cutoff is 90 s).
 
 ## Behavior on restart
 
@@ -92,3 +92,10 @@ State persists in `witchgrid-agent.db` (sqlite). Re-registers every 30 s as hear
 GPU box: parses `nvidia-smi --query-gpu=name,memory.total,memory.free,uuid --format=csv,noheader,nounits`, returns one entry per GPU. CPU-only box: returns `{ role: "cpu", gpus: [] }` and registers anyway — CPU profiles can still spawn there.
 
 If `nvidia-smi` isn't on the path, the agent treats it as CPU-only without erroring.
+
+
+## Known gaps
+
+- No model catalog yet: callers still pass concrete GGUF paths, and auto-spawn uses profile `default_model` paths baked into `services.hml`.
+- No OS-level free-port probe yet: CP avoids ports already known to Witchgrid and the agent refuses its own bind port, but an unrelated process can still occupy a selected llama-server port; the 2-second spawn grace should surface the bind failure quickly.
+- Capabilities are cached at boot; restart the agent after upgrading `llama-server`. If `llama-server --help` cannot be parsed, intent-based spawns fail because the agent cannot render the normalized profile intents into argv.

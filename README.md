@@ -4,7 +4,7 @@ Orchestration + dashboard for self-hosted AI inference services. The control pla
 
 For the case where you have a small fleet of CPU/GPU boxes and want to manage what's running where, what's loaded, and what's available — without hand-wiring each consumer to a hardcoded URL.
 
-> **Status: v0.1.** Single-tenant, LAN-only, llama.cpp-only. Multi-node spawn + capacity-aware placement + auto-spawn-on-first-request + dashboard all working. See `docs/test-cases-todo.md` for the open edges.
+> **Status: v0.1.** Single-tenant, LAN-only, llama.cpp-only. Multi-node spawn + single-GPU capacity-aware placement + auto-spawn-on-first-request + dashboard all working. Current limits: LAN-only/no auth, llama.cpp only, CP must be able to read the GGUF path for auto-placement, and request routing picks the first live matching service rather than load-balancing. See `docs/test-cases-todo.md` for the open edges.
 
 ## Layout
 
@@ -24,9 +24,9 @@ Built in [Hemlock](https://hemlang.dev) 2.2.x. Each binary is a single ~7 MB ELF
 
 - **Node registry** — agents POST `/register` at boot with hardware (GPU model, total/free VRAM via `nvidia-smi`); re-register every 30 s as heartbeat. Stale (> 90 s) nodes drop out of placement.
 - **Service supervisor** — agents `posix_spawn` `llama-server` with `setsid: true`, raw fd redirection for logs, transient `CUDA_VISIBLE_DEVICES`, sqlite-tracked PIDs, `kill(SIGTERM)` for stop. Zombie rows reaped on agent boot.
-- **Routing API** — `POST /v1/llama/{profile}/*` on CP proxies to a running instance for that profile, round-robin. If none is running, capacity-aware placement picks a node with the GGUF on disk + enough free VRAM and spawns one transparently before completing the request.
-- **Capacity-aware placement** — GGUF metadata parser extracts model size + KV-cache footprint at spawn-decision time; placement picks the GPU set that fits.
-- **Capability introspection** — at agent boot, `llama-server --help` is parsed into a `{flag → {short, longs, value, description}}` map and exposed at `GET /capabilities`. CP aggregates per-node.
+- **Routing API** — `POST /v1/llama/{profile}/*` on CP proxies to the first live instance for that profile. If none is running, capacity-aware placement picks a stale-filtered node/GPU with enough reported free VRAM and spawns one transparently before completing the request.
+- **Capacity-aware placement** — GGUF metadata parser extracts model size + KV-cache footprint at spawn-decision time; placement is currently first-fit onto one GPU. Auto-placement requires the CP process to read the same model path it asks the agent to spawn.
+- **Capability introspection** — at agent boot, `llama-server --help` is parsed into a `{flag → {short, longs, value, description}}` map and exposed at the agent's `GET /capabilities`; CP aggregates it for the dashboard.
 - **Intent-driven argv** — profile templates declare normalized intents (`flash_attention: true`, `kv_cache_k: "q4_0"`, `context: 131072`); the agent translates each into the binary's actual flag form using its capability map. Profiles outlast llama.cpp upgrades.
 - **Dashboard** — HTMX-driven live view at `GET /` on CP. Nodes, services, profiles, capabilities tables. Spawn form (Alpine.js) for manual placement.
 
@@ -60,8 +60,9 @@ See `cp/README.md` and `agent/README.md` for endpoint reference and smoke-test w
 The v0.1 priority list (`docs/flammen-as-first-consumer.md`) is fully closed. Open edges:
 
 - **Test suite** — see `docs/test-cases-todo.md` for what's covered manually + the planned automated cases.
-- **Model catalog** — agent scans known dirs and advertises models by alias, so profiles stop pinning host-specific paths.
-- **Hardening** — TCP-probe `pick_port` for non-Witchgrid contention; `WITCHGRID_DATA_DIR` env so `witchgrid.db` doesn't dance with CWD.
+- **Model catalog / agent-side inspection** — agents should scan known dirs and advertise models by alias; CP should not need the GGUF mounted at the same path just to place it.
+- **Hardening** — TCP-probe `pick_port` for non-Witchgrid port contention; `WITCHGRID_DATA_DIR` env so `witchgrid.db` / `witchgrid-agent.db` don't depend on CWD; JSON `GET /capabilities` on CP if consumers need it outside the dashboard.
+- **Load balancing** — current routing picks the first live service for a profile; round-robin/least-loaded routing is still a gap.
 - **SSE streaming** — deferred until a real consumer needs it.
 - **Real release artifacts** — CI builds the binaries on every push but doesn't yet attach them to tags.
 
