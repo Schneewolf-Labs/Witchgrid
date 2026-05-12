@@ -1,0 +1,213 @@
+// transfers.hml — model file pulls (peer + HuggingFace).
+//
+// CP asks an agent to pull a model alias from somewhere; the agent
+// runs the download in a detached background task and exposes
+// progress via GET /models/transfers. When the file lands in the
+// canonical dir, a rescan picks it up and the next /register tells
+// CP the agent now has the alias.
+//
+// Two source kinds:
+//
+//   peer         — HTTP GET against another agent's /models/{alias}/blob.
+//                  Source URL pre-resolved by CP.
+//
+//   huggingface  — shell out to `hf download <repo> <file>
+//                  --local-dir <canonical>`. `hf` is the rebranded
+//                  huggingface-cli; speaks Xet automatically when the
+//                  repo's enabled, handles auth + retries + chunk dedup.
+//                  Witchgrid never touches HF protocol bytes directly.
+//
+// Memory note: the peer path uses @stdlib/http.get_binary which
+// buffers the whole response before returning. For a 40 GB Saoirse
+// pull that's a lot. Move to a streaming write_to_file API once
+// Hemlock's stdlib exposes one (or a real consumer hits the limit).
+
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { stringify, parse } from "@stdlib/json";
+import { get_binary } from "@stdlib/http";
+import { file_stat, exists, remove_file, rename } from "@stdlib/fs";
+
+export fn init_transfers_schema(db): null {
+	db_exec(db, "create table if not exists model_transfers ("
+		+ "id text primary key,"
+		+ "alias text not null,"
+		+ "source_kind text not null,"
+		+ "source_url text,"
+		+ "hf_repo text,"
+		+ "hf_file text,"
+		+ "target_path text not null,"
+		+ "status text not null,"          // queued|downloading|complete|error
+		+ "bytes_downloaded integer default 0,"
+		+ "bytes_total integer default 0,"
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+	db_exec(db, "create index if not exists ix_transfers_status "
+		+ "on model_transfers(status, started_at)", []);
+	return null;
+}
+
+fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(8)) as id", []);
+	return r[0].id;
+}
+
+fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+// Pulls always land in canonical/<alias>.gguf. Filename derived from
+// alias (not the source filename) so a rescan re-derives the same
+// alias from the file we just wrote — round-trip stable.
+export fn target_path_for(canonical_dir: string, alias: string): string {
+	return canonical_dir + "/" + alias + ".gguf";
+}
+
+// Background task: HTTP GET from a peer's /models/{alias}/blob, write
+// to target.partial, atomic rename to target on success. Updates the
+// DB row at start, on success, on failure.
+//
+// Buffered (not streaming) — see module-header note.
+async fn pull_peer_task(db, transfer_id: string, source_url: string,
+                        target: string): null {
+	let partial = target + ".partial";
+	db_exec(db,
+		"update model_transfers set status='downloading' where id=?",
+		[transfer_id]);
+	try {
+		let resp = get_binary(source_url, null);
+		// get_binary returns { status_code, headers, body } where body
+		// is the buffer. Anything other than 2xx → fail loud.
+		if (resp.status_code < 200 || resp.status_code >= 300) {
+			throw "HTTP " + resp.status_code + " from " + source_url;
+		}
+		let buf = resp.body;
+		if (buf == null || buf.length == 0) {
+			throw "empty response body from " + source_url;
+		}
+		// Write to .partial then atomic rename so a crashed pull
+		// doesn't leave a half-file masquerading as a complete model.
+		//
+		// Buffer write only works via __open + write_bytes — the @stdlib
+		// wrappers (write_file, file.write) only accept strings, both
+		// in the interpreter and the compiled binary. compression.hml
+		// uses this same pattern for gzip output.
+		if (exists(partial)) { try { remove_file(partial); } catch (e) { } }
+		let out = __open(partial, "w");
+		out.write_bytes(buf);
+		out.close();
+		rename(partial, target);
+		let stat = file_stat(target);
+		let now = iso_now(db);
+		db_exec(db,
+			"update model_transfers "
+			+ "set status='complete', bytes_downloaded=?, bytes_total=?, completed_at=? "
+			+ "where id=?",
+			[stat.size, stat.size, now, transfer_id]);
+		print("[transfer] " + transfer_id + " complete: " + target + " (" + stat.size + " bytes)");
+	} catch (e) {
+		let msg = "" + e;
+		db_exec(db,
+			"update model_transfers set status='error', error=? where id=?",
+			[msg, transfer_id]);
+		// Best-effort cleanup of the .partial — don't let half-files
+		// confuse the next scan.
+		try { if (exists(partial)) { remove_file(partial); } } catch (ee) { }
+		eprint("[transfer] " + transfer_id + " failed: " + msg);
+	}
+	return null;
+}
+
+// HTTP handler: POST /models/pull
+//
+// Body: { alias, source: { kind: "peer", url } }
+// Returns 202 + { transfer_id } when the background task is queued.
+//
+// rescan_after: callback invoked after a successful peer pull so the
+// agent's catalog picks up the new file without waiting for the next
+// operator-triggered rescan.
+export fn make_pull_handler(db, canonical_dir: string, rescan_after): object {
+	return fn(req): object {
+		let payload = null;
+		try { payload = parse_or_throw(req?.body ?? "{}"); }
+		catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let alias = payload?.alias;
+		let source = payload?.source;
+		if (alias == null || source == null) {
+			return { status: 400, body: "{\"error\":\"alias + source required\"}" };
+		}
+		let kind = source?.kind;
+		let id = new_id(db);
+		let target = target_path_for(canonical_dir, alias);
+
+		if (kind == "peer") {
+			let url = source?.url;
+			if (url == null) {
+				return { status: 400, body: "{\"error\":\"source.url required for kind=peer\"}" };
+			}
+			let now = iso_now(db);
+			db_exec(db,
+				"insert into model_transfers "
+				+ "(id, alias, source_kind, source_url, target_path, status, started_at) "
+				+ "values (?, ?, 'peer', ?, ?, 'queued', ?)",
+				[id, alias, url, target, now]);
+			let t = spawn(pull_peer_task_with_rescan, db, id, url, target, rescan_after);
+			detach(t);
+			return { status: 202, body: stringify({ transfer_id: id, target_path: target }) };
+		}
+
+		return { status: 400, body: stringify({
+			error: "unknown source kind: " + kind + " (peer is the only kind in v0.3.0)",
+		})};
+	};
+}
+
+// Wrap pull_peer_task so it triggers a rescan on successful completion.
+// Done at this layer rather than inside pull_peer_task itself because
+// the rescan callback is captured from main()'s closure scope.
+async fn pull_peer_task_with_rescan(db, transfer_id: string, source_url: string,
+                                    target: string, rescan_after): null {
+	pull_peer_task(db, transfer_id, source_url, target);
+	let row = query(db, "select status from model_transfers where id=?",
+		[transfer_id]);
+	if (row.length > 0 && row[0].status == "complete" && rescan_after != null) {
+		try { rescan_after(); } catch (e) {
+			eprint("[transfer] post-pull rescan failed: " + e);
+		}
+	}
+	return null;
+}
+
+// Tiny wrapper so make_pull_handler can lift JSON parsing errors as
+// catchable. Hemlock's parse() throws, but we want to translate to
+// a 400 cleanly without hauling in a separate try/catch dance.
+fn parse_or_throw(s: string): object {
+	return parse(s);
+}
+
+// HTTP handler: GET /models/transfers
+//
+// Returns transfers in three buckets effectively:
+//   - any active (status in queued/downloading)
+//   - any completed within last hour
+//   - any errored within last hour
+// Older finished transfers fall off so the dashboard panel doesn't
+// grow without bound. Operators can still grep agent logs for older.
+export fn list_transfers(db): array {
+	let rows = query(db,
+		"select id, alias, source_kind, source_url, hf_repo, hf_file, "
+		+ "target_path, status, bytes_downloaded, bytes_total, error, "
+		+ "started_at, completed_at "
+		+ "from model_transfers "
+		+ "where status in ('queued','downloading') "
+		+ "   or started_at > datetime('now','-1 hour') "
+		+ "order by started_at desc",
+		[]);
+	let out = [];
+	for (row in rows) { out.push(row); }
+	return out;
+}

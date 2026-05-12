@@ -55,6 +55,7 @@ import { init_services_schema, make_handlers, reap_zombie_services } from "./ser
 import { probe } from "./hardware";
 import { introspect } from "./capabilities";
 import { scan as scan_models } from "./models";
+import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -248,6 +249,7 @@ fn main(): null {
 
 	let db = open_db(DB_PATH);
 	init_services_schema(db);
+	init_transfers_schema(db);
 	let reaped = reap_zombie_services(db);
 	if (reaped > 0) {
 		print("[agent] reaped " + reaped + " zombie service rows from prior run");
@@ -279,6 +281,16 @@ fn main(): null {
 		return {};
 	}
 
+	// Closure shared by /rescan and the pull-completion hook so a
+	// successful download immediately enters the catalog without
+	// waiting for an operator to re-trigger.
+	fn do_rescan(): null {
+		let fresh = scan_models(canonical_dir, extra_dirs);
+		models_ref.entries = fresh;
+		return null;
+	}
+	let pull = make_pull_handler(db, canonical_dir, do_rescan);
+
 	// Pass our own listen port as reserved so spawn_service refuses to
 	// land an llama-server there (the OS would let two binds compete and
 	// our future restart would lose).
@@ -296,13 +308,48 @@ fn main(): null {
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
 			return { status: 200, body: stringify(models_ref.entries) };
 		} },
+		// Streaming blob serve. URL: /models/{alias}/blob — peers (or
+		// curl, or `wget`) pull the actual GGUF file from here. Response
+		// is application/octet-stream with Content-Length set; the body
+		// streams from disk in 64KB chunks (see http_server.write_response)
+		// so we don't peg RAM on a 40GB model. Prefix-route because alias
+		// lives in the path; reject non-/blob suffixes with 404.
+		{ method: "GET",  path: "/models/",       prefix: true, handler: fn(req): object {
+			let after = req.path.substr(8, req.path.length - 8);  // strip "/models/"
+			let slash = after.find("/");
+			if (slash < 0) {
+				return { status: 404, body: "{\"error\":\"expected /models/{alias}/blob\"}" };
+			}
+			let alias = after.substr(0, slash);
+			let suffix = after.substr(slash, after.length - slash);
+			if (suffix != "/blob") {
+				return { status: 404, body: "{\"error\":\"only /models/{alias}/blob is served\"}" };
+			}
+			let entries = models_ref.entries;
+			let path = null;
+			for (e in entries) {
+				if (e.alias == alias) { path = e.path; break; }
+			}
+			if (path == null) {
+				return { status: 404, body: stringify({
+					error: "alias not in this node's catalog: " + alias,
+				})};
+			}
+			return { status: 200, stream_path: path, headers: {
+				"content-type": "application/octet-stream",
+				"x-witchgrid-alias": alias,
+			}};
+		} },
 		{ method: "POST", path: "/rescan",        handler: fn(req): object {
 			print("[agent] rescan triggered");
-			let fresh = scan_models(canonical_dir, extra_dirs);
-			models_ref.entries = fresh;
+			do_rescan();
 			return { status: 200, body: stringify({
-				count: fresh.length,
+				count: models_ref.entries.length,
 			})};
+		} },
+		{ method: "POST", path: "/models/pull",   handler: pull },
+		{ method: "GET",  path: "/models/transfers", handler: fn(req): object {
+			return { status: 200, body: stringify(list_transfers(db)) };
 		} },
 		{ method: "POST", path: "/port_check",    handler: fn(req): object {
 			// CP calls this to OS-truth-check candidate ports before

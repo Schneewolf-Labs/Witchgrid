@@ -1,18 +1,27 @@
 // http_server.hml — tiny HTTP/1.1 server for an internal control plane.
 //
 // Built on @stdlib/net.TcpListener. No keep-alive, no chunked transfer,
-// no streaming bodies, no TLS. Sufficient for JSON RPC + small HTML
-// pages on a trusted network. Dies on parse errors with 400.
+// no TLS. Sufficient for JSON RPC + small HTML pages on a trusted
+// network. Dies on parse errors with 400.
 //
 // Handler shape:
 //   fn handler(req: Request) -> Response
 //   Request:  { method, path, headers (object), body (string) }
-//   Response: { status: i32, headers?: object, body?: string }
+//   Response: { status: i32, headers?: object, body?: string,
+//               stream_path?: string }
 //
-// Routes are matched exact path + exact method. No params, no globs —
-// add when needed.
+// Two body modes:
+//   - body         in-memory string. Default. Right for JSON / HTML.
+//   - stream_path  file path to stream from disk in 64KB chunks. Use
+//                  for big artifacts (GGUFs) so we don't peg RAM.
+//                  When set, body is ignored.
+//
+// Routes are matched exact path + exact method, then prefix routes
+// (route.prefix == true). No glob params; handlers parse req.path
+// themselves when they need a captured segment.
 
 import { TcpListener } from "@stdlib/net";
+import { open, file_stat } from "@stdlib/fs";
 
 // Decode a buffer of UTF-8 bytes into a Hemlock string with proper
 // codepoints. The naive byte-as-rune approach we used before was wrong
@@ -78,11 +87,46 @@ fn status_text(code: i32): string {
 	};
 }
 
+// Read+write loop tuned for moving GGUFs over a LAN. 64KB matches
+// what curl uses by default — bigger doesn't gain meaningfully on
+// gigabit, smaller wastes syscalls.
+let STREAM_CHUNK_BYTES = 65536;
+
 export fn write_response(stream, resp): null {
 	let status = resp.status;
-	let body = resp?.body ?? "";
+	let stream_path = resp?.stream_path;
 	let headers = resp?.headers ?? {};
 
+	if (stream_path != null) {
+		// Streaming file response. Compute Content-Length from stat
+		// rather than read-the-whole-thing-twice; default to
+		// application/octet-stream since we use this for binary blobs.
+		let stat = file_stat(stream_path);
+		if (!headers.has("content-type")) {
+			headers["content-type"] = "application/octet-stream";
+		}
+		headers["content-length"] = stat.size;
+		headers["connection"] = "close";
+
+		stream.write("HTTP/1.1 " + status + " " + status_text(status) + "\r\n");
+		let keys = headers.keys();
+		for (k in keys) {
+			stream.write(k + ": " + headers[k] + "\r\n");
+		}
+		stream.write("\r\n");
+
+		let f = open(stream_path, "r");
+		loop {
+			let buf = f.read_bytes(STREAM_CHUNK_BYTES);
+			if (buf == null || buf.length == 0) { break; }
+			stream.write(buf);
+			if (buf.length < STREAM_CHUNK_BYTES) { break; }
+		}
+		f.close();
+		return null;
+	}
+
+	let body = resp?.body ?? "";
 	if (body.length > 0 && !headers.has("content-type")) {
 		headers["content-type"] = "application/json";
 	}
