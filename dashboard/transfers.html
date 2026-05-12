@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>witchgrid — overview</title>
+  <title>witchgrid — transfers</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
   <script>
     (function () {
@@ -44,42 +44,9 @@
     </div>
 
     <section>
-      <h2>Spawn</h2>
-      <form class="spawn" x-data="spawnForm()" @submit.prevent="submit()">
-        <div>
-          <label for="prof">profile</label>
-          <select id="prof" x-model="profileName" @change="onProfileChange()" required>
-            <option value="">— select —</option>
-            <template x-for="name in Object.keys(profiles)" :key="name">
-              <option :value="name" x-text="name"></option>
-            </template>
-          </select>
-        </div>
-        <div>
-          <label for="mdl">model path <span class="meta">(optional — alias resolves via catalog if blank)</span></label>
-          <input id="mdl" type="text" x-model="model" placeholder="/path/to/model.gguf or leave blank for catalog">
-        </div>
-        <button type="submit" :disabled="busy" x-text="busy ? '…' : 'spawn'"></button>
-        <details>
-          <summary>advanced (pin placement)</summary>
-          <div>
-            <input type="text" x-model="node_id" placeholder="node_id (auto)">
-            <input type="text" x-model="gpus" placeholder="gpus, e.g. 0,2 (auto)">
-            <input type="number" x-model="port" placeholder="port (auto)">
-          </div>
-        </details>
-        <p class="msg" :class="isError ? 'err' : 'ok'" x-show="message" x-text="message"></p>
-      </form>
-    </section>
-
-    <section>
-      <h2>Nodes</h2>
-      <div hx-get="/ui/nodes" hx-trigger="load, every 5s">loading…</div>
-    </section>
-
-    <section>
-      <h2>Services</h2>
-      <div hx-get="/ui/services" hx-trigger="load, every 5s">loading…</div>
+      <h2>Transfers</h2>
+      <p class="meta" style="margin: 0 0 0.5rem 0">In-flight + recent (last hour) model pulls across the fleet.</p>
+      <div hx-get="/ui/transfers" hx-trigger="load, every 3s">loading…</div>
     </section>
   </main>
 </body>

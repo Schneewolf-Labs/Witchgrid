@@ -11,8 +11,7 @@
 # a clean single-file deploy. Same model as Go's embed.FS.
 #
 # Authoring loop:
-#   1. Edit dashboard/index.html, dashboard/styles.css,
-#      dashboard/spawn_form.js, or assets/logo.svg as normal files.
+#   1. Edit any file under dashboard/ or assets/ as normal.
 #   2. Run ./scripts/embed_assets.sh
 #   3. Rebuild the CP binary; restart it.
 
@@ -23,10 +22,17 @@ python3 - <<'PY'
 import os
 
 ASSETS = [
-    ("INDEX_HTML",    "dashboard/index.html"),
-    ("STYLES_CSS",    "dashboard/styles.css"),
-    ("SPAWN_FORM_JS", "dashboard/spawn_form.js"),
-    ("LOGO_SVG",      "assets/logo.svg"),
+    # Pages — one HTML per logical view, served by separate routes
+    # so URLs are real + browser back/forward works. Topbar is
+    # duplicated across them (cheap; ~20 lines of HTML × 4).
+    ("INDEX_HTML",     "dashboard/index.html"),       # /
+    ("CATALOG_HTML",   "dashboard/catalog.html"),     # /catalog
+    ("TRANSFERS_HTML", "dashboard/transfers.html"),   # /transfers
+    ("PROFILES_HTML",  "dashboard/profiles.html"),    # /profiles
+    # Shared assets
+    ("STYLES_CSS",     "dashboard/styles.css"),
+    ("DASHBOARD_JS",   "dashboard/dashboard.js"),
+    ("LOGO_SVG",       "assets/logo.svg"),
 ]
 
 def hemlock_escape(src: str) -> str:

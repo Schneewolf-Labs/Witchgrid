@@ -183,6 +183,31 @@ h1 {
 .theme-toggle:hover { background: var(--bg-3); color: var(--fg-1); border-color: var(--accent); }
 .theme-toggle:focus { outline: 2px solid var(--accent-soft); outline-offset: 2px; }
 
+/* Page nav (between brand and theme toggle in topbar) */
+.page-nav {
+  display: flex;
+  gap: 0.25rem;
+  flex: 1;
+  justify-content: center;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.04em;
+}
+.page-nav a {
+  text-decoration: none;
+  color: var(--fg-dim);
+  padding: 0.4rem 0.85rem;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.page-nav a:hover { color: var(--fg-1); background: var(--bg-2); }
+.page-nav a.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft);
+}
+
 /* ─── stats strip ───────────────────────────────────────────────── */
 
 .stats {
@@ -270,17 +295,21 @@ code {
   border: 1px solid var(--border-soft);
 }
 
-/* ─── per-GPU rows ──────────────────────────────────────────────── */
+/* ─── per-hardware-item rows (CPU / RAM / GPU / disk) ───────────── */
 
-.gpu-row {
+.hw-row, .gpu-row {
   display: grid;
-  grid-template-columns: 200px 1fr 110px;
+  grid-template-columns: 280px 1fr 130px;
   align-items: center;
   gap: 0.6rem;
   margin: 3px 0;
   font-family: ui-monospace, monospace;
   font-size: 0.78rem;
 }
+.hw-row-cpu { grid-template-columns: 280px 1fr; }
+.hw-name { color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.hw-name code { font-size: 0.85em; padding: 0; background: transparent; border: none; }
+.hw-fill { color: var(--fg-1); }
 .gpu-name { color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .gpu-bar {
   height: 6px;

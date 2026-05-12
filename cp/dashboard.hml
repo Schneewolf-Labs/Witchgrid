@@ -17,11 +17,17 @@
 
 // Re-export the static assets so cp.hml can hand them to the asset routes
 // without importing them itself. Single import surface for the dashboard.
-import { INDEX_HTML, STYLES_CSS, SPAWN_FORM_JS, LOGO_SVG } from "./embedded_assets";
-export let SHELL_HTML = INDEX_HTML;
+import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML,
+         STYLES_CSS, DASHBOARD_JS, LOGO_SVG } from "./embedded_assets";
+// Page shells — one per route. Topbar is duplicated across them.
+export let OVERVIEW_HTML  = INDEX_HTML;
+export let PAGE_CATALOG   = CATALOG_HTML;
+export let PAGE_TRANSFERS = TRANSFERS_HTML;
+export let PAGE_PROFILES  = PROFILES_HTML;
+// Shared static assets
 export let SHELL_CSS = STYLES_CSS;
-export let SHELL_JS = SPAWN_FORM_JS;
-export let LOGO = LOGO_SVG;
+export let SHELL_JS  = DASHBOARD_JS;
+export let LOGO      = LOGO_SVG;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -159,10 +165,13 @@ export fn render_stats(stats): string {
 //                                ram: [vals...],
 //                                disk: { path → [vals...] } } }
 //
-// Each row gets a clickable expander (<details>) revealing the full
-// hardware breakdown — CPU cores, RAM, per-disk capacity, all with
-// 30-min sparklines. Default collapsed so the table stays dense for
-// fleets > 3 nodes.
+// All hardware (CPU, RAM, per-GPU, per-disk) renders inline in the
+// Hardware column — no collapsed expander. CPU profiles run on RAM,
+// distribution lands on disks, GPUs hold inference; operator wants
+// all three visible at a glance, not hidden behind a click.
+//
+// Each item gets the same shape: [label] [bar] [free/total] + 30-min
+// sparkline beneath. Same color tokens for everything.
 export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
@@ -170,7 +179,7 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 	let html = "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>node</th><th>role</th><th>last seen</th>"
-		+ "<th>GPUs (free / total · 30 min trend)</th>"
+		+ "<th>hardware (free / total · 30 min trend)</th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (n in nodes_data) {
 		let stale = n.age_seconds > stale_seconds;
@@ -178,82 +187,90 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 		if (stale) { last_class = " class=\"stale\""; }
 
 		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
-
-		// Top row: identity + GPUs (the "what's hot" view).
 		let hw = n.hardware ?? {};
+
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(n.node_id) + "</strong>"
 				+ "<br><span class=\"id\">" + esc(n.hostname) + "</span></td>"
 			+ "<td>" + esc(n.role) + "</td>"
 			+ "<td" + last_class + ">" + n.age_seconds + "s ago</td>"
 			+ "<td>";
-		let gpus = hw?.gpus ?? [];
-		if (gpus.length == 0) {
-			html = html + "<span class=\"empty\">—</span>";
-		} else {
-			for (g in gpus) {
-				let pct = (f64(g.free_mb) / f64(g.total_mb)) * 100.0;
-				let kind = util_class(g.free_mb, g.total_mb);
-				let series = bundle?.gpu?["" + g.index] ?? [];
-				html = html + "<div class=\"gpu-row\">"
-					+ "<span class=\"gpu-name\">[" + g.index + "] "
-						+ esc(g.name) + "</span>"
-					+ "<div class=\"gpu-bar\"><div class=\"bar-" + kind
-						+ "\" style=\"width: " + pct + "%;\"></div></div>"
-					+ "<span class=\"gpu-mem\">" + fmt_mb(g.free_mb)
-						+ " / " + fmt_mb(g.total_mb) + "</span>"
-					+ "</div>"
-					+ render_sparkline(series, g.total_mb, kind);
-			}
-		}
-		html = html + "</td></tr>\n";
 
-		// Hardware expander row — sub-row spanning all columns. Holds CPU,
-		// RAM, and per-disk capacity, each with their own sparkline.
-		// Collapsed by default; one click to inspect.
+		// CPU — single line, no bar (we don't probe utilization yet,
+		// just core count). Acts as a separator anchor before the
+		// memory + GPUs that get bars.
 		let cpu_cores = hw?.cpu_cores;
+		if (cpu_cores != null) {
+			html = html + "<div class=\"hw-row hw-row-cpu\">"
+				+ "<span class=\"hw-name\">CPU</span>"
+				+ "<span class=\"hw-fill\">"
+					+ cpu_cores + " core" + (cpu_cores == 1 ? "" : "s")
+				+ "</span>"
+				+ "</div>";
+		}
+
+		// RAM
 		let ram_total = hw?.ram_total_mb;
 		let ram_free  = hw?.ram_free_mb;
-		let disks     = hw?.disks ?? [];
-		if (cpu_cores != null || ram_total != null || disks.length > 0) {
-			html = html + "<tr class=\"hw-detail\"><td colspan=\"4\">"
-				+ "<details><summary>hardware</summary>"
-				+ "<dl class=\"hw-dl\">";
-			if (cpu_cores != null) {
-				html = html + "<dt>CPU</dt><dd>" + cpu_cores + " cores</dd>";
-			}
-			if (ram_total != null) {
-				let ram_pct = 0.0;
-				if (ram_free != null && ram_total > 0) {
-					ram_pct = (f64(ram_free) / f64(ram_total)) * 100.0;
-				}
-				let ram_kind = util_class(ram_free, ram_total);
-				html = html + "<dt>RAM</dt><dd>"
-					+ fmt_mb(ram_free) + " free / " + fmt_mb(ram_total)
-					+ " <span class=\"meta\">(" + i32(ram_pct) + "% free)</span>"
-					+ render_sparkline(bundle?.ram ?? [], ram_total, ram_kind)
-					+ "</dd>";
-			}
-			if (disks.length > 0) {
-				html = html + "<dt>Storage</dt><dd>";
-				for (d in disks) {
-					let role_badge = "";
-					if (d.role == "canonical") {
-						role_badge = " <span class=\"badge badge-canonical\">canonical</span>";
-					} else {
-						role_badge = " <span class=\"badge badge-scan\">scan</span>";
-					}
-					let disk_kind = util_class(d.free_mb, d.total_mb);
-					html = html + "<div class=\"disk-row\">"
-						+ "<code>" + esc(d.path) + "</code>" + role_badge
-						+ " — " + fmt_mb(d.free_mb) + " free / " + fmt_mb(d.total_mb)
-						+ render_sparkline(bundle?.disk?[d.path] ?? [], d.total_mb, disk_kind)
-						+ "</div>";
-				}
-				html = html + "</dd>";
-			}
-			html = html + "</dl></details></td></tr>\n";
+		if (ram_total != null && ram_total > 0) {
+			let ram_pct = 0.0;
+			if (ram_free != null) { ram_pct = (f64(ram_free) / f64(ram_total)) * 100.0; }
+			let ram_kind = util_class(ram_free, ram_total);
+			html = html + "<div class=\"hw-row\">"
+				+ "<span class=\"hw-name\">RAM</span>"
+				+ "<div class=\"gpu-bar\"><div class=\"bar-" + ram_kind
+					+ "\" style=\"width: " + ram_pct + "%;\"></div></div>"
+				+ "<span class=\"gpu-mem\">" + fmt_mb(ram_free)
+					+ " / " + fmt_mb(ram_total) + "</span>"
+				+ "</div>"
+				+ render_sparkline(bundle?.ram ?? [], ram_total, ram_kind);
 		}
+
+		// GPUs
+		let gpus = hw?.gpus ?? [];
+		for (g in gpus) {
+			let pct = (f64(g.free_mb) / f64(g.total_mb)) * 100.0;
+			let kind = util_class(g.free_mb, g.total_mb);
+			let series = bundle?.gpu?["" + g.index] ?? [];
+			html = html + "<div class=\"hw-row\">"
+				+ "<span class=\"hw-name\">GPU " + g.index + " "
+					+ "<span class=\"meta\">" + esc(g.name) + "</span></span>"
+				+ "<div class=\"gpu-bar\"><div class=\"bar-" + kind
+					+ "\" style=\"width: " + pct + "%;\"></div></div>"
+				+ "<span class=\"gpu-mem\">" + fmt_mb(g.free_mb)
+					+ " / " + fmt_mb(g.total_mb) + "</span>"
+				+ "</div>"
+				+ render_sparkline(series, g.total_mb, kind);
+		}
+
+		// Disks
+		let disks = hw?.disks ?? [];
+		for (d in disks) {
+			let role_badge = "";
+			if (d.role == "canonical") {
+				role_badge = " <span class=\"badge badge-canonical\">canonical</span>";
+			} else {
+				role_badge = " <span class=\"badge badge-scan\">scan</span>";
+			}
+			let disk_kind = util_class(d.free_mb, d.total_mb);
+			let disk_pct = 0.0;
+			if (d.total_mb > 0) { disk_pct = (f64(d.free_mb) / f64(d.total_mb)) * 100.0; }
+			html = html + "<div class=\"hw-row\">"
+				+ "<span class=\"hw-name\">disk " + role_badge + " "
+					+ "<code class=\"meta\">" + esc(d.path) + "</code></span>"
+				+ "<div class=\"gpu-bar\"><div class=\"bar-" + disk_kind
+					+ "\" style=\"width: " + disk_pct + "%;\"></div></div>"
+				+ "<span class=\"gpu-mem\">" + fmt_mb(d.free_mb)
+					+ " / " + fmt_mb(d.total_mb) + "</span>"
+				+ "</div>"
+				+ render_sparkline(bundle?.disk?[d.path] ?? [], d.total_mb, disk_kind);
+		}
+
+		if (cpu_cores == null && ram_total == null && gpus.length == 0 && disks.length == 0) {
+			html = html + "<span class=\"empty\">—</span>";
+		}
+
+		html = html + "</td></tr>\n";
 	}
 	html = html + "</tbody></table>";
 	return html;
