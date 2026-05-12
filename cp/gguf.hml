@@ -353,6 +353,43 @@ export fn max_context_tokens(parsed: object, available_vram_mb: f64,
 	return ctx;
 }
 
+// Catalog-row variant of estimate_vram_mb. CP uses this path when
+// placement was driven by a model_alias instead of a model_path: the
+// agent already extracted these ingredients at scan time and shipped
+// them in the catalog, so CP doesn't need filesystem access to the
+// model. This is the architectural reason the catalog is worth its
+// weight — placement decoupled from "CP must mount the model dir."
+//
+// Ingredients required: { size_mb, architecture, n_layers, n_heads,
+// n_kv_heads, embedding_length }. Same math as estimate_vram_mb.
+export fn estimate_vram_from_ingredients(ing, context_tokens: i32, kv_type: string): object {
+	let n_kv_heads = ing.n_kv_heads;
+	if (n_kv_heads == null) { n_kv_heads = ing.n_heads; }
+	let head_dim: i64 = ing.embedding_length / ing.n_heads;
+	let bpe = kv_bytes_per_elem(kv_type);
+	let kv_per_token_b: f64 = 2.0 * f64(ing.n_layers) * f64(n_kv_heads) * f64(head_dim) * bpe;
+
+	let weights_mb: f64 = f64(ing.size_mb);
+	let kv_total_mb: f64 = (kv_per_token_b * f64(context_tokens)) / 1048576.0;
+	let activation_overhead_mb: f64 = 1024.0;
+
+	return {
+		architecture: ing.architecture,
+		n_layers: ing.n_layers,
+		n_heads: ing.n_heads,
+		n_kv_heads: n_kv_heads,
+		embedding_length: ing.embedding_length,
+		head_dim: head_dim,
+		kv_type: kv_type,
+		context_tokens: context_tokens,
+		weights_mb: weights_mb,
+		kv_per_token_b: kv_per_token_b,
+		kv_total_mb: kv_total_mb,
+		activation_overhead_mb: activation_overhead_mb,
+		total_mb: weights_mb + kv_total_mb + activation_overhead_mb,
+	};
+}
+
 // Estimate VRAM in megabytes for serving a given context length with a
 // given KV cache quant. Returns { weights_mb, kv_per_token_b, kv_total_mb,
 // activation_overhead_mb, total_mb } so callers can see the breakdown.

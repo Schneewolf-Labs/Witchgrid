@@ -1,0 +1,174 @@
+// models.hml — local GGUF catalog scanner.
+//
+// Walks WITCHGRID_MODEL_DIR (canonical, where pulls land) plus any
+// extras from WITCHGRID_MODEL_DIRS_EXTRA, parses each *.gguf file's
+// metadata via cp/gguf.hml, and produces a list of catalog entries
+// the agent ships to CP on /register.
+//
+// Each entry carries enough placement ingredients (size_mb + arch +
+// layer/head shape) that CP can compute estimate_vram_mb() WITHOUT
+// re-opening the file. That's the point of the catalog: CP no longer
+// needs the model directory mounted to do placement.
+//
+// Alias derivation: filename minus extension, lowercased. Pure
+// filename-based for v0.2 — operators recognise it ("mahou-1.5-mistral-
+// nemo-12b.q5_k_m") and it matches what they typed when they
+// downloaded. Metadata-derived alias (combine general.name + size +
+// quant) is on the table if filename collisions become a real pain.
+//
+// Dedup: if the same alias appears in multiple paths (e.g. operator
+// has the same model in canonical + an extra dir), keep the first one
+// found and log the dup. Hashing 7 GB to dedupe content is too
+// expensive to do every boot for a v0.2 nicety.
+
+import { list_dir, file_stat, is_dir, is_file, exists } from "@stdlib/fs";
+import { read_metadata } from "../cp/gguf";
+
+// Walk dir recursively, accumulating absolute paths matching *.gguf.
+// Symlinks are followed via the underlying stat (Hemlock's is_dir/is_file
+// don't distinguish — that's fine for our purpose; a symlink to a GGUF
+// is a GGUF). max_depth caps runaway walks if someone points us at /.
+fn walk_gguf(root: string, max_depth: i32, out): null {
+	if (max_depth < 0) { return null; }
+	if (!exists(root)) { return null; }
+
+	let entries = null;
+	try {
+		entries = list_dir(root);
+	} catch (e) {
+		// Permission denied / IO error — skip, don't blow up the scan.
+		return null;
+	}
+	for (name in entries) {
+		if (name == "." || name == "..") { continue; }
+		// Skip hidden dirs (.git, .cache) — these never hold models we
+		// care about and waste time on huge trees.
+		if (name.length > 0 && name[0] == '.') { continue; }
+
+		let full = root + "/" + name;
+		let is_d = false;
+		let is_f = false;
+		try { is_d = is_dir(full); } catch (e) { }
+		try { is_f = is_file(full); } catch (e) { }
+
+		if (is_d) {
+			walk_gguf(full, max_depth - 1, out);
+			continue;
+		}
+		if (!is_f) { continue; }
+		// Filename-based extension match. Avoids slurping every file's
+		// stat — most dirs have lots of non-GGUF cruft.
+		if (name.length < 5) { continue; }
+		let dot = name.length - 5;
+		if (name.substr(dot, 5) != ".gguf") { continue; }
+		out.push(full);
+	}
+	return null;
+}
+
+// path/to/Mahou-1.5-mistral-nemo-12B.Q5_K_M.gguf
+//   → mahou-1.5-mistral-nemo-12b.q5_k_m
+fn alias_from_path(path: string): string {
+	let slash = path.length - 1;
+	while (slash >= 0 && path[slash] != '/') { slash = slash - 1; }
+	let name = path.substr(slash + 1, path.length - slash - 1);
+	if (name.length >= 5) {
+		let dot = name.length - 5;
+		if (name.substr(dot, 5) == ".gguf") {
+			name = name.substr(0, dot);
+		}
+	}
+	return name.to_lower();
+}
+
+// Build a catalog entry from a parsed GGUF (already opened by
+// read_metadata). Returns null if the file lacks the architecture
+// metadata we need to do placement — corrupt or unsupported GGUFs
+// shouldn't end up in the catalog. Caller logs the skip.
+fn entry_from_metadata(path: string, parsed): object {
+	let meta = parsed.meta;
+	let arch = meta?["general.architecture"];
+	if (arch == null) { return null; }
+
+	let n_layers   = meta?[arch + ".block_count"];
+	let n_heads    = meta?[arch + ".attention.head_count"];
+	let embed_dim  = meta?[arch + ".embedding_length"];
+	if (n_layers == null || n_heads == null || embed_dim == null) {
+		return null;
+	}
+	let n_kv_heads = meta?[arch + ".attention.head_count_kv"];
+	if (n_kv_heads == null) { n_kv_heads = n_heads; }
+
+	let claimed_ctx = meta?[arch + ".context_length"];
+	if (claimed_ctx == null) { claimed_ctx = 0; }
+
+	// Source URL if the GGUF stamps one (newer HF uploads do; many
+	// don't). When present, this lets the dashboard offer a one-click
+	// "pull from HF" without an explicit profile-side hf_source.
+	let source_url = meta?["general.source.url"];
+	if (source_url == null) { source_url = meta?["general.source_url"]; }
+
+	let general_name = meta?["general.name"];
+
+	return {
+		alias:        alias_from_path(path),
+		path:         path,
+		size_mb:      i32(parsed.file_size / 1048576),
+		architecture: arch,
+		n_layers:     n_layers,
+		n_heads:      n_heads,
+		n_kv_heads:   n_kv_heads,
+		embedding_length: embed_dim,
+		claimed_context:  claimed_ctx,
+		general_name: general_name,
+		source_url:   source_url,
+	};
+}
+
+// Scan the canonical dir + any extras for GGUFs, parse each, return the
+// dedup'd catalog. canonical/extras are the same shapes hardware.probe
+// uses; pass null for either when not configured.
+//
+// Cost: dominated by the per-file GGUF metadata parse. ~16 ms per file
+// on a SATA SSD; ~1.5 s for a fleet member with 100 GGUFs. Worth it
+// only at boot + on operator-triggered rescan.
+export fn scan(canonical, extras): array {
+	let paths = [];
+	if (canonical != null && exists(canonical)) {
+		walk_gguf(canonical, 8, paths);
+	}
+	if (extras != null) {
+		for (d in extras) {
+			if (exists(d)) { walk_gguf(d, 8, paths); }
+		}
+	}
+
+	let entries = [];
+	let seen = {};
+	for (p in paths) {
+		let parsed = null;
+		try {
+			parsed = read_metadata(p);
+		} catch (e) {
+			eprint("[catalog] skip " + p + ": " + e);
+			continue;
+		}
+		let entry = entry_from_metadata(p, parsed);
+		if (entry == null) {
+			eprint("[catalog] skip " + p
+				+ ": missing arch metadata (not a runnable GGUF for placement)");
+			continue;
+		}
+		if (seen.has(entry.alias)) {
+			// First-found wins. Operator can resolve by renaming the
+			// duplicate or deleting it; not our place to choose.
+			eprint("[catalog] dup alias " + entry.alias
+				+ " (already at " + seen[entry.alias]
+				+ "; ignoring " + p + ")");
+			continue;
+		}
+		seen[entry.alias] = p;
+		entries.push(entry);
+	}
+	return entries;
+}

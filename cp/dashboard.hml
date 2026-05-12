@@ -64,8 +64,14 @@ fn vram_color(free_mb, total_mb): string {
 
 // ── /ui/nodes fragment ───────────────────────────────────────────────
 
-// nodes_data: [{node_id, hostname, role, hardware: {gpus: [...]},
+// nodes_data: [{node_id, hostname, role,
+//               hardware: { role, cpu_cores, ram_total_mb, ram_free_mb,
+//                           gpus: [...], disks: [...] },
 //               agent_url, registered_at, last_seen_at, age_seconds}]
+//
+// Each row gets a clickable expander (<details>) revealing the full
+// hardware breakdown — CPU cores, RAM, per-disk capacity. Default
+// collapsed so the table stays dense for fleets > 3 nodes.
 export fn render_nodes(nodes_data, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
@@ -79,13 +85,16 @@ export fn render_nodes(nodes_data, stale_seconds: i32): string {
 		let stale = n.age_seconds > stale_seconds;
 		let last_class = "";
 		if (stale) { last_class = " class=\"stale\""; }
+
+		// Top row: identity + GPUs (the "what's hot" view).
+		let hw = n.hardware ?? {};
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(n.node_id) + "</strong>"
 				+ "<br><span class=\"id\">" + esc(n.hostname) + "</span></td>"
 			+ "<td>" + esc(n.role) + "</td>"
 			+ "<td" + last_class + ">" + n.age_seconds + "s ago</td>"
 			+ "<td>";
-		let gpus = n.hardware?.gpus ?? [];
+		let gpus = hw?.gpus ?? [];
 		if (gpus.length == 0) {
 			html = html + "<span class=\"empty\">—</span>";
 		} else {
@@ -103,6 +112,95 @@ export fn render_nodes(nodes_data, stale_seconds: i32): string {
 			}
 		}
 		html = html + "</td></tr>\n";
+
+		// Hardware expander row — sub-row spanning all columns. Holds CPU,
+		// RAM, and per-disk capacity. Collapsed by default; one click to
+		// inspect.
+		let cpu_cores = hw?.cpu_cores;
+		let ram_total = hw?.ram_total_mb;
+		let ram_free  = hw?.ram_free_mb;
+		let disks     = hw?.disks ?? [];
+		if (cpu_cores != null || ram_total != null || disks.length > 0) {
+			html = html + "<tr class=\"hw-detail\"><td colspan=\"4\">"
+				+ "<details><summary>hardware</summary>"
+				+ "<dl class=\"hw-dl\">";
+			if (cpu_cores != null) {
+				html = html + "<dt>CPU</dt><dd>" + cpu_cores + " cores</dd>";
+			}
+			if (ram_total != null) {
+				let ram_pct = 0.0;
+				if (ram_free != null && ram_total > 0) {
+					ram_pct = (f64(ram_free) / f64(ram_total)) * 100.0;
+				}
+				html = html + "<dt>RAM</dt><dd>"
+					+ fmt_mb(ram_free) + " free / " + fmt_mb(ram_total)
+					+ " <span class=\"meta\">(" + i32(ram_pct) + "% free)</span></dd>";
+			}
+			if (disks.length > 0) {
+				html = html + "<dt>Storage</dt><dd>";
+				for (d in disks) {
+					let role_badge = "";
+					if (d.role == "canonical") {
+						role_badge = " <span class=\"badge badge-canonical\">canonical</span>";
+					} else {
+						role_badge = " <span class=\"badge badge-scan\">scan</span>";
+					}
+					html = html + "<div class=\"disk-row\">"
+						+ "<code>" + esc(d.path) + "</code>" + role_badge
+						+ " — " + fmt_mb(d.free_mb) + " free / " + fmt_mb(d.total_mb)
+						+ "</div>";
+				}
+				html = html + "</dd>";
+			}
+			html = html + "</dl></details></td></tr>\n";
+		}
+	}
+	html = html + "</tbody></table>";
+	return html;
+}
+
+// ── /ui/catalog fragment ─────────────────────────────────────────────
+//
+// catalog_data: [{alias, size_mb, architecture, claimed_context,
+//                 general_name, source_url, on_nodes: [{node_id, path}]}]
+//
+// One row per alias. Each row lists which nodes have it on disk so the
+// operator can see at a glance "who can run this?" and where.
+export fn render_catalog(catalog_data): string {
+	if (catalog_data.length == 0) {
+		return "<p class=\"empty\">No models in any node's catalog. "
+			+ "Set <code>WITCHGRID_MODEL_DIR</code> on an agent and restart it.</p>";
+	}
+	let html = "<table>\n"
+		+ "<thead><tr>"
+		+ "<th>alias</th><th>size</th><th>arch</th>"
+		+ "<th>on nodes</th><th>source</th>"
+		+ "</tr></thead>\n<tbody>\n";
+	for (e in catalog_data) {
+		// general_name is the human-friendly name from the GGUF — show as
+		// secondary text under the alias so the alias-as-key stays primary.
+		let name_subline = "";
+		if (e?.general_name != null && e.general_name.length > 0) {
+			name_subline = "<br><span class=\"id\">" + esc(e.general_name) + "</span>";
+		}
+		let nodes_html = "";
+		for (on in e.on_nodes) {
+			nodes_html = nodes_html + "<div class=\"catalog-node\">"
+				+ "<strong>" + esc(on.node_id) + "</strong> "
+				+ "<code class=\"meta\">" + esc(on.path) + "</code>"
+				+ "</div>";
+		}
+		let source_html = "<span class=\"empty\">—</span>";
+		if (e?.source_url != null && e.source_url.length > 0) {
+			source_html = "<a href=\"" + esc(e.source_url) + "\" target=\"_blank\">link</a>";
+		}
+		html = html + "<tr>"
+			+ "<td><code>" + esc(e.alias) + "</code>" + name_subline + "</td>"
+			+ "<td>" + fmt_mb(e.size_mb) + "</td>"
+			+ "<td>" + esc(e.architecture) + "</td>"
+			+ "<td>" + nodes_html + "</td>"
+			+ "<td>" + source_html + "</td>"
+			+ "</tr>\n";
 	}
 	html = html + "</tbody></table>";
 	return html;
@@ -221,7 +319,12 @@ export fn render_capabilities(caps_data): string {
 // ── /ui/profiles fragment ────────────────────────────────────────────
 
 // profiles_data: object map { name → { default_port, context, kv_type,
-//                                       default_model } }
+//                                       model_alias, default_model } }
+//
+// "model" column shows model_alias when present (the modern path) and
+// falls back to default_model. Both shown when both are set so the
+// operator sees the alias is the primary and default_model is the
+// legacy fallback.
 export fn render_profiles(profiles_data): string {
 	let names = profiles_data.keys();
 	if (names.length == 0) {
@@ -230,21 +333,30 @@ export fn render_profiles(profiles_data): string {
 	let html = "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>profile</th><th>context</th><th>kv</th>"
-		+ "<th>default port</th><th>auto-spawn</th>"
+		+ "<th>default port</th><th>model</th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (n in names) {
 		let p = profiles_data[n];
-		let auto = "—";
-		if (p?.default_model != null) {
-			auto = "<span class=\"alive-yes\">✓</span> <code>"
-				+ esc(p.default_model) + "</code>";
+		let model_cell = "<span class=\"empty\">—</span>";
+		if (p?.model_alias != null) {
+			model_cell = "<span class=\"alive-yes\">✓</span> "
+				+ "<code>" + esc(p.model_alias) + "</code>"
+				+ " <span class=\"meta\">(catalog)</span>";
+			if (p?.default_model != null) {
+				model_cell = model_cell
+					+ "<br><span class=\"meta\">fallback: <code>"
+					+ esc(p.default_model) + "</code></span>";
+			}
+		} else if (p?.default_model != null) {
+			model_cell = "<span class=\"alive-yes\">✓</span> "
+				+ "<code>" + esc(p.default_model) + "</code>";
 		}
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(n) + "</strong></td>"
 			+ "<td><code>" + p.context + "</code></td>"
 			+ "<td><code>" + esc(p.kv_type) + "</code></td>"
 			+ "<td><code>" + p.default_port + "</code></td>"
-			+ "<td>" + auto + "</td>"
+			+ "<td>" + model_cell + "</td>"
 			+ "</tr>\n";
 	}
 	html = html + "</tbody></table>";

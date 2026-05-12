@@ -35,3 +35,17 @@ form.spawn details > div { display: grid; grid-template-columns: 1fr 1fr 1fr; ga
 form.spawn .msg { grid-column: 1 / -1; margin: 0; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 0.9em; }
 form.spawn .msg.ok { background: var(--pico-color-green-50); color: var(--pico-color-green-700); }
 form.spawn .msg.err { background: var(--pico-color-red-50); color: var(--pico-color-red-700); white-space: pre-wrap; font-family: monospace; font-size: 0.8em; }
+
+/* Hardware detail expander row in nodes table */
+tr.hw-detail td { padding-top: 0; padding-bottom: 0.5rem; border-top: none; }
+tr.hw-detail details summary { font-size: 0.8em; color: var(--pico-muted-color); cursor: pointer; padding: 0.25rem 0; }
+.hw-dl { display: grid; grid-template-columns: 80px 1fr; gap: 0.25rem 0.75rem; margin: 0.5rem 0 0 0; font-size: 0.85em; }
+.hw-dl dt { color: var(--pico-muted-color); text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.05em; padding-top: 0.15rem; }
+.hw-dl dd { margin: 0; }
+.disk-row { padding: 0.1rem 0; }
+
+/* Catalog table */
+.catalog-node { font-size: 0.85em; padding: 0.1rem 0; }
+.badge { display: inline-block; padding: 0 0.4rem; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em; vertical-align: middle; }
+.badge-canonical { background: var(--pico-color-green-100); color: var(--pico-color-green-700); }
+.badge-scan { background: var(--pico-color-slate-100); color: var(--pico-color-slate-700); }

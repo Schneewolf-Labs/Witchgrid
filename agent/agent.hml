@@ -1,14 +1,17 @@
 // agent.hml — Witchgrid node agent.
 //
 // Runs on every box that hosts inference. On boot:
-//   1. Probe hardware (nvidia-smi if GPU box, empty if CPU-only).
-//   2. POST /register to the control plane with { node_id, hostname,
-//      role, hardware, agent_url } so CP knows where to reach us.
-//   3. Open sqlite, init the local services schema.
-//   4. Spawn a detached heartbeat task that re-registers every
+//   1. Probe hardware (nvidia-smi if GPU box, empty if CPU-only) +
+//      cpu_count + ram totals + per-watched-dir disk free.
+//   2. Scan model dirs (canonical + extras) into a GGUF catalog.
+//   3. POST /register to the control plane with hardware + catalog.
+//   4. Open sqlite, init the local services schema.
+//   5. Spawn a detached heartbeat task that re-registers every
 //      HEARTBEAT_SECONDS with refreshed hardware (live free_mb counts
-//      so CP placement sees current state, not boot snapshot).
-//   5. Listen on AGENT_PORT for service-supervisor requests from CP.
+//      so CP placement sees current state, not boot snapshot). Catalog
+//      is sent on every heartbeat too — small payload, easier than
+//      change-detection.
+//   6. Listen on AGENT_PORT for service-supervisor requests from CP.
 //
 // CP is the only intended caller — agents don't need to be reachable
 // from the public internet, just from CP. Bind to 0.0.0.0 by default
@@ -16,21 +19,27 @@
 // to lock down further.
 //
 // Endpoints:
-//   POST /services         { profile, model, port?, gpus? }   → 201 {id,...}
-//   GET  /services                                            → [...]
-//   POST /services/stop    { id }                             → 204
-//   GET  /profiles                                            → [profile names]
-//   GET  /healthz                                             → ok
+//   POST /services         { profile, model?, port?, gpus? }   → 201 {id,...}
+//   GET  /services                                             → [...]
+//   POST /services/stop    { id }                              → 204
+//   GET  /profiles                                             → [profile names]
+//   GET  /capabilities                                         → { binary: caps_map }
+//   GET  /models                                               → catalog entries
+//   POST /rescan                                               → 200, refresh + return new count
+//   GET  /healthz                                              → ok
 //
 // Config (env vars):
-//   WITCHGRID_CP_URL       e.g. http://192.168.8.154:8765   (required)
-//   WITCHGRID_AGENT_URL    e.g. http://192.168.8.217:8766   (required;
-//                          what URL CP can reach this agent at — not
-//                          derivable, since the agent might be behind
-//                          NAT or have multiple interfaces)
-//   WITCHGRID_AGENT_HOST   bind address                       (default 0.0.0.0)
-//   WITCHGRID_AGENT_PORT   bind port                          (default 8766)
-//   WITCHGRID_NODE_ID      stable identifier                  (default $HOSTNAME)
+//   WITCHGRID_CP_URL           required   e.g. http://192.168.8.154:8765
+//   WITCHGRID_AGENT_URL        required   what URL CP can reach this agent at
+//   WITCHGRID_AGENT_HOST       0.0.0.0    bind address
+//   WITCHGRID_AGENT_PORT       8766       bind port
+//   WITCHGRID_NODE_ID          $HOSTNAME  stable identifier
+//   WITCHGRID_MODEL_DIR        ~/.witchgrid/models
+//                                         canonical dir; pulls land here,
+//                                         disk free reported as "canonical"
+//   WITCHGRID_MODEL_DIRS_EXTRA <empty>    colon-separated extra scan dirs
+//                                         (read-only as far as Witchgrid
+//                                         is concerned; just discovered)
 
 import { open_db, close_db } from "@stdlib/sqlite";
 import { stringify } from "@stdlib/json";
@@ -38,10 +47,13 @@ import { getenv } from "@stdlib/env";
 import { exec_argv } from "@stdlib/process";
 import { post_json } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
+import { homedir } from "@stdlib/os";
+import { exists, make_dir } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
 import { probe } from "./hardware";
 import { introspect } from "./capabilities";
+import { scan as scan_models } from "./models";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -73,6 +85,20 @@ fn detect_hostname(): string {
 	return "unknown";
 }
 
+// Split a colon-separated PATH-style env value, dropping empties. Used
+// for WITCHGRID_MODEL_DIRS_EXTRA. Returns [] when the value is unset
+// or empty so the scan code doesn't have to nil-check.
+fn split_paths(value: string): array {
+	let out = [];
+	if (value == null || value.length == 0) { return out; }
+	let parts = value.split(":");
+	for (p in parts) {
+		let pp = p.trim();
+		if (pp.length > 0) { out.push(pp); }
+	}
+	return out;
+}
+
 fn register_with_cp(cp_url: string, payload): null {
 	let url = cp_url + "/register";
 	print("[agent] registering with CP at " + url);
@@ -93,13 +119,19 @@ fn register_with_cp(cp_url: string, payload): null {
 
 // Heartbeat task. Runs detached on a worker thread. Re-probes hardware
 // each tick so CP's placement sees current free_mb, not boot-time
-// snapshot. Transient CP failures are swallowed — we'll succeed on the
-// next tick. The only way to stop the loop is process exit.
+// snapshot. Catalog is sent verbatim from the cached scan — rescans
+// are operator-triggered, not heartbeat-driven (boot scan + POST
+// /rescan covers the realistic cadence; per-heartbeat rescan would
+// repeatedly read every GGUF header for no operational gain).
+//
+// Transient CP failures are swallowed — we'll succeed on the next
+// tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
-                        agent_url: string, interval_seconds: i32): null {
+                        agent_url: string, canonical_dir: string,
+                        extra_dirs, models_ref, interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
-		let hw = probe();
+		let hw = probe(canonical_dir, extra_dirs);
 		try {
 			let resp = post_json(cp_url + "/register", {
 				node_id:   node_id,
@@ -107,6 +139,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				role:      hw.role,
 				hardware:  hw,
 				agent_url: agent_url,
+				models:    models_ref.entries,
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -114,6 +147,36 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		} catch (e) {
 			eprint("[heartbeat] CP unreachable: " + e);
 		}
+	}
+	return null;
+}
+
+// Default canonical dir is ~/.witchgrid/models. Created if missing so
+// the operator doesn't have to mkdir before first run; harmless on
+// CPU-only boxes that won't ever hold models (empty dir reports 0
+// catalog entries, which is what we want).
+fn default_canonical_dir(): string {
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/models"; }
+	return h + "/.witchgrid/models";
+}
+
+fn ensure_canonical_dir(path: string): null {
+	if (exists(path)) { return null; }
+	try {
+		// Walk up creating each missing component. Hemlock's make_dir
+		// doesn't recurse; one level at a time.
+		let parts = path.split("/");
+		let cur = "";
+		for (p in parts) {
+			if (p.length == 0) { cur = ""; continue; }
+			cur = cur + "/" + p;
+			if (!exists(cur)) {
+				try { make_dir(cur); } catch (e) { }
+			}
+		}
+	} catch (e) {
+		eprint("[agent] could not create canonical dir " + path + ": " + e);
 	}
 	return null;
 }
@@ -127,9 +190,34 @@ fn main(): null {
 	let hostname   = detect_hostname();
 	let node_id    = env_or("WITCHGRID_NODE_ID", hostname);
 
-	let hw = probe();
+	// Catalog config. Canonical defaults to ~/.witchgrid/models (created
+	// if missing). Extras are colon-separated and read-only — we discover
+	// what's there but pulls always land in the canonical dir.
+	let canonical_dir = env_or("WITCHGRID_MODEL_DIR", default_canonical_dir());
+	let extra_dirs    = split_paths(env_or("WITCHGRID_MODEL_DIRS_EXTRA", ""));
+	ensure_canonical_dir(canonical_dir);
+
+	let hw = probe(canonical_dir, extra_dirs);
 	print("[agent] " + node_id + " (" + hostname + ", " + hw.role + ") "
-		+ "with " + hw.gpus.length + " GPU(s)");
+		+ hw.cpu_cores + " cores, "
+		+ hw.ram_total_mb + " MB RAM, "
+		+ hw.gpus.length + " GPU(s), "
+		+ hw.disks.length + " disk path(s)");
+
+	// Scan the catalog before first /register so CP gets the model list
+	// on the very first contact (placement can use it immediately).
+	// Cost: ~16ms per file. A box with 100 GGUFs sees ~1.5s extra boot
+	// time — acceptable for a one-shot.
+	print("[agent] scanning models in " + canonical_dir
+		+ (extra_dirs.length > 0 ? " + " + extra_dirs.length + " extra dir(s)" : ""));
+	let model_entries = scan_models(canonical_dir, extra_dirs);
+	print("[agent] catalog: " + model_entries.length + " GGUF(s)");
+
+	// Wrap entries in a holder object so the heartbeat closure sees the
+	// SAME live reference after a /rescan replaces the inner list.
+	// (Hemlock arrays are passed by value in some assignment forms; the
+	// holder dodges any reassignment-vs-mutation ambiguity.)
+	let models_ref = { entries: model_entries };
 
 	register_with_cp(cp_url, {
 		node_id:   node_id,
@@ -137,11 +225,12 @@ fn main(): null {
 		role:      hw.role,
 		hardware:  hw,
 		agent_url: agent_url,
+		models:    models_ref.entries,
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               HEARTBEAT_SECONDS);
+	               canonical_dir, extra_dirs, models_ref, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
@@ -190,6 +279,17 @@ fn main(): null {
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
 			return { status: 200, body: stringify({
 				"llama-server": llama_caps,
+			})};
+		} },
+		{ method: "GET",  path: "/models",        handler: fn(req): object {
+			return { status: 200, body: stringify(models_ref.entries) };
+		} },
+		{ method: "POST", path: "/rescan",        handler: fn(req): object {
+			print("[agent] rescan triggered");
+			let fresh = scan_models(canonical_dir, extra_dirs);
+			models_ref.entries = fresh;
+			return { status: 200, body: stringify({
+				count: fresh.length,
 			})};
 		} },
 		{ method: "GET",  path: "/healthz",       handler: fn(req): object {

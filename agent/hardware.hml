@@ -1,13 +1,27 @@
 // hardware.hml — local hardware probe for the agent.
 //
-// Calls `nvidia-smi --query-gpu=...` and returns a structured object the
-// agent ships to CP on registration / heartbeat. Empty `gpus` array on
-// CPU-only nodes (nvidia-smi missing or fails); the role flips to "cpu".
+// Builds the hardware snapshot the agent ships to CP on registration
+// and every heartbeat. Covers four dimensions:
+//
+//   role:     "gpu" | "cpu"  (gpu if any nvidia GPU is visible)
+//   cpu:      core count
+//   ram:      total + free in MB
+//   gpus:     [{index, name, total_mb, free_mb, uuid}]   (empty on CPU box)
+//   disks:    [{path, role, total_mb, free_mb}]          (per watched dir)
+//
+// CPU/RAM via @stdlib/os (cross-platform). GPU via nvidia-smi (Linux,
+// CUDA box only — graceful empty on anything else). Disk free via
+// `df -B1 <path>` (Linux/macOS shellout — no statvfs in @stdlib/fs yet).
+//
+// Disks are reported per watched dir, not per device, because the
+// operator-relevant question is "is there room for another GGUF in
+// the canonical dir," not "what's the layout of /dev/sdX."
 
 import { exec_argv } from "@stdlib/process";
+import { cpu_count, total_memory, free_memory } from "@stdlib/os";
+import { exists } from "@stdlib/fs";
 
-// Returns: { role: "gpu"|"cpu", gpus: [{index, name, total_mb, free_mb, uuid}] }
-export fn probe(): object {
+fn probe_gpus(): array {
 	// exec_argv captures stderr instead of leaking it to the terminal AND
 	// throws if the binary isn't on PATH — both branches mean "no GPUs."
 	let r = null;
@@ -16,11 +30,10 @@ export fn probe(): object {
 			"--query-gpu=index,name,memory.total,memory.free,uuid",
 			"--format=csv,noheader,nounits"]);
 	} catch (e) {
-		return { role: "cpu", gpus: [] };
+		return [];
 	}
-
 	if (r.exit_code != 0 || r.output.length == 0) {
-		return { role: "cpu", gpus: [] };
+		return [];
 	}
 
 	let gpus = [];
@@ -38,8 +51,102 @@ export fn probe(): object {
 			uuid:     parts[4].trim(),
 		});
 	}
+	return gpus;
+}
 
+// `df -B1 <path>` output looks like (1024 = 1KB blocks; -B1 forces bytes):
+//   Filesystem     1B-blocks         Used     Available Use% Mounted on
+//   /dev/nvme0n1p2 500107862016 320451551232 154316603392  68% /
+// We want the second-to-last number (Available, in bytes) and the first
+// (1B-blocks total). Format is whitespace-aligned.
+fn probe_disk(path: string, role: string) {
+	if (!exists(path)) { return null; }
+	let r = null;
+	try {
+		r = exec_argv(["df", "-B1", path]);
+	} catch (e) {
+		return null;
+	}
+	if (r.exit_code != 0) { return null; }
+
+	let lines = r.output.split("\n");
+	if (lines.length < 2) { return null; }
+	// Take the LAST non-empty data line — `df` sometimes wraps long
+	// device names onto a continuation line, but the numeric fields
+	// always end up on a single line we can parse.
+	let data_line = "";
+	for (line in lines) {
+		let trimmed = line.trim();
+		if (trimmed.length == 0) { continue; }
+		if (trimmed.find("Filesystem") == 0) { continue; }
+		data_line = trimmed;
+	}
+	if (data_line.length == 0) { return null; }
+
+	let parts = data_line.split(" ");
+	let nums = [];
+	for (p in parts) {
+		let pp = p.trim();
+		if (pp.length == 0) { continue; }
+		nums.push(pp);
+	}
+	// Expected fields: device 1B-blocks used available use% mounted-on
+	// Numbers we want are at indices 1 (total) and 3 (available).
+	if (nums.length < 5) { return null; }
+	let total_b: i64 = i64(nums[1]);
+	let free_b:  i64 = i64(nums[3]);
+	return {
+		path:     path,
+		role:     role,
+		total_mb: i32(total_b / 1048576),
+		free_mb:  i32(free_b  / 1048576),
+	};
+}
+
+// Probe the canonical model dir + any extra scan dirs. Each path that
+// exists turns into one entry; missing paths are skipped silently
+// (operator may have configured an extra dir that isn't on this node).
+//
+// canonical: single path (the WITCHGRID_MODEL_DIR — where pulls land).
+// extras: array of paths (WITCHGRID_MODEL_DIRS_EXTRA, read-only scans).
+export fn probe_disks(canonical, extras): array {
+	let out = [];
+	if (canonical != null) {
+		let d = probe_disk(canonical, "canonical");
+		if (d != null) { out.push(d); }
+	}
+	if (extras != null) {
+		for (p in extras) {
+			let d = probe_disk(p, "scan");
+			if (d != null) { out.push(d); }
+		}
+	}
+	return out;
+}
+
+// Returns the full hardware snapshot. Disks come from probe_disks() so
+// the agent can pass in whichever dirs it actually cares about.
+//
+// canonical_dir + extra_dirs are nullable; pass null when the model
+// catalog isn't configured yet (early boot, or future CPU-only nodes
+// that don't host any models).
+export fn probe(canonical_dir, extra_dirs): object {
+	let gpus = probe_gpus();
+	let disks = probe_disks(canonical_dir, extra_dirs);
 	let role = "cpu";
 	if (gpus.length > 0) { role = "gpu"; }
-	return { role: role, gpus: gpus };
+
+	// Convert bytes → MB up front so the wire payload is small ints,
+	// not 64-bit byte counts CP would have to divide every render.
+	let ram_total_b: i64 = total_memory();
+	let ram_free_b:  i64 = free_memory();
+
+	return {
+		role:         role,
+		cpu_cores:    cpu_count(),
+		ram_total_mb: i32(ram_total_b / 1048576),
+		ram_free_mb:  i32(ram_free_b  / 1048576),
+		gpus:         gpus,
+		disks:        disks,
+	};
 }

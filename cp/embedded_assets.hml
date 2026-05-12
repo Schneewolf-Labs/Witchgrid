@@ -40,8 +40,8 @@ export let INDEX_HTML = "<!doctype html>
           </select>
         </div>
         <div>
-          <label for=\"mdl\">model path</label>
-          <input id=\"mdl\" type=\"text\" x-model=\"model\" placeholder=\"/path/to/model.gguf\" required>
+          <label for=\"mdl\">model path <span class=\"meta\">(optional — profile alias resolves via catalog if blank)</span></label>
+          <input id=\"mdl\" type=\"text\" x-model=\"model\" placeholder=\"/path/to/model.gguf or leave blank for catalog\">
         </div>
         <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'spawn'\"></button>
         <details>
@@ -64,6 +64,12 @@ export let INDEX_HTML = "<!doctype html>
     <section>
       <h2>Services</h2>
       <div hx-get=\"/ui/services\" hx-trigger=\"load, every 5s\">loading…</div>
+    </section>
+
+    <section>
+      <h2>Catalog</h2>
+      <p class=\"meta\" style=\"margin-left:0\">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time.</p>
+      <div hx-get=\"/ui/catalog\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
 
     <section>
@@ -118,6 +124,20 @@ form.spawn details > div { display: grid; grid-template-columns: 1fr 1fr 1fr; ga
 form.spawn .msg { grid-column: 1 / -1; margin: 0; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 0.9em; }
 form.spawn .msg.ok { background: var(--pico-color-green-50); color: var(--pico-color-green-700); }
 form.spawn .msg.err { background: var(--pico-color-red-50); color: var(--pico-color-red-700); white-space: pre-wrap; font-family: monospace; font-size: 0.8em; }
+
+/* Hardware detail expander row in nodes table */
+tr.hw-detail td { padding-top: 0; padding-bottom: 0.5rem; border-top: none; }
+tr.hw-detail details summary { font-size: 0.8em; color: var(--pico-muted-color); cursor: pointer; padding: 0.25rem 0; }
+.hw-dl { display: grid; grid-template-columns: 80px 1fr; gap: 0.25rem 0.75rem; margin: 0.5rem 0 0 0; font-size: 0.85em; }
+.hw-dl dt { color: var(--pico-muted-color); text-transform: uppercase; font-size: 0.75em; letter-spacing: 0.05em; padding-top: 0.15rem; }
+.hw-dl dd { margin: 0; }
+.disk-row { padding: 0.1rem 0; }
+
+/* Catalog table */
+.catalog-node { font-size: 0.85em; padding: 0.1rem 0; }
+.badge { display: inline-block; padding: 0 0.4rem; border-radius: 3px; font-size: 0.7em; text-transform: uppercase; letter-spacing: 0.05em; vertical-align: middle; }
+.badge-canonical { background: var(--pico-color-green-100); color: var(--pico-color-green-700); }
+.badge-scan { background: var(--pico-color-slate-100); color: var(--pico-color-slate-700); }
 ";
 
 export let SPAWN_FORM_JS = "// Alpine.js component for the spawn form. Pure client state — fetches
@@ -149,10 +169,17 @@ function spawnForm() {
     },
 
     onProfileChange() {
+      // Prefer leaving the model field blank when the profile has an
+      // alias — placement will resolve it via the catalog. Operator can
+      // still type a path to override. Fall back to default_model when
+      // the profile carries one but no alias.
       const p = this.profiles[this.profileName];
-      if (p && p.default_model) {
+      if (!p) { this.model = ''; return; }
+      if (p.model_alias) {
+        this.model = '';
+      } else if (p.default_model) {
         this.model = p.default_model;
-      } else if (p) {
+      } else {
         this.model = '';
       }
     },
@@ -160,7 +187,10 @@ function spawnForm() {
     async submit() {
       this.busy = true;
       this.message = '';
-      const body = { profile: this.profileName, model: this.model };
+      const body = { profile: this.profileName };
+      // Only include model if the operator actually filled it; CP will
+      // resolve from profile.model_alias / default_model otherwise.
+      if (this.model) body.model = this.model;
       if (this.node_id) body.node_id = this.node_id;
       if (this.port)    body.port    = parseInt(this.port);
       if (this.gpus) {

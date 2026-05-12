@@ -34,8 +34,8 @@ import { post_json, get, request as http_request } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
-import { read_metadata, estimate_vram_mb } from "./gguf";
-import { render_nodes, render_services, render_profiles, render_capabilities, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
+import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
+import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -54,6 +54,26 @@ fn init_db(db): null {
 		+ "registered_at text not null,"
 		+ "last_seen_at text not null"
 		+ ")", []);
+	// Per-node GGUF catalog. Replaced wholesale on each /register so we
+	// don't accumulate stale entries when an operator deletes a model
+	// from disk. Indexed on alias for the placement-time "which nodes
+	// have this model?" lookup.
+	exec(db, "create table if not exists node_models ("
+		+ "node_id text not null,"
+		+ "alias text not null,"
+		+ "path text not null,"
+		+ "size_mb integer not null,"
+		+ "architecture text,"
+		+ "n_layers integer,"
+		+ "n_heads integer,"
+		+ "n_kv_heads integer,"
+		+ "embedding_length integer,"
+		+ "claimed_context integer,"
+		+ "general_name text,"
+		+ "source_url text,"
+		+ "primary key (node_id, alias)"
+		+ ")", []);
+	exec(db, "create index if not exists ix_node_models_alias on node_models(alias)", []);
 	return null;
 }
 
@@ -86,8 +106,29 @@ fn handle_register(req): object {
 		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now]
 	);
 
+	// Catalog ingest. Replace-all-for-this-node so deleted models drop
+	// out automatically — no separate /unregister-model bookkeeping.
+	// Skipping silently when the field is absent keeps us compatible
+	// with older agents that haven't been rebuilt yet.
+	let models = payload?.models;
+	if (models != null) {
+		exec(DB, "delete from node_models where node_id = ?", [node_id]);
+		for (m in models) {
+			exec(DB,
+				"insert into node_models (node_id, alias, path, size_mb, "
+				+ "architecture, n_layers, n_heads, n_kv_heads, embedding_length, "
+				+ "claimed_context, general_name, source_url) "
+				+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				[node_id, m.alias, m.path, m.size_mb,
+				 m?.architecture, m?.n_layers, m?.n_heads, m?.n_kv_heads,
+				 m?.embedding_length, m?.claimed_context,
+				 m?.general_name, m?.source_url]);
+		}
+	}
+
 	return { status: 200, body: stringify({
 		node_id: node_id, registered_at: now, welcome: "joined the grid",
+		catalog_count: (models != null ? models.length : 0),
 	})};
 }
 
@@ -167,6 +208,56 @@ fn fetch_profile(profile_name: string) {
 	return null;
 }
 
+// Catalog-driven placement. Walks every node that advertises this alias,
+// computes VRAM cost from the catalog row's ingredients (no file read on
+// CP's side), picks the first GPU with enough free memory.
+//
+// Returns:
+//   { node_id, agent_url, gpu_index, est_mb, model_path }  -- a placement
+//   null                                                    -- alias not in
+//                                                              any node's
+//                                                              catalog OR no
+//                                                              GPU fits
+//
+// model_path comes back so the spawn proxy knows the agent-local path
+// without the caller needing to keep separate state.
+fn pick_placement_via_alias(alias: string, profile) {
+	let candidates = nodes_with_alias(alias);
+	if (candidates.length == 0) { return null; }
+
+	for (cand in candidates) {
+		// Only consider nodes that have heartbeated recently and exposed
+		// an agent_url. Stale nodes shouldn't drive placement decisions.
+		let nodes = query(DB,
+			"select agent_url, hardware_json from nodes "
+			+ "where node_id = ? "
+			+ "and agent_url is not null "
+			+ "and last_seen_at > datetime('now', ?)",
+			[cand.node_id, "-" + STALE_NODE_SECONDS + " seconds"]);
+		if (nodes.length == 0) { continue; }
+		let n = nodes[0];
+
+		let est = estimate_vram_from_ingredients(cand,
+			i32(profile.context), profile.kv_type);
+		let needed_mb = est.total_mb;
+
+		let hw = parse(n.hardware_json);
+		let gpus = hw?.gpus ?? [];
+		for (gpu in gpus) {
+			if (f64(gpu.free_mb) >= needed_mb) {
+				return {
+					node_id:    cand.node_id,
+					agent_url:  n.agent_url,
+					gpu_index:  gpu.index,
+					est_mb:     needed_mb,
+					model_path: cand.path,
+				};
+			}
+		}
+	}
+	return null;
+}
+
 // Returns one of:
 //   { node_id, agent_url, gpu_index, est_mb }   -- a placement
 //   { error: "...", status: 4xx|5xx }           -- a structured error
@@ -180,8 +271,10 @@ fn fetch_profile(profile_name: string) {
 // throws catchable, compiled binary doesn't), so a `try` around
 // read_metadata wouldn't actually catch the crash.
 //
-// Long-term fix: push model introspection to the agent (POST /inspect on
-// the agent), since the agent always has the file.
+// Long-term fix (mostly delivered by the catalog — see
+// pick_placement_via_alias above): push model introspection to the
+// agent. This path-based placement remains as the fallback for profiles
+// without a model_alias and for explicit operator-supplied paths.
 fn pick_placement(model_path: string, profile) {
 	if (!exists(model_path)) {
 		return { error: "CP cannot read model file at '" + model_path + "'. "
@@ -261,17 +354,24 @@ fn handle_spawn_proxy(req): object {
 	let payload = parse(req.body);
 	let profile_name = payload?.profile;
 	let model = payload?.model;
-	if (profile_name == null || model == null) {
-		return { status: 400, body: "{\"error\":\"profile+model required\"}" };
+	if (profile_name == null) {
+		return { status: 400, body: "{\"error\":\"profile required\"}" };
 	}
 
+	// Model can come from three places, in priority order:
+	//   1. Operator-supplied `model:` in the request (explicit override).
+	//   2. Catalog lookup via the profile's model_alias.
+	//   3. Profile's default_model (legacy escape hatch).
+	// We don't resolve here — pick_placement_via_alias does it inline so
+	// the same node that wins placement also reports the path. For the
+	// explicit model: case, we pass through to the path-based placement.
 	let node_id = payload?.node_id;
 	let gpus = payload?.gpus;
 	let port = payload?.port;
 
 	// If the operator didn't pin (node_id, gpus), do capacity-aware
-	// placement: read GGUF → estimate VRAM at profile.context → first-fit
-	// across registered nodes' free GPU memory.
+	// placement. Try alias-driven first (catalog → no FS access on CP);
+	// fall back to path-driven if no alias resolves.
 	if (node_id == null || gpus == null) {
 		let profile = fetch_profile(profile_name);
 		if (profile == null) {
@@ -279,9 +379,29 @@ fn handle_spawn_proxy(req): object {
 				error: "unknown profile (no agent advertises it): " + profile_name,
 			})};
 		}
-		let pick = pick_placement(model, profile);
-		if (pick?.error != null) {
-			return { status: pick.status, body: stringify({ error: pick.error }) };
+
+		let pick = null;
+		// Prefer explicit model: from the request, then alias, then default_model.
+		let resolved_model = model;
+		if (resolved_model == null && profile?.model_alias != null) {
+			pick = pick_placement_via_alias(profile.model_alias, profile);
+			if (pick != null) { resolved_model = pick.model_path; }
+		}
+		if (pick == null) {
+			if (resolved_model == null) { resolved_model = profile?.default_model; }
+			let rm = resolved_model;
+			if (rm == null) {
+				return { status: 400, body: stringify({
+					error: "no model resolved for " + profile_name
+						+ " (request had no model, profile has no model_alias "
+						+ "in catalog, and no default_model)",
+				})};
+			}
+			let path_pick = pick_placement(rm, profile);
+			if (path_pick?.error != null) {
+				return { status: path_pick.status, body: stringify({ error: path_pick.error }) };
+			}
+			pick = path_pick;
 		}
 		if (pick == null) {
 			return { status: 503, body: stringify({
@@ -291,7 +411,17 @@ fn handle_spawn_proxy(req): object {
 		}
 		node_id = pick.node_id;
 		gpus = [pick.gpu_index];
+		model = resolved_model;
 		if (port == null) { port = pick_port(pick.agent_url, profile.default_port); }
+	} else {
+		// Pinned (node_id + gpus). Operator must supply the model path —
+		// no point doing a catalog lookup since they've already chosen
+		// where to spawn it.
+		if (model == null) {
+			return { status: 400, body: stringify({
+				error: "model required when node_id+gpus are pinned",
+			})};
+		}
 	}
 
 	let agent_url = lookup_agent(node_id);
@@ -461,17 +591,33 @@ fn auto_spawn(profile_name: string) {
 			error: "no agent advertises profile: " + profile_name,
 		})}};
 	}
-	if (profile?.default_model == null) {
-		return { error: { status: 503, body: stringify({
-			error: "no running service for profile " + profile_name
-				+ " and no default_model declared on it (operator must POST /services first)",
-		})}};
-	}
 
-	let pick = pick_placement(profile.default_model, profile);
-	if (pick?.error != null) {
-		return { error: { status: pick.status,
-			body: stringify({ error: pick.error }) }};
+	// Same priority ladder as handle_spawn_proxy: alias-driven first,
+	// then default_model fallback. The /v1/llama/* path has no operator-
+	// supplied override; it's all profile-derived.
+	let pick = null;
+	let resolved_model = null;
+	if (profile?.model_alias != null) {
+		pick = pick_placement_via_alias(profile.model_alias, profile);
+		if (pick != null) { resolved_model = pick.model_path; }
+	}
+	if (pick == null) {
+		let dm = profile?.default_model;
+		if (dm == null) {
+			return { error: { status: 503, body: stringify({
+				error: "no running service for profile " + profile_name
+					+ " and no model resolvable (alias '"
+					+ (profile?.model_alias ?? "<none>")
+					+ "' not in any node's catalog and no default_model)",
+			})}};
+		}
+		resolved_model = dm;
+		let path_pick = pick_placement(dm, profile);
+		if (path_pick?.error != null) {
+			return { error: { status: path_pick.status,
+				body: stringify({ error: path_pick.error }) }};
+		}
+		pick = path_pick;
 	}
 	if (pick == null) {
 		return { error: { status: 503, body: stringify({
@@ -482,7 +628,7 @@ fn auto_spawn(profile_name: string) {
 	let port = pick_port(pick.agent_url, profile.default_port);
 	let agent_payload = {
 		profile: profile_name,
-		model:   profile.default_model,
+		model:   resolved_model,
 		port:    port,
 		gpus:    [pick.gpu_index],
 	};
@@ -660,6 +806,62 @@ fn handle_ui_capabilities(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
+// ── catalog ──────────────────────────────────────────────────────────
+// Aggregated GGUF catalog across every registered node. Each alias may
+// appear on multiple nodes; the operator (or placement) picks where to
+// run.
+
+// Look up nodes that have a given alias on disk. Used by placement to
+// resolve model_alias → (node, path). Returns rows with the placement
+// ingredients pre-extracted so we don't re-parse hardware_json per call.
+fn nodes_with_alias(alias: string): array {
+	let rows = query(DB,
+		"select node_id, path, size_mb, architecture, n_layers, n_heads, "
+		+ "n_kv_heads, embedding_length, claimed_context, source_url "
+		+ "from node_models where alias = ?", [alias]);
+	return rows;
+}
+
+// Aggregated catalog grouped by alias, for the dashboard + JSON endpoint.
+fn catalog_grouped(): array {
+	let rows = query(DB,
+		"select alias, node_id, path, size_mb, architecture, "
+		+ "claimed_context, general_name, source_url "
+		+ "from node_models order by alias asc, node_id asc", []);
+	let by_alias = {};
+	let order = [];
+	for (row in rows) {
+		if (!by_alias.has(row.alias)) {
+			by_alias[row.alias] = {
+				alias: row.alias,
+				size_mb: row.size_mb,
+				architecture: row.architecture,
+				claimed_context: row.claimed_context,
+				general_name: row.general_name,
+				source_url: row.source_url,
+				on_nodes: [],
+			};
+			order.push(row.alias);
+		}
+		by_alias[row.alias].on_nodes.push({
+			node_id: row.node_id,
+			path:    row.path,
+		});
+	}
+	let out = [];
+	for (a in order) { out.push(by_alias[a]); }
+	return out;
+}
+
+fn handle_list_catalog(req): object {
+	return { status: 200, body: stringify(catalog_grouped()) };
+}
+
+fn handle_ui_catalog(req): object {
+	return { status: 200, body: render_catalog(catalog_grouped()),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
 // JSON profiles endpoint — for the dashboard's Alpine-driven spawn form
 // (profile dropdown auto-fills the model field from the profile's
 // default_model). Same shape the agents return, but merged.
@@ -720,6 +922,8 @@ fn main(): null {
 		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles },
 		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities },
 		{ method: "GET",  path: "/profiles",        handler: handle_list_profiles },
+		{ method: "GET",  path: "/catalog",         handler: handle_list_catalog },
+		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,

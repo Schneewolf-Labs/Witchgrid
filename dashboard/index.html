@@ -32,8 +32,8 @@
           </select>
         </div>
         <div>
-          <label for="mdl">model path</label>
-          <input id="mdl" type="text" x-model="model" placeholder="/path/to/model.gguf" required>
+          <label for="mdl">model path <span class="meta">(optional — profile alias resolves via catalog if blank)</span></label>
+          <input id="mdl" type="text" x-model="model" placeholder="/path/to/model.gguf or leave blank for catalog">
         </div>
         <button type="submit" :disabled="busy" x-text="busy ? '…' : 'spawn'"></button>
         <details>
@@ -56,6 +56,12 @@
     <section>
       <h2>Services</h2>
       <div hx-get="/ui/services" hx-trigger="load, every 5s">loading…</div>
+    </section>
+
+    <section>
+      <h2>Catalog</h2>
+      <p class="meta" style="margin-left:0">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time.</p>
+      <div hx-get="/ui/catalog" hx-trigger="load, every 30s">loading…</div>
     </section>
 
     <section>
