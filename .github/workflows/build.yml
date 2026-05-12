@@ -7,10 +7,16 @@ on:
     branches: [main]
 
 # Witchgrid pins Hemlock by version because the runtime gets fixes that
-# matter to us (e.g. 2.2.1's HTTP POST body fix; without it, agent <-> CP
-# proxy calls send empty bodies). Bump this when we adopt a new feature.
+# matter to us. Each bump should note the load-bearing fix:
+#   2.2.1 — HTTP POST body fix; without it, agent ↔ CP proxy calls
+#           send empty bodies.
+#   2.2.3 — socket.bind/TcpStream now throw catchable exceptions in
+#           compiled binaries (#557, #559) — the agent's port_check
+#           probe relies on this. Plus @stdlib/fs.make_dirs (#562) for
+#           canonical-dir creation, and null-narrowing through ?. (#563)
+#           which the placement code uses.
 env:
-  HEMLOCK_VERSION: 2.2.1
+  HEMLOCK_VERSION: 2.2.3
 
 jobs:
   build:

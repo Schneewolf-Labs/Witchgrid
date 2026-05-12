@@ -48,7 +48,8 @@ import { exec_argv } from "@stdlib/process";
 import { post_json } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
 import { homedir } from "@stdlib/os";
-import { exists, make_dir } from "@stdlib/fs";
+import { exists, make_dirs } from "@stdlib/fs";
+import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
 import { probe } from "./hardware";
@@ -151,31 +152,27 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 	return null;
 }
 
-// Probe whether a TCP port is currently bindable on this host. Shells
-// out to `ss -tln 'sport = :N'` and checks for a LISTEN line — if any
-// process has the port open, the output has > 1 line (header + match).
-//
-// Why not socket.bind() directly: Hemlock's compiled binaries currently
-// runtime-crash on EADDRINUSE rather than throwing a catchable
-// exception (interpreter throws fine; same parity gap that bites
-// file_stat — see cp/cp.hml's pick_placement comment). Same with
-// TcpStream's connect-refused. `ss` is universally available on Linux,
-// fast (~5ms), and gives us OS truth without the language quirk.
+// Probe whether a TCP port is currently bindable on this host. Tries a
+// fresh bind to 0.0.0.0:port — that's the exact condition llama-server
+// faces — and reports the answer. Hemlock 2.2.3 made this catchable in
+// compiled binaries (#559), so we no longer need to shell out to `ss`.
 fn port_is_free(port: i32): bool {
-	let r = null;
+	let s = null;
 	try {
-		r = exec_argv(["ss", "-tln", "sport = :" + port]);
+		s = socket_create(AF_INET, SOCK_STREAM, 0);
 	} catch (e) {
-		// `ss` not on PATH (rare on modern Linux). Optimistic — let the
-		// spawn try and surface any real bind error.
+		// FD exhaustion or worse. Optimistic — let the spawn try and
+		// surface the real error.
 		return true;
 	}
-	if (r.exit_code != 0) { return true; }
-	// `ss` always prints a one-line header; lines beyond that = matches.
-	let lines = r.output.split("\n");
-	let count = 0;
-	for (line in lines) { if (line.trim().length > 0) { count = count + 1; } }
-	return count <= 1;
+	let free = true;
+	try {
+		s.bind("0.0.0.0", port);
+	} catch (e) {
+		free = false;
+	}
+	try { s.close(); } catch (e) { }
+	return free;
 }
 
 // Default canonical dir is ~/.witchgrid/models. Created if missing so
@@ -190,19 +187,7 @@ fn default_canonical_dir(): string {
 
 fn ensure_canonical_dir(path: string): null {
 	if (exists(path)) { return null; }
-	try {
-		// Walk up creating each missing component. Hemlock's make_dir
-		// doesn't recurse; one level at a time.
-		let parts = path.split("/");
-		let cur = "";
-		for (p in parts) {
-			if (p.length == 0) { cur = ""; continue; }
-			cur = cur + "/" + p;
-			if (!exists(cur)) {
-				try { make_dir(cur); } catch (e) { }
-			}
-		}
-	} catch (e) {
+	try { make_dirs(path); } catch (e) {
 		eprint("[agent] could not create canonical dir " + path + ": " + e);
 	}
 	return null;

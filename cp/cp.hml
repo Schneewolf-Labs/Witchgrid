@@ -572,15 +572,14 @@ fn handle_spawn_proxy(req): object {
 		}
 		if (pick == null) {
 			if (resolved_model == null) { resolved_model = profile?.default_model; }
-			let rm = resolved_model;
-			if (rm == null) {
+			if (resolved_model == null) {
 				return { status: 400, body: stringify({
 					error: "no model resolved for " + profile_name
 						+ " (request had no model, profile has no model_alias "
 						+ "in catalog, and no default_model)",
 				})};
 			}
-			let path_pick = pick_placement(rm, profile);
+			let path_pick = pick_placement(resolved_model, profile);
 			if (path_pick?.error != null) {
 				return { status: path_pick.status, body: stringify({ error: path_pick.error }) };
 			}
@@ -787,8 +786,7 @@ fn auto_spawn(profile_name: string) {
 		if (pick != null) { resolved_model = pick.model_path; }
 	}
 	if (pick == null) {
-		let dm = profile?.default_model;
-		if (dm == null) {
+		if (profile?.default_model == null) {
 			return { error: { status: 503, body: stringify({
 				error: "no running service for profile " + profile_name
 					+ " and no model resolvable (alias '"
@@ -796,8 +794,8 @@ fn auto_spawn(profile_name: string) {
 					+ "' not in any node's catalog and no default_model)",
 			})}};
 		}
-		resolved_model = dm;
-		let path_pick = pick_placement(dm, profile);
+		resolved_model = profile.default_model;
+		let path_pick = pick_placement(profile.default_model, profile);
 		if (path_pick?.error != null) {
 			return { error: { status: path_pick.status,
 				body: stringify({ error: path_pick.error }) }};
