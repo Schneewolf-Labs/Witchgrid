@@ -1,0 +1,24 @@
+// run.hml — entry point for the Witchgrid test suite.
+//
+// Each *_test.hml file exports a register() function that calls
+// describe()/test() to register its suites with @stdlib/testing's
+// global registry. We import + invoke them all here, then run().
+// (Hemlock has no "import for side effect only" form, so the
+// register() indirection is what makes test files discoverable.)
+//
+// Run with:    hemlock tests/run.hml
+// CI uses:     hemlock tests/run.hml   (exits non-zero if any test failed)
+
+import { register as register_intent }       from "./intent_test";
+import { register as register_capabilities } from "./capabilities_test";
+
+import { run } from "@stdlib/testing";
+import { exit } from "@stdlib/env";
+
+register_intent();
+register_capabilities();
+
+let result = run();
+if (!result.success) {
+	exit(1);
+}

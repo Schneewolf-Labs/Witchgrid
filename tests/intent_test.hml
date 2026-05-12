@@ -1,0 +1,171 @@
+// intent_test.hml — coverage for agent/intent.hml
+//
+// The intent translator is the trickiest pure-function layer in the
+// codebase: small input, behavior gated on multiple intersecting axes
+// (intent kind × capability shape × value type). It's also the layer
+// most likely to silently regress when llama.cpp's --help output drifts.
+// Hence the unusually thick test surface for ~150 lines of code under
+// test.
+
+import { describe, test, assert_eq, assert_throws } from "@stdlib/testing";
+import { render_argv, explain } from "../agent/intent";
+
+// Synthetic capability map mirroring what capabilities.hml emits for a
+// modern (post-enum-fa) llama-server build. Kept inline rather than
+// loaded from a fixture so the test names + the cap shape sit in one
+// view — the binding between intent name and flag is the unit under
+// test, not the parser.
+fn modern_caps(): object {
+	return {
+		"ctx-size":     { short: "-c",   longs: ["--ctx-size"],                    value: "N",            description: "" },
+		"cache-type-k": { short: "-ctk", longs: ["--cache-type-k"],                value: "TYPE",         description: "" },
+		"cache-type-v": { short: "-ctv", longs: ["--cache-type-v"],                value: "TYPE",         description: "" },
+		"parallel":     { short: "-np",  longs: ["--parallel"],                    value: "N",            description: "" },
+		"gpu-layers":   { short: "-ngl", longs: ["--gpu-layers", "--n-gpu-layers"], value: "N",            description: "" },
+		"flash-attn":   { short: "-fa",  longs: ["--flash-attn"],                  value: "[on|off|auto]", description: "" },
+		"host":         { short: null,    longs: ["--host"],                        value: "HOST",         description: "" },
+		"port":         { short: null,    longs: ["--port"],                        value: "PORT",         description: "" },
+	};
+}
+
+// Older llama-server: -fa is a bare boolean (no value placeholder).
+// Used to verify the boolean_or_enum branch picks the legacy form.
+fn legacy_caps(): object {
+	let c = modern_caps();
+	c["flash-attn"] = { short: "-fa", longs: ["--flash-attn"], value: null, description: "" };
+	return c;
+}
+
+// A capability map missing flash-attn entirely — simulates a build that
+// dropped the flag. Profiles asking for it should fail loud.
+fn caps_without_flash(): object {
+	let c = modern_caps();
+	c.delete("flash-attn");
+	return c;
+}
+
+// A long-only flag (no short alias). Verifies canonical_flag falls back
+// to the first long correctly.
+fn caps_long_only(): object {
+	return {
+		"ctx-size": { short: null, longs: ["--ctx-size", "--context"], value: "N", description: "" },
+	};
+}
+
+// Wrap describe() calls in an exported register() so the test runner
+// (tests/run.hml) can pull them in by importing this name. Hemlock has
+// no "import for side effect only" form — each test file must expose
+// at least one binding.
+export fn register(): null {
+	describe("intent.render_argv (value kind)", fn() {
+		test("emits short form when capability has both short and long", fn() {
+			let argv = render_argv({ context: 131072 }, [], modern_caps());
+			assert_eq(argv, ["-c", "131072"]);
+		});
+
+		test("falls back to first long when no short exists", fn() {
+			let argv = render_argv({ context: 4096 }, [], caps_long_only());
+			assert_eq(argv, ["--ctx-size", "4096"]);
+		});
+
+		test("stringifies non-string values verbatim", fn() {
+			let argv = render_argv({ kv_cache_k: "q4_0" }, [], modern_caps());
+			assert_eq(argv, ["-ctk", "q4_0"]);
+		});
+
+		test("preserves intent insertion order in argv", fn() {
+			let argv = render_argv({
+				context: 131072,
+				kv_cache_k: "q4_0",
+				parallel_slots: 1,
+				gpu_layers: 99,
+			}, [], modern_caps());
+			assert_eq(argv, ["-c", "131072", "-ctk", "q4_0", "-np", "1", "-ngl", "99"]);
+		});
+	});
+
+	describe("intent.render_argv (boolean_or_enum kind, modern enum form)", fn() {
+		test("true renders as 'on'", fn() {
+			let argv = render_argv({ flash_attention: true }, [], modern_caps());
+			assert_eq(argv, ["-fa", "on"]);
+		});
+
+		test("false renders as 'off'", fn() {
+			let argv = render_argv({ flash_attention: false }, [], modern_caps());
+			assert_eq(argv, ["-fa", "off"]);
+		});
+
+		test("explicit string ('auto') passes through verbatim", fn() {
+			let argv = render_argv({ flash_attention: "auto" }, [], modern_caps());
+			assert_eq(argv, ["-fa", "auto"]);
+		});
+	});
+
+	describe("intent.render_argv (boolean_or_enum kind, legacy boolean form)", fn() {
+		test("true emits the flag alone", fn() {
+			let argv = render_argv({ flash_attention: true }, [], legacy_caps());
+			assert_eq(argv, ["-fa"]);
+		});
+
+		test("false omits the flag entirely", fn() {
+			let argv = render_argv({ flash_attention: false }, [], legacy_caps());
+			assert_eq(argv, []);
+		});
+
+		test("string value ('auto') against legacy boolean → throws", fn() {
+			// Operator asked for a value the binary can't accept; this should
+			// surface clearly rather than silently emit garbage argv.
+			assert_throws(fn() {
+				render_argv({ flash_attention: "auto" }, [], legacy_caps());
+			});
+		});
+	});
+
+	describe("intent.render_argv (extra_flags + error paths)", fn() {
+		test("extra_flags appended verbatim after intent-derived argv", fn() {
+			let argv = render_argv({ context: 4096 }, ["--no-mmap", "--log-disable"], modern_caps());
+			assert_eq(argv, ["-c", "4096", "--no-mmap", "--log-disable"]);
+		});
+
+		test("null extra_flags treated as empty", fn() {
+			let argv = render_argv({ context: 4096 }, null, modern_caps());
+			assert_eq(argv, ["-c", "4096"]);
+		});
+
+		test("unknown intent name throws (operator typo / out-of-vocab)", fn() {
+			assert_throws(fn() {
+				render_argv({ flssh_attention: true }, [], modern_caps());
+			});
+		});
+
+		test("intent against binary that lacks the flag throws actionably", fn() {
+			assert_throws(fn() {
+				render_argv({ flash_attention: true }, [], caps_without_flash());
+			});
+		});
+	});
+
+	describe("intent.explain", fn() {
+		test("returns a human-readable line per intent", fn() {
+			let out = explain({ context: 131072, flash_attention: true }, modern_caps());
+			// Format isn't a contract — assert on substrings that should be
+			// stable across cosmetic output tweaks.
+			assert_eq(out.find("context = 131072") >= 0, true);
+			assert_eq(out.find("-c 131072") >= 0, true);
+			assert_eq(out.find("flash_attention = true") >= 0, true);
+			assert_eq(out.find("-fa on") >= 0, true);
+		});
+
+		test("captures errors per-line instead of aborting the rest", fn() {
+			// One bad intent shouldn't hide the others — explain should
+			// annotate the failure inline so the operator sees the full set.
+			let out = explain({
+				context: 4096,
+				flash_attention: true,
+			}, caps_without_flash());
+			assert_eq(out.find("context = 4096") >= 0, true);
+			assert_eq(out.find("ERROR") >= 0, true);
+		});
+	});
+	return null;
+}

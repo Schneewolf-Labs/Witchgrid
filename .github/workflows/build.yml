@@ -73,6 +73,13 @@ jobs:
           file witchgrid-inspect
           ls -la witchgrid-inspect
 
+      - name: Unit tests
+        # Pure-function coverage for intent translator + capabilities
+        # parser. Runs the same `hemlock tests/run.hml` an operator runs
+        # locally; exits non-zero if any test fails. See tests/README.md
+        # for the test layout.
+        run: hemlock tests/run.hml
+
       - name: Smoke test — CP starts and answers /healthz
         run: |
           ./cp/witchgrid-cp > /tmp/cp.log 2>&1 &

@@ -1,0 +1,17 @@
+build: 4321 (legacy0001) with cc for x86_64-linux-gnu
+
+usage: ./llama-server [options]
+
+options:
+  -h, --help                            print this help and exit
+  -v, --verbose                         verbose output
+  -c, --ctx-size N                      size of the prompt context (default: 512)
+  -b, --batch-size N                    batch size for prompt processing (default: 512)
+  -fa, --flash-attn                     enable Flash Attention
+  -ctk, --cache-type-k TYPE             KV cache data type for K (default: f16)
+  -ctv, --cache-type-v TYPE             KV cache data type for V (default: f16)
+  -ngl, --n-gpu-layers N                number of layers to store in VRAM
+  -np, --parallel N                     number of parallel sequences (default: 1)
+  --host HOST                           ip address to listen (default: 127.0.0.1)
+  --port PORT                           port to listen (default: 8080)
+  -m, --model FNAME                     model path (default: models/7B/ggml-model-f16.gguf)

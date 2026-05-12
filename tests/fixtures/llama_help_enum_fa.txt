@@ -1,0 +1,24 @@
+load_backend: loaded CUDA backend from /usr/lib/llama-server/libggml-cuda.so
+build: 6543 (abcd1234) with cc (Ubuntu 13.2.0-23ubuntu4) for x86_64-linux-gnu
+
+----- common params -----
+
+-h,    --help, --usage                  print usage and exit
+       --version                        show version and build info
+-v,    --verbose                        set verbosity level to infinity (i.e. log all messages, useful for debugging)
+-c,    --ctx-size N                     size of the prompt context (default: 4096, 0 = loaded from model)
+                                        (env: LLAMA_ARG_CTX_SIZE)
+-n,    --predict, --n-predict N         number of tokens to predict (default: -1, -1 = infinity)
+-b,    --batch-size N                   logical maximum batch size (default: 2048)
+       --cpu-strict <0|1>               use strict CPU placement (default: 0)
+-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', 'auto', default: 'auto')
+                                        (env: LLAMA_ARG_FLASH_ATTN)
+-ctk,  --cache-type-k TYPE              KV cache data type for K
+                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1
+                                        (default: f16)
+-ctv,  --cache-type-v TYPE              KV cache data type for V (default: f16)
+-ngl,  --gpu-layers, --n-gpu-layers N   number of layers to store in VRAM
+-np,   --parallel N                     number of parallel sequences to decode (default: 1)
+       --host HOST                      ip address to listen, or bind to an UNIX socket if relative (default: 127.0.0.1)
+       --port PORT                      port to listen (default: 8080)
+-m,    --model FNAME                    model path (default: `models/7B/ggml-model-f16.gguf`)

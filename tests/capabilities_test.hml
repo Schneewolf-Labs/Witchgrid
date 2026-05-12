@@ -1,0 +1,101 @@
+// capabilities_test.hml — coverage for agent/capabilities.hml
+//
+// The parser turns whatever shape `llama-server --help` happens to print
+// into a normalized flag map. Two fixtures pin the two shapes we know
+// about: the modern enum-`-fa` build and an older boolean-`-fa` build.
+// New shapes get added as new fixtures + assertions, not by editing
+// existing ones.
+
+import { describe, test, assert_eq, assert_true } from "@stdlib/testing";
+import { read_file } from "@stdlib/fs";
+import { parse_help } from "../agent/capabilities";
+
+fn load_fixture(name: string): string {
+	// Tests are run from the repo root (hemlock tests/run.hml). Paths are
+	// relative to that CWD.
+	return read_file("tests/fixtures/" + name);
+}
+
+export fn register(): null {
+	describe("capabilities.parse_help (modern enum-fa fixture)", fn() {
+		test("indexes flags by their primary long name (no -- prefix)", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_true(caps.has("ctx-size"));
+			assert_true(caps.has("flash-attn"));
+			assert_true(caps.has("cache-type-k"));
+			assert_true(caps.has("port"));
+		});
+
+		test("captures short alias when present", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_eq(caps["ctx-size"].short,     "-c");
+			assert_eq(caps["flash-attn"].short,   "-fa");
+			assert_eq(caps["cache-type-k"].short, "-ctk");
+			assert_eq(caps["gpu-layers"].short,   "-ngl");
+		});
+
+		test("leaves short=null for long-only flags", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_eq(caps["host"].short, null);
+			assert_eq(caps["port"].short, null);
+			assert_eq(caps["version"].short, null);
+		});
+
+		test("collects multiple long aliases in order", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			// -h, --help, --usage  →  longs = ["--help", "--usage"]
+			assert_eq(caps["help"].longs, ["--help", "--usage"]);
+			// -ngl, --gpu-layers, --n-gpu-layers
+			assert_eq(caps["gpu-layers"].longs, ["--gpu-layers", "--n-gpu-layers"]);
+		});
+
+		test("captures the value-shape placeholder for value-taking flags", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_eq(caps["ctx-size"].value,     "N");
+			assert_eq(caps["flash-attn"].value,   "[on|off|auto]");
+			assert_eq(caps["cpu-strict"].value,   "<0|1>");
+			assert_eq(caps["cache-type-k"].value, "TYPE");
+			assert_eq(caps["host"].value,         "HOST");
+		});
+
+		test("leaves value=null for boolean flags", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_eq(caps["help"].value,    null);
+			assert_eq(caps["verbose"].value, null);
+			assert_eq(caps["version"].value, null);
+		});
+
+		test("description starts at the first non-flag, non-value-shape token", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			assert_eq(caps["flash-attn"].description.find("Flash Attention") >= 0, true);
+			assert_eq(caps["ctx-size"].description.find("size of the prompt context") >= 0, true);
+		});
+
+		test("ignores section dividers and continuation lines", fn() {
+			let caps = parse_help(load_fixture("llama_help_enum_fa.txt"));
+			// '----- common params -----' and indented '(env: ...)' lines
+			// should not contribute spurious entries.
+			assert_true(!caps.has("common"));
+			assert_true(!caps.has("env"));
+			assert_true(!caps.has("LLAMA_ARG_CTX_SIZE"));
+		});
+	});
+
+	describe("capabilities.parse_help (legacy boolean-fa fixture)", fn() {
+		test("flash-attn parses as a value-less boolean here", fn() {
+			// This is the exact regression we built the intent translator
+			// around: same flag name, no value placeholder, all the way
+			// through to render_argv emitting `[-fa]` instead of `[-fa, on]`.
+			let caps = parse_help(load_fixture("llama_help_legacy_fa.txt"));
+			assert_eq(caps["flash-attn"].short, "-fa");
+			assert_eq(caps["flash-attn"].value, null);
+		});
+
+		test("value-taking flags still parse the value placeholder", fn() {
+			let caps = parse_help(load_fixture("llama_help_legacy_fa.txt"));
+			assert_eq(caps["ctx-size"].value, "N");
+			assert_eq(caps["cache-type-k"].value, "TYPE");
+		});
+	});
+	return null;
+}
