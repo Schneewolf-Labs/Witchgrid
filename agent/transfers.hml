@@ -104,19 +104,6 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 	return null;
 }
 
-// Strip scheme + path, return "host:port" or "host" from a URL like
-// http://192.168.8.154:8766/models/foo/blob → 192.168.8.154
-fn url_host(url: string): string {
-	let rest = url;
-	let scheme = rest.find("://");
-	if (scheme >= 0) { rest = rest.substr(scheme + 3, rest.length - scheme - 3); }
-	let slash = rest.find("/");
-	if (slash >= 0) { rest = rest.substr(0, slash); }
-	let colon = rest.find(":");
-	if (colon >= 0) { rest = rest.substr(0, colon); }
-	return rest;
-}
-
 // HTTP handler: POST /models/pull
 //
 // Body: { alias, source: { kind: "peer", url } }
@@ -126,13 +113,10 @@ fn url_host(url: string): string {
 // agent's catalog picks up the new file without waiting for the next
 // operator-triggered rescan.
 //
-// own_host: the host portion of WITCHGRID_AGENT_URL — used to refuse
-// pulls whose source resolves to ourselves. Self-pulls in the current
-// single-threaded server time out (the get_binary blocks the same
-// libwebsockets state that has to serve the /models/{alias}/blob)
-// rather than producing useful work; honest 400 beats silent 60s
-// timeout. Multithreading the http_server (v0.4) removes this
-// limitation.
+// (As of v0.4 the http_server is multi-threaded, so self-pulls work
+// — agent serves its own /models/{alias}/blob on one worker thread
+// while another runs the pull task. The own_host parameter is kept
+// for the API contract but the refuser logic is gone.)
 export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: string): object {
 	return fn(req): object {
 		let payload = null;
@@ -153,17 +137,6 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: s
 			let url = source?.url;
 			if (url == null) {
 				return { status: 400, body: "{\"error\":\"source.url required for kind=peer\"}" };
-			}
-			let src_host = url_host(url);
-			if (src_host == "127.0.0.1" || src_host == "localhost"
-			    || src_host == own_host) {
-				return { status: 400, body: stringify({
-					error: "refusing self-pull (source host '" + src_host
-						+ "' is this agent). Single-threaded http_server can't "
-						+ "serve its own pull request without timing out — "
-						+ "operator should pull from a different agent or use "
-						+ "kind=huggingface. Multithreading lifts this in v0.4.",
-				})};
 			}
 			let now = iso_now(db);
 			db_exec(db,

@@ -144,20 +144,37 @@ export fn dispatch(req, routes): object {
 	return { status: 404, body: "{\"error\":\"not found\"}" };
 }
 
+// Per-accept worker. Parses, dispatches, writes, closes — all on its
+// own thread so a slow handler doesn't freeze the accept loop. CP
+// does heavy fan-outs (every /ui/services aggregates from every
+// agent's /services), and one slow agent used to mean every dashboard
+// poll waited on it. With per-accept spawn, dashboard polls overlap.
+//
+// Concurrency safety relies on:
+//   - sqlite (libsqlite3 is thread-safe at the connection level when
+//     compiled with default mutex mode, which @stdlib/sqlite uses)
+//   - libwebsockets HTTP client per-call (fresh handle per request,
+//     no shared state)
+async fn handle_connection(stream, routes): null {
+	try {
+		let req = parse_request(stream);
+		let resp = dispatch(req, routes);
+		write_response(stream, resp);
+	} catch (e) {
+		eprint("[server] " + e);
+	}
+	try { stream.close(); } catch (e) { }
+	return null;
+}
+
 // Serve forever on host:port. routes is array of { method, path, handler }.
 export fn serve(host: string, port: i32, routes): null {
 	let listener = TcpListener(host, port);
 	print("[http] listening on " + host + ":" + port);
 	loop {
 		let stream = listener.accept();
-		try {
-			let req = parse_request(stream);
-			let resp = dispatch(req, routes);
-			write_response(stream, resp);
-		} catch (e) {
-			eprint("[server] " + e);
-		}
-		stream.close();
+		let t = spawn(handle_connection, stream, routes);
+		detach(t);
 	}
 	return null;
 }
