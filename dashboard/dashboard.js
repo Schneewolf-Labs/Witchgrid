@@ -245,6 +245,56 @@ function profileEditor() {
   };
 }
 
+// ── node editor (Overview page) ──────────────────────────────────
+//
+// Opens via editNode(node_id, current_state) called from the per-row
+// "options" button. Saves via PATCH /api/nodes/{node_id}.
+
+function nodeEditor() {
+  return {
+    open: false,
+    node_id: '',
+    state: 'active',
+    error: '',
+    busy: false,
+    init() {
+      window.addEventListener('witchgrid:edit-node', (e) => {
+        this.node_id = e.detail.node_id;
+        this.state = e.detail.state || 'active';
+        this.error = '';
+        this.open = true;
+      });
+    },
+    cancel() { this.open = false; },
+    async save() {
+      this.busy = true; this.error = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ state: this.state }),
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.error = d.error || ('HTTP ' + r.status);
+          this.busy = false;
+          return;
+        }
+        this.open = false;
+      } catch (e) {
+        this.error = 'save failed: ' + e;
+      }
+      this.busy = false;
+    },
+  };
+}
+
+function editNode(node_id, state) {
+  window.dispatchEvent(new CustomEvent('witchgrid:edit-node', {
+    detail: { node_id, state },
+  }));
+}
+
 async function deleteProfile(name) {
   if (!confirm('Delete profile "' + name + '"?')) return;
   const r = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });

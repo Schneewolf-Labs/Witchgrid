@@ -235,3 +235,59 @@ export fn introspect(binary: string): object {
 	}
 	return parse_help(combined);
 }
+
+// Parse `<binary> --version` output. Both formats we've seen end with
+// the same two lines:
+//
+//   version: 8635 (e15efe007)
+//   built with GNU 11.4.0 for Linux x86_64
+//
+// CUDA / Metal preludes a bunch of init noise; we just scan all lines
+// for the two patterns we care about.
+//
+// Returns: { version: "8635", build_hash: "e15efe007", built: "GNU 11.4.0 for Linux x86_64", path: <which-output> }
+//          or null if the binary didn't produce a recognizable version line
+//          (or doesn't exist at all).
+export fn probe_version(binary: string) {
+	let r = null;
+	try {
+		r = exec_argv([binary, "--version"]);
+	} catch (e) {
+		return null;
+	}
+	let combined = r.output;
+	if (r?.stderr != null && r.stderr.length > 0) {
+		combined = combined + "\n" + r.stderr;
+	}
+	let version = null;
+	let build_hash = null;
+	let built = null;
+	let lines = combined.split("\n");
+	for (line in lines) {
+		let l = line.trim();
+		if (l.starts_with("version:")) {
+			// "version: 8635 (e15efe007)"
+			let rest = l.substr(8, l.length - 8).trim();
+			let paren = rest.find("(");
+			if (paren > 0) {
+				version = rest.substr(0, paren).trim();
+				let hash_start = paren + 1;
+				let close = rest.find(")");
+				if (close > hash_start) {
+					build_hash = rest.substr(hash_start, close - hash_start);
+				}
+			} else {
+				version = rest;
+			}
+		} else if (l.starts_with("built with")) {
+			built = l.substr(11, l.length - 11).trim();
+		}
+	}
+	if (version == null) { return null; }
+	return {
+		binary:     binary,
+		version:    version,
+		build_hash: build_hash,
+		built:      built,
+	};
+}

@@ -83,9 +83,43 @@ export let INDEX_HTML = "<!doctype html>
       </form>
     </section>
 
-    <section>
+    <section x-data=\"nodeEditor()\">
       <h2>Nodes</h2>
       <div hx-get=\"/ui/nodes\" hx-trigger=\"load, every 5s\">loading…</div>
+
+      <!-- ── Node editor modal ─────────────────────────────────── -->
+      <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"cancel()\" style=\"display:none\">
+        <div class=\"modal-card\" @click.stop style=\"max-width:480px\">
+          <h3 style=\"margin:0 0 0.75rem 0\">edit <span x-text=\"node_id\"></span></h3>
+          <div class=\"form-grid\">
+            <div class=\"full\">
+              <label>state</label>
+              <div style=\"display:grid; gap:0.4rem; margin-top:0.25rem\">
+                <label class=\"state-radio\">
+                  <input type=\"radio\" x-model=\"state\" value=\"active\">
+                  <strong>active</strong>
+                  <span class=\"meta\">accept new spawns</span>
+                </label>
+                <label class=\"state-radio\">
+                  <input type=\"radio\" x-model=\"state\" value=\"draining\">
+                  <strong>draining</strong>
+                  <span class=\"meta\">no new spawns; existing services keep running</span>
+                </label>
+                <label class=\"state-radio\">
+                  <input type=\"radio\" x-model=\"state\" value=\"disabled\">
+                  <strong>disabled</strong>
+                  <span class=\"meta\">fully out of placement; node still visible for inspection</span>
+                </label>
+              </div>
+            </div>
+          </div>
+          <p class=\"msg err\" x-show=\"error\" x-text=\"error\" style=\"margin-top:0.75rem\"></p>
+          <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem\">
+            <button type=\"button\" class=\"row-action\" @click=\"cancel()\" :disabled=\"busy\">cancel</button>
+            <button type=\"button\" @click=\"save()\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save'\"></button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section>
@@ -755,6 +789,29 @@ tr.hw-detail details summary:hover { color: var(--accent); }
   color: var(--fg-2);
   border-color: var(--border);
 }
+.badge-state-active   { background: var(--ok-soft);   color: var(--ok);   border-color: var(--ok-soft); }
+.badge-state-draining { background: var(--warn-soft); color: var(--warn); border-color: var(--warn-soft); }
+.badge-state-disabled { background: var(--bg-3);      color: var(--fg-dim); border-color: var(--border); }
+
+/* Node editor state-radio rows */
+.state-radio {
+  display: grid;
+  grid-template-columns: 24px auto 1fr;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  margin: 0;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.state-radio:hover { border-color: var(--accent); background: var(--bg-3); }
+.state-radio input { margin: 0; }
+.state-radio strong { color: var(--fg-1); font-weight: 500; }
+.state-radio .meta { font-size: 0.78rem; }
 
 /* Catalog \"copy to\" + missing-model \"pull from HF\" inline pickers */
 .distribute-row { display: flex; gap: 0.4rem; align-items: center; }
@@ -1161,6 +1218,56 @@ function profileEditor() {
       }
     },
   };
+}
+
+// ── node editor (Overview page) ──────────────────────────────────
+//
+// Opens via editNode(node_id, current_state) called from the per-row
+// \"options\" button. Saves via PATCH /api/nodes/{node_id}.
+
+function nodeEditor() {
+  return {
+    open: false,
+    node_id: '',
+    state: 'active',
+    error: '',
+    busy: false,
+    init() {
+      window.addEventListener('witchgrid:edit-node', (e) => {
+        this.node_id = e.detail.node_id;
+        this.state = e.detail.state || 'active';
+        this.error = '';
+        this.open = true;
+      });
+    },
+    cancel() { this.open = false; },
+    async save() {
+      this.busy = true; this.error = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ state: this.state }),
+        });
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.error = d.error || ('HTTP ' + r.status);
+          this.busy = false;
+          return;
+        }
+        this.open = false;
+      } catch (e) {
+        this.error = 'save failed: ' + e;
+      }
+      this.busy = false;
+    },
+  };
+}
+
+function editNode(node_id, state) {
+  window.dispatchEvent(new CustomEvent('witchgrid:edit-node', {
+    detail: { node_id, state },
+  }));
 }
 
 async function deleteProfile(name) {

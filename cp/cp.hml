@@ -54,8 +54,14 @@ fn init_db(db): null {
 		+ "hardware_json text not null,"
 		+ "agent_url text,"
 		+ "registered_at text not null,"
-		+ "last_seen_at text not null"
+		+ "last_seen_at text not null,"
+		+ "state text not null default 'active',"  // active | disabled | draining
+		+ "runtime_json text"                       // {llama_server: {...}}
 		+ ")", []);
+	// Migrations for DBs that predate v0.7 columns (state, runtime_json).
+	// SQLite errors if the column exists; wrap in try to make idempotent.
+	try { exec(db, "alter table nodes add column state text not null default 'active'", []); } catch (e) { }
+	try { exec(db, "alter table nodes add column runtime_json text", []); } catch (e) { }
 	// Per-node GGUF catalog. Replaced wholesale on each /register so we
 	// don't accumulate stale entries when an operator deletes a model
 	// from disk. Indexed on alias for the placement-time "which nodes
@@ -210,17 +216,24 @@ fn handle_register(req): object {
 	}
 
 	let hw_json = stringify(payload?.hardware ?? {});
+	let runtime_json = null;
+	if (payload?.runtime != null) { runtime_json = stringify(payload.runtime); }
 	let agent_url = payload?.agent_url;
 	let now = iso_now();
 
+	// Note: we deliberately do NOT touch `state` on update — that's
+	// operator-owned (set via PATCH /api/nodes/{id}). A heartbeat
+	// shouldn't undo a manual disable. Insert path defaults to 'active'
+	// via the column default.
 	exec(DB,
-		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at) "
-		+ "values (?, ?, ?, ?, ?, ?, ?) "
+		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?) "
 		+ "on conflict(node_id) do update set "
 		+ "hostname=excluded.hostname, role=excluded.role, "
 		+ "hardware_json=excluded.hardware_json, agent_url=excluded.agent_url, "
-		+ "last_seen_at=excluded.last_seen_at",
-		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now]
+		+ "last_seen_at=excluded.last_seen_at, "
+		+ "runtime_json=excluded.runtime_json",
+		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json]
 	);
 
 	// Catalog ingest. Replace-all-for-this-node so deleted models drop
@@ -279,9 +292,14 @@ fn handle_register(req): object {
 fn handle_list_nodes(req): object {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
-		+ "registered_at, last_seen_at from nodes order by registered_at desc", []);
+		+ "registered_at, last_seen_at, state, runtime_json "
+		+ "from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
+		let runtime = null;
+		if (row?.runtime_json != null) {
+			try { runtime = parse(row.runtime_json); } catch (e) { }
+		}
 		out.push({
 			node_id: row.node_id,
 			hostname: row.hostname,
@@ -290,9 +308,48 @@ fn handle_list_nodes(req): object {
 			agent_url: row.agent_url,
 			registered_at: row.registered_at,
 			last_seen_at: row.last_seen_at,
+			state: row?.state ?? "active",
+			runtime: runtime,
 		});
 	}
 	return { status: 200, body: stringify(out) };
+}
+
+// PATCH /api/nodes/{node_id}  body: {state: "active"|"disabled"|"draining"}
+//
+// State semantics:
+//   active    — placement targets this node normally
+//   disabled  — placement skips entirely; existing services keep running
+//               but operator should stop them; node still appears in
+//               dashboard (with disabled badge) so operator can re-enable
+//   draining  — placement skips for new spawns; existing services keep
+//               running so in-flight requests finish; meant to be used
+//               briefly before disable + restart for upgrades
+//
+// Disabled / draining nodes still serve catalog blobs + accept stop
+// commands. The state only gates NEW spawn placement.
+fn handle_patch_node(req): object {
+	let prefix = "/api/nodes/";
+	let node_id = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (node_id.length == 0) {
+		return { status: 400, body: "{\"error\":\"node_id required\"}" };
+	}
+	let payload = null;
+	try { payload = parse(req.body); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	let state = payload?.state;
+	if (state != "active" && state != "disabled" && state != "draining") {
+		return { status: 400, body: stringify({
+			error: "state must be one of: active, disabled, draining",
+		})};
+	}
+	let existing = query(DB, "select node_id from nodes where node_id = ?", [node_id]);
+	if (existing.length == 0) {
+		return { status: 404, body: stringify({ error: "no such node: " + node_id }) };
+	}
+	exec(DB, "update nodes set state = ? where node_id = ?", [state, node_id]);
+	return { status: 200, body: stringify({ node_id: node_id, state: state }) };
 }
 
 fn handle_health(req): object {
@@ -457,10 +514,13 @@ fn pick_placement_via_alias(alias: string, profile) {
 	for (cand in candidates) {
 		// Only consider nodes that have heartbeated recently and exposed
 		// an agent_url. Stale nodes shouldn't drive placement decisions.
+		// Disabled / draining nodes also drop out (operator-set state
+		// in the dashboard or via PATCH /api/nodes/{id}).
 		let nodes = query(DB,
 			"select agent_url, hardware_json from nodes "
 			+ "where node_id = ? "
 			+ "and agent_url is not null "
+			+ "and state = 'active' "
 			+ "and last_seen_at > datetime('now', ?)",
 			[cand.node_id, "-" + STALE_NODE_SECONDS + " seconds"]);
 		if (nodes.length == 0) { continue; }
@@ -523,6 +583,7 @@ fn pick_placement(model_path: string, profile) {
 	let rows = query(DB,
 		"select node_id, agent_url, hardware_json from nodes "
 		+ "where agent_url is not null "
+		+ "and state = 'active' "
 		+ "and last_seen_at > datetime('now', ?) "
 		+ "order by registered_at desc",
 		["-" + STALE_NODE_SECONDS + " seconds"]);
@@ -1052,11 +1113,15 @@ fn handle_llama_proxy(req): object {
 fn nodes_for_dashboard(): array {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
-		+ "registered_at, last_seen_at, "
+		+ "registered_at, last_seen_at, state, runtime_json, "
 		+ "cast((julianday('now') - julianday(last_seen_at)) * 86400 as integer) as age_seconds "
 		+ "from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
+		let runtime = null;
+		if (row?.runtime_json != null) {
+			try { runtime = parse(row.runtime_json); } catch (e) { }
+		}
 		out.push({
 			node_id: row.node_id,
 			hostname: row.hostname,
@@ -1065,6 +1130,8 @@ fn nodes_for_dashboard(): array {
 			agent_url: row.agent_url,
 			last_seen_at: row.last_seen_at,
 			age_seconds: row.age_seconds,
+			state: row?.state ?? "active",
+			runtime: runtime,
 		});
 	}
 	return out;
@@ -1669,6 +1736,7 @@ fn main(): null {
 	let routes = [
 		{ method: "POST", path: "/register",      handler: handle_register },
 		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes },
+		{ method: "PATCH", path: "/api/nodes/",   prefix: true, handler: handle_patch_node },
 		{ method: "GET",  path: "/healthz",       handler: handle_health },
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },

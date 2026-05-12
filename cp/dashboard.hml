@@ -178,8 +178,8 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 	}
 	let html = "<table>\n"
 		+ "<thead><tr>"
-		+ "<th>node</th><th>role</th><th>last seen</th>"
-		+ "<th>hardware (free / total · 30 min trend)</th>"
+		+ "<th>node</th><th>state</th><th>last seen</th>"
+		+ "<th>hardware (free / total · 30 min trend)</th><th></th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (n in nodes_data) {
 		let stale = n.age_seconds > stale_seconds;
@@ -189,10 +189,28 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
 		let hw = n.hardware ?? {};
 
+		// state badge — colored by meaning. active = green, draining =
+		// amber, disabled = gray. role still shown (cpu/gpu) as a
+		// secondary tag underneath since it informs what spawns can land.
+		let state = n?.state ?? "active";
+		let state_class = "badge-state-active";
+		if (state == "draining") { state_class = "badge-state-draining"; }
+		else if (state == "disabled") { state_class = "badge-state-disabled"; }
+
+		// Show llama-server build under the node name when reported
+		// (some nodes might be CPU-only with no llama-server installed).
+		let runtime_line = "";
+		let lv = n?.runtime?.llama_server;
+		if (lv != null) {
+			runtime_line = "<br><span class=\"id\">llama-server " + esc(lv?.version ?? "?")
+				+ " <span class=\"meta\">(" + esc(lv?.build_hash ?? "?") + ")</span></span>";
+		}
+
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(n.node_id) + "</strong>"
-				+ "<br><span class=\"id\">" + esc(n.hostname) + "</span></td>"
-			+ "<td>" + esc(n.role) + "</td>"
+				+ "<br><span class=\"id\">" + esc(n.hostname) + " · " + esc(n.role) + "</span>"
+				+ runtime_line + "</td>"
+			+ "<td><span class=\"badge " + state_class + "\">" + esc(state) + "</span></td>"
 			+ "<td" + last_class + ">" + n.age_seconds + "s ago</td>"
 			+ "<td>";
 
@@ -270,7 +288,13 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 			html = html + "<span class=\"empty\">—</span>";
 		}
 
-		html = html + "</td></tr>\n";
+		// Per-row "options" button → opens the node editor modal.
+		// Pass current state so the modal pre-selects it.
+		let opts_btn = "<button class=\"row-action\" "
+			+ "onclick=\"editNode('" + esc(n.node_id) + "','" + esc(state) + "')\""
+			+ ">options</button>";
+
+		html = html + "</td><td class=\"row-actions\">" + opts_btn + "</td></tr>\n";
 	}
 	html = html + "</tbody></table>";
 	return html;

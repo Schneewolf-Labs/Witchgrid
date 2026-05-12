@@ -72,9 +72,43 @@
       </form>
     </section>
 
-    <section>
+    <section x-data="nodeEditor()">
       <h2>Nodes</h2>
       <div hx-get="/ui/nodes" hx-trigger="load, every 5s">loading…</div>
+
+      <!-- ── Node editor modal ─────────────────────────────────── -->
+      <div class="modal-backdrop" x-show="open" x-cloak @click.self="cancel()" style="display:none">
+        <div class="modal-card" @click.stop style="max-width:480px">
+          <h3 style="margin:0 0 0.75rem 0">edit <span x-text="node_id"></span></h3>
+          <div class="form-grid">
+            <div class="full">
+              <label>state</label>
+              <div style="display:grid; gap:0.4rem; margin-top:0.25rem">
+                <label class="state-radio">
+                  <input type="radio" x-model="state" value="active">
+                  <strong>active</strong>
+                  <span class="meta">accept new spawns</span>
+                </label>
+                <label class="state-radio">
+                  <input type="radio" x-model="state" value="draining">
+                  <strong>draining</strong>
+                  <span class="meta">no new spawns; existing services keep running</span>
+                </label>
+                <label class="state-radio">
+                  <input type="radio" x-model="state" value="disabled">
+                  <strong>disabled</strong>
+                  <span class="meta">fully out of placement; node still visible for inspection</span>
+                </label>
+              </div>
+            </div>
+          </div>
+          <p class="msg err" x-show="error" x-text="error" style="margin-top:0.75rem"></p>
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem">
+            <button type="button" class="row-action" @click="cancel()" :disabled="busy">cancel</button>
+            <button type="button" @click="save()" :disabled="busy" x-text="busy ? '…' : 'save'"></button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section>

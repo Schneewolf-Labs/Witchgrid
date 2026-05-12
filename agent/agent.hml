@@ -53,7 +53,7 @@ import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
 import { probe } from "./hardware";
-import { introspect } from "./capabilities";
+import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
 
@@ -130,7 +130,7 @@ fn register_with_cp(cp_url: string, payload): null {
 // tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
                         agent_url: string, canonical_dir: string,
-                        extra_dirs, models_ref, interval_seconds: i32): null {
+                        extra_dirs, models_ref, runtime, interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
 		let hw = probe(canonical_dir, extra_dirs);
@@ -142,6 +142,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				hardware:  hw,
 				agent_url: agent_url,
 				models:    models_ref.entries,
+				runtime:   runtime,
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -230,6 +231,20 @@ fn main(): null {
 		+ hw.gpus.length + " GPU(s), "
 		+ hw.disks.length + " disk path(s)");
 
+	// Probe llama-server build/version so CP can show "this node is on
+	// b8635" and the operator can decide who needs an upgrade. null
+	// when the binary isn't installed (CPU-only nodes that don't host
+	// llama-server are valid; placement just won't pick them).
+	let runtime = {};
+	let lv = probe_version("llama-server");
+	if (lv != null) {
+		runtime["llama_server"] = lv;
+		print("[agent] llama-server build " + lv.version
+			+ " (" + (lv?.build_hash ?? "?") + ")");
+	} else {
+		print("[agent] llama-server not installed or --version failed");
+	}
+
 	// Scan the catalog before first /register so CP gets the model list
 	// on the very first contact (placement can use it immediately).
 	// Cost: ~16ms per file. A box with 100 GGUFs sees ~1.5s extra boot
@@ -252,11 +267,12 @@ fn main(): null {
 		hardware:  hw,
 		agent_url: agent_url,
 		models:    models_ref.entries,
+		runtime:   runtime,
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               canonical_dir, extra_dirs, models_ref, HEARTBEAT_SECONDS);
+	               canonical_dir, extra_dirs, models_ref, runtime, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
