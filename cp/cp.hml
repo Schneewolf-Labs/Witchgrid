@@ -30,7 +30,7 @@
 
 import { open_db, exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
-import { post_json, get, request as http_request } from "@stdlib/http";
+import { post_json, get, request as http_request, stream as http_stream } from "@stdlib/http";
 import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
@@ -896,6 +896,44 @@ fn handle_llama_proxy(req): object {
 	// (completion, chat/completions, embeddings) takes JSON. Generalize when
 	// we add image gen / multipart paths.
 	let headers = ["Content-Type: application/json"];
+
+	// Detect stream:true in the body. llama-server returns SSE
+	// (text/event-stream) when stream is true; we need to forward
+	// chunks straight through to the client without buffering, so the
+	// caller sees tokens as they're produced. Otherwise we buffer
+	// (single JSON object response) — same as before.
+	//
+	// Body parse cost: chat completion bodies are typically <100KB,
+	// most under 10KB. Single JSON parse per request is noise vs the
+	// inference cost.
+	let want_stream = false;
+	if (req.body != null && req.body.length > 0) {
+		try {
+			let payload = parse(req.body);
+			if (payload?.stream == true) { want_stream = true; }
+		} catch (e) {
+			// Non-JSON body — treat as buffered. llama-server only
+			// accepts JSON for the endpoints we care about, so a
+			// malformed body will fail upstream with a useful error.
+		}
+	}
+
+	if (want_stream) {
+		let s = null;
+		try {
+			s = http_stream(req.method, target_url, req.body, headers, 600000);
+		} catch (e) {
+			return { status: 502, body: stringify({
+				error: "llama-server unreachable at " + target_url + ": " + e,
+			})};
+		}
+		return {
+			status: s.status_code,
+			stream_upstream: s,
+			headers: { "content-type": "text/event-stream" },
+		};
+	}
+
 	try {
 		let resp = http_request(req.method, target_url, req.body, headers);
 		// Body might be JSON or text — pass through unchanged. Status from

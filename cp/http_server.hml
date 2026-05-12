@@ -1,13 +1,23 @@
 // http_server.hml — tiny HTTP/1.1 server for an internal control plane.
 //
 // Built on @stdlib/net.TcpListener. No keep-alive, no chunked transfer,
-// no streaming bodies, no TLS. Sufficient for JSON RPC + small HTML
-// pages on a trusted network. Dies on parse errors with 400.
+// no TLS. Sufficient for JSON RPC + small HTML pages on a trusted
+// network. Dies on parse errors with 400.
 //
 // Handler shape:
 //   fn handler(req: Request) -> Response
 //   Request:  { method, path, headers (object), body (string) }
-//   Response: { status: i32, headers?: object, body?: string }
+//   Response: { status: i32, headers?: object, body?: string,
+//               stream_upstream?: stream_obj }
+//
+// Two body modes:
+//   - body            in-memory string. Default. Right for JSON / HTML.
+//   - stream_upstream a @stdlib/http.stream() object whose chunks get
+//                     pumped straight to the client socket. Used by the
+//                     inference proxy to forward llama-server's SSE
+//                     responses without buffering. No Content-Length
+//                     (we don't know it); Connection: close terminates
+//                     the body.
 //
 // Routes are matched exact path + exact method. No params, no globs —
 // add when needed.
@@ -80,9 +90,47 @@ fn status_text(code: i32): string {
 
 export fn write_response(stream, resp): null {
 	let status = resp.status;
-	let body = resp?.body ?? "";
+	let upstream = resp?.stream_upstream;
 	let headers = resp?.headers ?? {};
 
+	if (upstream != null) {
+		// Streaming pass-through. We don't know the body length up
+		// front; rely on Connection: close as the body terminator
+		// (close-delimited HTTP/1.0-style framing — fine since our
+		// server already sets connection: close on every response).
+		// No Content-Length header since libwebsockets clients (and
+		// curl) handle close-delimited bodies natively.
+		if (!headers.has("content-type")) {
+			headers["content-type"] = "text/event-stream";
+		}
+		headers["connection"] = "close";
+		// Hint to intermediaries (corporate proxies, nginx) not to
+		// buffer the response.
+		if (!headers.has("cache-control")) {
+			headers["cache-control"] = "no-cache";
+		}
+
+		stream.write("HTTP/1.1 " + status + " " + status_text(status) + "\r\n");
+		let hkeys = headers.keys();
+		for (k in hkeys) {
+			stream.write(k + ": " + headers[k] + "\r\n");
+		}
+		stream.write("\r\n");
+
+		// Pump chunks until upstream is done. read_binary returns null
+		// when the source closes; empty-but-non-null chunks are
+		// transient (no-data-yet) and we just keep polling.
+		loop {
+			let chunk = upstream.read_binary(60000);
+			if (chunk == null) { break; }
+			if (chunk.length == 0) { continue; }
+			stream.write(chunk);
+		}
+		try { upstream.close(); } catch (e) { }
+		return null;
+	}
+
+	let body = resp?.body ?? "";
 	if (body.length > 0 && !headers.has("content-type")) {
 		headers["content-type"] = "application/json";
 	}
