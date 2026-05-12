@@ -26,6 +26,7 @@ import { exec as db_exec, query } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
 import { get_binary } from "@stdlib/http";
 import { file_stat, exists, remove_file, rename } from "@stdlib/fs";
+import { exec_argv } from "@stdlib/process";
 
 export fn init_transfers_schema(db): null {
 	db_exec(db, "create table if not exists model_transfers ("
@@ -120,6 +121,19 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 	return null;
 }
 
+// Strip scheme + path, return "host:port" or "host" from a URL like
+// http://192.168.8.154:8766/models/foo/blob → 192.168.8.154
+fn url_host(url: string): string {
+	let rest = url;
+	let scheme = rest.find("://");
+	if (scheme >= 0) { rest = rest.substr(scheme + 3, rest.length - scheme - 3); }
+	let slash = rest.find("/");
+	if (slash >= 0) { rest = rest.substr(0, slash); }
+	let colon = rest.find(":");
+	if (colon >= 0) { rest = rest.substr(0, colon); }
+	return rest;
+}
+
 // HTTP handler: POST /models/pull
 //
 // Body: { alias, source: { kind: "peer", url } }
@@ -128,7 +142,15 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 // rescan_after: callback invoked after a successful peer pull so the
 // agent's catalog picks up the new file without waiting for the next
 // operator-triggered rescan.
-export fn make_pull_handler(db, canonical_dir: string, rescan_after): object {
+//
+// own_host: the host portion of WITCHGRID_AGENT_URL — used to refuse
+// pulls whose source resolves to ourselves. Self-pulls in the current
+// single-threaded server time out (the get_binary blocks the same
+// libwebsockets state that has to serve the /models/{alias}/blob)
+// rather than producing useful work; honest 400 beats silent 60s
+// timeout. Multithreading the http_server (v0.4) removes this
+// limitation.
+export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: string): object {
 	return fn(req): object {
 		let payload = null;
 		try { payload = parse_or_throw(req?.body ?? "{}"); }
@@ -149,6 +171,17 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after): object {
 			if (url == null) {
 				return { status: 400, body: "{\"error\":\"source.url required for kind=peer\"}" };
 			}
+			let src_host = url_host(url);
+			if (src_host == "127.0.0.1" || src_host == "localhost"
+			    || src_host == own_host) {
+				return { status: 400, body: stringify({
+					error: "refusing self-pull (source host '" + src_host
+						+ "' is this agent). Single-threaded http_server can't "
+						+ "serve its own pull request without timing out — "
+						+ "operator should pull from a different agent or use "
+						+ "kind=huggingface. Multithreading lifts this in v0.4.",
+				})};
+			}
 			let now = iso_now(db);
 			db_exec(db,
 				"insert into model_transfers "
@@ -160,10 +193,117 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after): object {
 			return { status: 202, body: stringify({ transfer_id: id, target_path: target }) };
 		}
 
+		if (kind == "huggingface") {
+			let repo = source?.repo;
+			let file = source?.file;
+			if (repo == null || file == null) {
+				return { status: 400, body: "{\"error\":\"source.repo + source.file required for kind=huggingface\"}" };
+			}
+			let now = iso_now(db);
+			db_exec(db,
+				"insert into model_transfers "
+				+ "(id, alias, source_kind, hf_repo, hf_file, target_path, status, started_at) "
+				+ "values (?, ?, 'huggingface', ?, ?, ?, 'queued', ?)",
+				[id, alias, repo, file, target, now]);
+			let t = spawn(pull_hf_task_with_rescan, db, id, repo, file,
+				canonical_dir, target, rescan_after);
+			detach(t);
+			return { status: 202, body: stringify({ transfer_id: id, target_path: target }) };
+		}
+
 		return { status: 400, body: stringify({
-			error: "unknown source kind: " + kind + " (peer is the only kind in v0.3.0)",
+			error: "unknown source kind: " + kind + " (expected 'peer' or 'huggingface')",
 		})};
 	};
+}
+
+// Background task: shell out to `hf download <repo> <file>
+// --local-dir <canonical>`. Renames the resulting file to
+// canonical/<alias>.gguf so the catalog rescan recognizes it under
+// the alias the operator asked for (which may differ from the HF
+// filename, e.g. they downloaded a different quant once).
+//
+// hf is the rebranded huggingface-cli (per user's tooling memory).
+// It speaks Xet automatically when the repo is enabled, handles
+// auth via ~/.cache/huggingface/token, retries chunks, dedupes
+// against existing local files. We just wait for it.
+async fn pull_hf_task(db, transfer_id: string, repo: string, file: string,
+                      canonical_dir: string, target: string): null {
+	db_exec(db,
+		"update model_transfers set status='downloading' where id=?",
+		[transfer_id]);
+	let r = null;
+	try {
+		// `hf download <repo> <file> --local-dir <dir>` writes the
+		// file at <dir>/<file> (preserving any nested path inside the
+		// repo). We pass --local-dir-use-symlinks=False since some
+		// older hf versions defaulted to symlinking into the cache
+		// instead of materializing the file, which then breaks the
+		// rename/scan loop. Modern `hf` (>= 0.20) ignores this flag
+		// safely.
+		r = exec_argv(["hf", "download", repo, file,
+			"--local-dir", canonical_dir]);
+	} catch (e) {
+		db_exec(db,
+			"update model_transfers set status='error', error=? where id=?",
+			["could not exec `hf download` (is huggingface_hub installed?): " + e,
+			 transfer_id]);
+		return null;
+	}
+	if (r.exit_code != 0) {
+		let tail = r?.stderr ?? r?.output ?? "";
+		if (tail.length > 1024) { tail = tail.substr(tail.length - 1024, 1024); }
+		db_exec(db,
+			"update model_transfers set status='error', error=? where id=?",
+			["hf download exited " + r.exit_code + ": " + tail, transfer_id]);
+		return null;
+	}
+
+	// hf wrote the file at canonical_dir/<file>. Move it to the alias-
+	// derived target so a rescan re-derives the same alias from this file.
+	let downloaded = canonical_dir + "/" + file;
+	if (!exists(downloaded)) {
+		// hf may have written into a subdirectory mirroring the repo's
+		// path; try to find it.
+		db_exec(db,
+			"update model_transfers set status='error', error=? where id=?",
+			["hf download said success but expected file at "
+				+ downloaded + " is missing — check repo path", transfer_id]);
+		return null;
+	}
+	if (downloaded != target) {
+		try { rename(downloaded, target); } catch (e) {
+			db_exec(db,
+				"update model_transfers set status='error', error=? where id=?",
+				["rename " + downloaded + " → " + target + " failed: " + e,
+				 transfer_id]);
+			return null;
+		}
+	}
+	let stat = file_stat(target);
+	let now = iso_now(db);
+	db_exec(db,
+		"update model_transfers "
+		+ "set status='complete', bytes_downloaded=?, bytes_total=?, completed_at=? "
+		+ "where id=?",
+		[stat.size, stat.size, now, transfer_id]);
+	print("[transfer] " + transfer_id + " complete (hf): " + target
+		+ " (" + stat.size + " bytes)");
+	return null;
+}
+
+async fn pull_hf_task_with_rescan(db, transfer_id: string, repo: string,
+                                  file: string, canonical_dir: string,
+                                  target: string, rescan_after): null {
+	pull_hf_task(db, transfer_id, repo, file, canonical_dir, target);
+	let row = query(db, "select status from model_transfers where id=?",
+		[transfer_id]);
+	if (row.length > 0 && row[0].status == "complete" && rescan_after != null) {
+		try { rescan_after(); } catch (e) {
+			eprint("[transfer] post-pull rescan failed: " + e);
+		}
+	}
+	return null;
 }
 
 // Wrap pull_peer_task so it triggers a rescan on successful completion.

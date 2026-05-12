@@ -90,8 +90,20 @@ export let INDEX_HTML = "<!doctype html>
 
     <section>
       <h2>Catalog</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time.</p>
-      <div hx-get=\"/ui/catalog\" hx-trigger=\"load, every 30s\">loading…</div>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time. Use the per-row picker to copy a model to another node.</p>
+      <div hx-get=\"/ui/catalog\" hx-trigger=\"load, every 10s\">loading…</div>
+    </section>
+
+    <section>
+      <h2>Missing</h2>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
+      <div hx-get=\"/ui/missing\" hx-trigger=\"load, every 30s\">loading…</div>
+    </section>
+
+    <section>
+      <h2>Transfers</h2>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">In-flight + recent model pulls across the fleet.</p>
+      <div hx-get=\"/ui/transfers\" hx-trigger=\"load, every 3s\">loading…</div>
     </section>
 
     <section>
@@ -489,6 +501,11 @@ tr.hw-detail details summary:hover { color: var(--accent); }
   color: var(--fg-2);
   border-color: var(--border);
 }
+
+/* Catalog \"copy to\" + missing-model \"pull from HF\" inline pickers */
+.distribute-row { display: flex; gap: 0.4rem; align-items: center; }
+.distribute-row select { margin: 0; padding: 0.2rem 0.4rem; font-size: 0.78rem; height: 28px; min-width: 120px; }
+.distribute-row button { margin: 0; padding: 0.2rem 0.7rem; font-size: 0.78rem; }
 
 /* ─── spawn form ────────────────────────────────────────────────── */
 

@@ -35,7 +35,7 @@ import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
-import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
+import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -787,12 +787,23 @@ fn auto_spawn(profile_name: string) {
 	}
 	if (pick == null) {
 		if (profile?.default_model == null) {
-			return { error: { status: 503, body: stringify({
+			let alias = profile?.model_alias;
+			let body = {
 				error: "no running service for profile " + profile_name
 					+ " and no model resolvable (alias '"
-					+ (profile?.model_alias ?? "<none>")
+					+ (alias ?? "<none>")
 					+ "' not in any node's catalog and no default_model)",
-			})}};
+			};
+			// Enrich with hunt hints when we have an alias to look up.
+			// Operator sees "here's the HF coords / here's a peer that
+			// has it" right in the error and can POST /models/distribute.
+			if (alias != null) {
+				body["alias"] = alias;
+				body["known_sources"] = known_sources_for(alias, null);
+				body["hint"] = "POST /models/distribute "
+					+ "{alias, target_node, source_kind?} to fetch it";
+			}
+			return { error: { status: 503, body: stringify(body) }};
 		}
 		resolved_model = profile.default_model;
 		let path_pick = pick_placement(profile.default_model, profile);
@@ -1051,8 +1062,188 @@ fn handle_list_catalog(req): object {
 }
 
 fn handle_ui_catalog(req): object {
-	return { status: 200, body: render_catalog(catalog_grouped()),
+	return { status: 200,
+		body: render_catalog(catalog_grouped(), nodes_for_dashboard()),
 		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+fn handle_ui_transfers(req): object {
+	return { status: 200, body: render_transfers(aggregated_transfers()),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+// Build the missing-models list: aliases that any profile names but
+// no node has on disk. Each row carries known_sources + the profiles
+// that reference it so the UI can render an actionable hint.
+fn missing_models(): array {
+	let profiles = aggregated_profiles();
+	let names = profiles.keys();
+	let aliases_to_profiles = {};
+	for (n in names) {
+		let p = profiles[n];
+		let alias = p?.model_alias;
+		if (alias == null) { continue; }
+		if (!aliases_to_profiles.has(alias)) {
+			aliases_to_profiles[alias] = [];
+		}
+		aliases_to_profiles[alias].push(n);
+	}
+
+	let out = [];
+	let alias_keys = aliases_to_profiles.keys();
+	for (alias in alias_keys) {
+		let on = nodes_with_alias(alias);
+		if (on.length > 0) { continue; }  // someone has it; not missing
+		out.push({
+			alias:         alias,
+			profiles:      aliases_to_profiles[alias],
+			known_sources: known_sources_for(alias, null),
+		});
+	}
+	return out;
+}
+
+fn handle_ui_missing(req): object {
+	return { status: 200,
+		body: render_missing(missing_models(), nodes_for_dashboard()),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+// ── distribution ─────────────────────────────────────────────────────
+//
+// Resolve known sources for an alias: peer (any node that has it on
+// disk EXCEPT the target node itself) + hf (any profile with this
+// model_alias and an hf_source). Used both by /models/distribute (to
+// auto-pick a source) and by routing 404s (to enrich the error body
+// with hunt hints).
+fn known_sources_for(alias: string, target_node) {
+	let out = { peer: [], hf: [] };
+
+	// Peer: every other node that has the alias on disk, paired with
+	// its agent_url so the target can hit /models/{alias}/blob there.
+	let rows = query(DB,
+		"select nm.node_id as node_id, nm.path as path, n.agent_url as agent_url "
+		+ "from node_models nm "
+		+ "join nodes n on nm.node_id = n.node_id "
+		+ "where nm.alias = ? "
+		+ "and n.agent_url is not null "
+		+ "and n.last_seen_at > datetime('now', ?)",
+		[alias, "-" + STALE_NODE_SECONDS + " seconds"]);
+	for (row in rows) {
+		if (row.node_id == target_node) { continue; }  // can't pull from self
+		out.peer.push({
+			node_id:   row.node_id,
+			agent_url: row.agent_url,
+			blob_url:  row.agent_url + "/models/" + alias + "/blob",
+		});
+	}
+
+	// HF: scan aggregated profiles for any that name this alias and
+	// include an hf_source. Same alias may show up in multiple
+	// profiles; first match wins.
+	let profiles = aggregated_profiles();
+	let names = profiles.keys();
+	for (n in names) {
+		let p = profiles[n];
+		if (p?.model_alias == alias && p?.hf_source != null) {
+			out.hf.push({
+				profile: n,
+				repo:    p.hf_source.repo,
+				file:    p.hf_source.file,
+			});
+		}
+	}
+	return out;
+}
+
+fn handle_distribute(req): object {
+	let payload = parse(req.body);
+	let alias = payload?.alias;
+	let target_node = payload?.target_node;
+	if (alias == null || target_node == null) {
+		return { status: 400, body: stringify({
+			error: "alias + target_node required",
+		})};
+	}
+	let target_url = lookup_agent(target_node);
+	if (target_url == null) {
+		return { status: 404, body: stringify({
+			error: "no agent for target_node: " + target_node,
+		})};
+	}
+
+	let sources = known_sources_for(alias, target_node);
+	let source_kind = payload?.source_kind;
+	let pull_body = null;
+
+	// Operator-supplied source_kind narrows; absence means "auto-pick".
+	// Auto-pick prefers peer (LAN, faster) over HF (internet).
+	if (source_kind == "peer" || (source_kind == null && sources.peer.length > 0)) {
+		if (sources.peer.length == 0) {
+			return { status: 422, body: stringify({
+				error: "no peer source for alias '" + alias + "'",
+				known_sources: sources,
+			})};
+		}
+		pull_body = { alias: alias, source: { kind: "peer",
+			url: sources.peer[0].blob_url } };
+	} else if (source_kind == "huggingface" || source_kind == null) {
+		if (sources.hf.length == 0) {
+			return { status: 422, body: stringify({
+				error: "no source available for alias '" + alias
+					+ "' (no peer has it on disk and no profile names "
+					+ "an hf_source for this alias)",
+				known_sources: sources,
+			})};
+		}
+		pull_body = { alias: alias, source: { kind: "huggingface",
+			repo: sources.hf[0].repo, file: sources.hf[0].file } };
+	} else {
+		return { status: 400, body: stringify({
+			error: "unknown source_kind: " + source_kind
+				+ " (expected 'peer' or 'huggingface')",
+		})};
+	}
+
+	try {
+		let resp = post_json(target_url + "/models/pull", pull_body);
+		// Enrich the response with what we picked so the UI can show
+		// "pulling from {repo} via HF" or "pulling from schneewolf via peer".
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			let body = parse(resp.body);
+			body["target_node"] = target_node;
+			body["source"] = pull_body.source;
+			return { status: resp.status_code, body: stringify(body) };
+		}
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({
+			error: "target agent unreachable: " + e,
+		})};
+	}
+}
+
+// ── transfers aggregator ─────────────────────────────────────────────
+fn aggregated_transfers(): array {
+	let agents = list_all_agents();
+	let merged = [];
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/models/transfers", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let entries = parse(resp.body);
+				for (e in entries) {
+					e["node_id"] = a.node_id;
+					merged.push(e);
+				}
+			}
+		} catch (e) { }
+	}
+	return merged;
+}
+
+fn handle_list_transfers(req): object {
+	return { status: 200, body: stringify(aggregated_transfers()) };
 }
 
 // Fetch the last N samples for one (node, metric, series) ordered
@@ -1225,6 +1416,10 @@ fn main(): null {
 		{ method: "GET",  path: "/profiles",        handler: handle_list_profiles },
 		{ method: "GET",  path: "/catalog",         handler: handle_list_catalog },
 		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog },
+		{ method: "POST", path: "/models/distribute", handler: handle_distribute },
+		{ method: "GET",  path: "/transfers",       handler: handle_list_transfers },
+		{ method: "GET",  path: "/ui/transfers",    handler: handle_ui_transfers },
+		{ method: "GET",  path: "/ui/missing",      handler: handle_ui_missing },
 		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.

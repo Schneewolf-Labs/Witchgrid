@@ -266,10 +266,13 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 //
 // catalog_data: [{alias, size_mb, architecture, claimed_context,
 //                 general_name, source_url, on_nodes: [{node_id, path}]}]
+// all_nodes:    [{node_id, ...}]   so the per-row "copy to" dropdown can
+//                                  list nodes that don't yet have it.
 //
-// One row per alias. Each row lists which nodes have it on disk so the
-// operator can see at a glance "who can run this?" and where.
-export fn render_catalog(catalog_data): string {
+// One row per alias. Each row lists which nodes have it on disk and
+// offers a "⇣ copy to" dropdown that POSTs /models/distribute when the
+// operator picks a target.
+export fn render_catalog(catalog_data, all_nodes): string {
 	if (catalog_data.length == 0) {
 		return "<p class=\"empty\">No models in any node's catalog. "
 			+ "Set <code>WITCHGRID_MODEL_DIR</code> on an agent and restart it.</p>";
@@ -277,17 +280,17 @@ export fn render_catalog(catalog_data): string {
 	let html = "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>alias</th><th>size</th><th>arch</th>"
-		+ "<th>on nodes</th><th>source</th>"
+		+ "<th>on nodes</th><th>source</th><th>distribute</th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (e in catalog_data) {
-		// general_name is the human-friendly name from the GGUF — show as
-		// secondary text under the alias so the alias-as-key stays primary.
 		let name_subline = "";
 		if (e?.general_name != null && e.general_name.length > 0) {
 			name_subline = "<br><span class=\"id\">" + esc(e.general_name) + "</span>";
 		}
 		let nodes_html = "";
+		let on_set = {};
 		for (on in e.on_nodes) {
+			on_set[on.node_id] = true;
 			nodes_html = nodes_html + "<div class=\"catalog-node\">"
 				+ "<strong>" + esc(on.node_id) + "</strong> "
 				+ "<code class=\"meta\">" + esc(on.path) + "</code>"
@@ -297,12 +300,164 @@ export fn render_catalog(catalog_data): string {
 		if (e?.source_url != null && e.source_url.length > 0) {
 			source_html = "<a href=\"" + esc(e.source_url) + "\" target=\"_blank\">link</a>";
 		}
+
+		// Distribute control: pick a target node that doesn't have it
+		// + click pull. Inline JS (no extra Alpine component) since the
+		// row count is bounded by catalog size and this stays simple.
+		let dist_html = "<span class=\"empty\">—</span>";
+		let candidates = [];
+		for (n in all_nodes) {
+			if (!on_set.has(n.node_id)) { candidates.push(n.node_id); }
+		}
+		if (candidates.length > 0) {
+			let opts = "<option value=\"\">target node…</option>";
+			for (c in candidates) {
+				opts = opts + "<option value=\"" + esc(c) + "\">" + esc(c) + "</option>";
+			}
+			let id_safe = esc(e.alias).replace_all(".", "-");
+			dist_html = "<div class=\"distribute-row\">"
+				+ "<select id=\"tgt-" + id_safe + "\">" + opts + "</select>"
+				+ "<button class=\"secondary\" onclick=\""
+				+ "let s=document.getElementById('tgt-" + id_safe + "');"
+				+ "if(!s.value){return;}"
+				+ "fetch('/models/distribute',{method:'POST',"
+				+ "headers:{'content-type':'application/json'},"
+				+ "body:JSON.stringify({alias:'" + esc(e.alias)
+					+ "',target_node:s.value})})"
+				+ ".then(r=>r.json()).then(d=>"
+				+ "alert(d.error?('error: '+d.error):('queued '+d.transfer_id+' on '+d.target_node)));"
+				+ "\">pull</button></div>";
+		}
+
 		html = html + "<tr>"
 			+ "<td><code>" + esc(e.alias) + "</code>" + name_subline + "</td>"
 			+ "<td>" + fmt_mb(e.size_mb) + "</td>"
 			+ "<td>" + esc(e.architecture) + "</td>"
 			+ "<td>" + nodes_html + "</td>"
 			+ "<td>" + source_html + "</td>"
+			+ "<td>" + dist_html + "</td>"
+			+ "</tr>\n";
+	}
+	html = html + "</tbody></table>";
+	return html;
+}
+
+// ── /ui/transfers fragment ───────────────────────────────────────────
+//
+// transfers_data: [{node_id, id, alias, source_kind, source_url, hf_repo,
+//                   hf_file, status, bytes_downloaded, bytes_total,
+//                   error, started_at, completed_at}]
+export fn render_transfers(transfers_data): string {
+	if (transfers_data.length == 0) {
+		return "<p class=\"empty\">No transfers yet. Use the "
+			+ "<em>distribute</em> button on a catalog row to start one.</p>";
+	}
+	let html = "<table>\n"
+		+ "<thead><tr>"
+		+ "<th>alias</th><th>node</th><th>source</th>"
+		+ "<th>status</th><th>bytes</th><th>started</th>"
+		+ "</tr></thead>\n<tbody>\n";
+	for (t in transfers_data) {
+		let kind = t.source_kind;
+		let source_label = "?";
+		if (kind == "peer") {
+			source_label = "<span class=\"badge badge-scan\">peer</span> "
+				+ "<code class=\"meta\">" + esc(t?.source_url ?? "") + "</code>";
+		} else if (kind == "huggingface") {
+			source_label = "<span class=\"badge badge-canonical\">HF</span> "
+				+ "<code>" + esc(t?.hf_repo ?? "") + "</code>"
+				+ " <span class=\"meta\">/</span> "
+				+ "<code>" + esc(t?.hf_file ?? "") + "</code>";
+		}
+		let status_class = "alive-yes";
+		if (t.status == "error") { status_class = "alive-no"; }
+		else if (t.status == "downloading" || t.status == "queued") { status_class = ""; }
+		let status_html = "<span class=\"" + status_class + "\">" + esc(t.status) + "</span>";
+		if (t.status == "error" && t?.error != null) {
+			status_html = status_html
+				+ "<br><span class=\"meta\">" + esc(t.error.substr(0, 200)) + "</span>";
+		}
+		let bytes_html = "<span class=\"empty\">—</span>";
+		if (t.bytes_total > 0) {
+			let pct = (f64(t.bytes_downloaded) / f64(t.bytes_total)) * 100.0;
+			bytes_html = fmt_mb(t.bytes_downloaded / 1048576)
+				+ " / " + fmt_mb(t.bytes_total / 1048576)
+				+ " <span class=\"meta\">(" + i32(pct) + "%)</span>";
+		} else if (t.bytes_downloaded > 0) {
+			bytes_html = fmt_mb(t.bytes_downloaded / 1048576);
+		}
+		html = html + "<tr>"
+			+ "<td><code>" + esc(t.alias) + "</code></td>"
+			+ "<td><strong>" + esc(t.node_id) + "</strong></td>"
+			+ "<td>" + source_label + "</td>"
+			+ "<td>" + status_html + "</td>"
+			+ "<td>" + bytes_html + "</td>"
+			+ "<td><span class=\"meta\">" + esc(t.started_at) + "</span></td>"
+			+ "</tr>\n";
+	}
+	html = html + "</tbody></table>";
+	return html;
+}
+
+// ── /ui/missing fragment ─────────────────────────────────────────────
+//
+// missing_data: [{alias, profiles: [name,...], known_sources: {peer:[],hf:[]}}]
+//
+// Aliases referenced by some profile that are NOT on disk anywhere in
+// the fleet. Renders an actionable hint per row — if there's an HF
+// source in any profile naming this alias, show a one-click "pull
+// from HF" picker (target node selector + button).
+export fn render_missing(missing_data, all_nodes): string {
+	if (missing_data.length == 0) {
+		return "<p class=\"empty\">All profiles' aliases resolve. ✓</p>";
+	}
+	let html = "<table>\n"
+		+ "<thead><tr>"
+		+ "<th>alias</th><th>used by</th><th>known source</th>"
+		+ "<th>fetch</th>"
+		+ "</tr></thead>\n<tbody>\n";
+	for (m in missing_data) {
+		let profs = "";
+		for (p in m.profiles) {
+			if (profs.length > 0) { profs = profs + ", "; }
+			profs = profs + "<code>" + esc(p) + "</code>";
+		}
+		let src_html = "<span class=\"empty\">— no source declared</span>";
+		let can_fetch = false;
+		if (m.known_sources?.hf != null && m.known_sources.hf.length > 0) {
+			let h = m.known_sources.hf[0];
+			src_html = "<span class=\"badge badge-canonical\">HF</span> "
+				+ "<code>" + esc(h.repo) + "</code>"
+				+ " <span class=\"meta\">/</span> "
+				+ "<code>" + esc(h.file) + "</code>";
+			can_fetch = true;
+		}
+
+		let fetch_html = "<span class=\"empty\">—</span>";
+		if (can_fetch && all_nodes.length > 0) {
+			let opts = "<option value=\"\">target…</option>";
+			for (n in all_nodes) {
+				opts = opts + "<option value=\"" + esc(n.node_id) + "\">" + esc(n.node_id) + "</option>";
+			}
+			let id_safe = esc(m.alias).replace_all(".", "-");
+			fetch_html = "<div class=\"distribute-row\">"
+				+ "<select id=\"miss-" + id_safe + "\">" + opts + "</select>"
+				+ "<button class=\"secondary\" onclick=\""
+				+ "let s=document.getElementById('miss-" + id_safe + "');"
+				+ "if(!s.value){return;}"
+				+ "fetch('/models/distribute',{method:'POST',"
+				+ "headers:{'content-type':'application/json'},"
+				+ "body:JSON.stringify({alias:'" + esc(m.alias)
+					+ "',target_node:s.value,source_kind:'huggingface'})})"
+				+ ".then(r=>r.json()).then(d=>"
+				+ "alert(d.error?('error: '+d.error):('queued '+d.transfer_id+' on '+d.target_node)));"
+				+ "\">pull from HF</button></div>";
+		}
+		html = html + "<tr>"
+			+ "<td><code>" + esc(m.alias) + "</code></td>"
+			+ "<td>" + profs + "</td>"
+			+ "<td>" + src_html + "</td>"
+			+ "<td>" + fetch_html + "</td>"
 			+ "</tr>\n";
 	}
 	html = html + "</tbody></table>";

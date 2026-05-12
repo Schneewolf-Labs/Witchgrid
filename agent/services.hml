@@ -91,6 +91,15 @@ let PROFILES = {
 		context: 131072,
 		kv_type: "q4_0",
 		model_alias: "mahou-1.5-mistral-nemo-12b.q5_k_m",
+		// Where to fetch this if no node has it. Used when CP's
+		// /models/distribute resolves an alias to nothing on-disk
+		// across the fleet but the profile names a HF source.
+		// Verify the exact repo/file with the upstream publisher
+		// when bootstrapping a new operator's fleet.
+		hf_source: {
+			repo: "flammenai/Mahou-1.5-mistral-nemo-12B-gguf",
+			file: "Mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
+		},
 		default_model: "/mnt/BALTEUS/gguf_models/mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
 	},
 
@@ -479,6 +488,7 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 					kv_type: p.kv_type,
 					default_model: p.default_model,
 					model_alias:   p?.model_alias,
+					hf_source:     p?.hf_source,
 				};
 			}
 			return { status: 200, body: stringify(out) };

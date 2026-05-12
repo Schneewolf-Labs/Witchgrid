@@ -153,6 +153,19 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 	return null;
 }
 
+// Strip URL → bare host. Handed to make_pull_handler so peer pulls
+// can refuse self-targeting cleanly.
+fn extract_url_host(url: string): string {
+	let rest = url;
+	let scheme = rest.find("://");
+	if (scheme >= 0) { rest = rest.substr(scheme + 3, rest.length - scheme - 3); }
+	let slash = rest.find("/");
+	if (slash >= 0) { rest = rest.substr(0, slash); }
+	let colon = rest.find(":");
+	if (colon >= 0) { rest = rest.substr(0, colon); }
+	return rest;
+}
+
 // Probe whether a TCP port is currently bindable on this host. Tries a
 // fresh bind to 0.0.0.0:port — that's the exact condition llama-server
 // faces — and reports the answer. Hemlock 2.2.3 made this catchable in
@@ -289,7 +302,8 @@ fn main(): null {
 		models_ref.entries = fresh;
 		return null;
 	}
-	let pull = make_pull_handler(db, canonical_dir, do_rescan);
+	let pull = make_pull_handler(db, canonical_dir, do_rescan,
+		extract_url_host(agent_url));
 
 	// Pass our own listen port as reserved so spawn_service refuses to
 	// land an llama-server there (the OS would let two binds compete and

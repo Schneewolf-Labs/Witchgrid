@@ -379,6 +379,11 @@ tr.hw-detail details summary:hover { color: var(--accent); }
   border-color: var(--border);
 }
 
+/* Catalog "copy to" + missing-model "pull from HF" inline pickers */
+.distribute-row { display: flex; gap: 0.4rem; align-items: center; }
+.distribute-row select { margin: 0; padding: 0.2rem 0.4rem; font-size: 0.78rem; height: 28px; min-width: 120px; }
+.distribute-row button { margin: 0; padding: 0.2rem 0.7rem; font-size: 0.78rem; }
+
 /* ─── spawn form ────────────────────────────────────────────────── */
 
 form.spawn {
