@@ -15,8 +15,15 @@ on:
 #           probe relies on this. Plus @stdlib/fs.make_dirs (#562) for
 #           canonical-dir creation, and null-narrowing through ?. (#563)
 #           which the placement code uses.
+#   2.3.0 — string concat fixes: f64 → string preserves decimals,
+#           integer 0 no longer dropped in concat in compiled binaries,
+#           inline arithmetic in concat stringifies correctly. The
+#           dashboard sparkline coords + per-GPU bar width % depend on
+#           f64 string precision; pre-2.3 they truncated to integer.
+#           Also: new @stdlib/http.stream() for SSE responses (not yet
+#           used; v0.4 routing proxy will pick it up for stream:true).
 env:
-  HEMLOCK_VERSION: 2.2.3
+  HEMLOCK_VERSION: 2.3.0
 
 jobs:
   build:

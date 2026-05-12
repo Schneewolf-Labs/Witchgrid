@@ -92,12 +92,9 @@ fn render_sparkline(values, total, kind: string): string {
 
 	// Build the path: M x0,y0 L x1,y1 L ...
 	// y axis: 0 = top of chart, h = bottom. We invert so high values
-	// (more free MB) draw higher on the chart.
-	//
-	// SVG accepts integer coordinates fine at this resolution; rounding
-	// to integer pixels also dodges Hemlock's i32-in-string-concat quirk
-	// (operator precedence makes inline arithmetic stringify oddly when
-	// chained with + on strings).
+	// (more free MB) draw higher on the chart. Integer pixels — at
+	// 200×24 the visible difference vs sub-pixel f64 is negligible
+	// and integer concat is one fewer thing to worry about.
 	let path = "";
 	let i = 0;
 	while (i < n) {
