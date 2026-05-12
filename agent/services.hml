@@ -82,7 +82,12 @@ let PROFILES = {
 			flash_attention: true,
 		},
 		extra_flags: [],
-		default_port: 8080,
+		// Ports 8080-8090 are de-facto convention space for AI tools
+		// (llama-server default 8080, koboldcpp 5001/8080, oobabooga
+		// 5000/7860, sd-webui 7860, ComfyUI 8188). Witchgrid lands at
+		// 18080+ to dodge collisions on real GPU boxes that already
+		// host one or more of those.
+		default_port: 18080,
 		context: 131072,
 		kv_type: "q4_0",
 		model_alias: "mahou-1.5-mistral-nemo-12b.q5_k_m",
@@ -99,7 +104,7 @@ let PROFILES = {
 			kv_cache_v: "q8_0",
 		},
 		extra_flags: [],
-		default_port: 8081,
+		default_port: 18081,
 		context: 8192,
 		kv_type: "q8_0",
 		default_model: null,
@@ -116,7 +121,7 @@ let PROFILES = {
 			flash_attention: true,
 		},
 		extra_flags: [],
-		default_port: 8085,
+		default_port: 18085,
 		context: 32768,
 		kv_type: "q4_0",
 		default_model: null,
@@ -230,7 +235,7 @@ let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
 // ── core: spawn ───────────────────────────────────────────────────────
 
-export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus, capabilities): object {
+export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus, tensor_split, capabilities): object {
 	if (!PROFILES.has(profile_name)) {
 		throw "unknown profile: " + profile_name;
 	}
@@ -249,6 +254,38 @@ export fn spawn_service(db, profile_name: string, model_path: string, port: i32,
 	argv.push("-m"); argv.push(model_path);
 	argv.push("--port"); argv.push("" + port);
 	argv.push("--host"); argv.push("0.0.0.0");
+
+	// Multi-GPU tensor-parallel split. We only emit --tensor-split when
+	// CP told us to — for single-GPU spawns the flag isn't needed (or
+	// meaningful), and for multi-GPU pinned spawns where CP didn't
+	// compute weights, we leave llama-server to its default equal-split.
+	//
+	// Capability gate: if the binary doesn't expose --tensor-split (very
+	// old llama.cpp or a CPU-only build), fail loud rather than silently
+	// shipping a malformed argv. The placement decision was made on the
+	// assumption tensor-split would work; if it can't, the operator
+	// needs to know.
+	if (tensor_split != null && tensor_split.length > 1) {
+		if (!capabilities.has("tensor-split")) {
+			throw "binary does not support --tensor-split but CP placed a "
+				+ "multi-GPU spawn (" + tensor_split.length + " GPUs). "
+				+ "Either upgrade llama.cpp on this node or pin to a "
+				+ "single GPU.";
+		}
+		let csv = "";
+		let i = 0;
+		while (i < tensor_split.length) {
+			if (i > 0) { csv = csv + ","; }
+			csv = csv + tensor_split[i];
+			i = i + 1;
+		}
+		// Use the binary's actual short form when present (typically -ts).
+		let ts_cap = capabilities["tensor-split"];
+		let ts_flag = "--tensor-split";
+		if (ts_cap?.short != null) { ts_flag = ts_cap.short; }
+		argv.push(ts_flag);
+		argv.push(csv);
+	}
 
 	let id = new_id(db);
 	let log_path = "/tmp/witchgrid-" + id + ".log";
@@ -397,9 +434,10 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 				i = i + 1;
 			}
 			let gpus = payload?.gpus ?? [];
+			let tensor_split = payload?.tensor_split;
 			try {
 				let caps = capabilities_for(PROFILES[profile].binary);
-				let svc = spawn_service(db, profile, model, port, gpus, caps);
+				let svc = spawn_service(db, profile, model, port, gpus, tensor_split, caps);
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
 				// 502 vs 400: a port-bind / missing-model / OOM error from

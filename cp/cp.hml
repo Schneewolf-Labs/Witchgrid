@@ -256,19 +256,113 @@ fn fetch_profile(profile_name: string) {
 	return null;
 }
 
+// Tensor-parallel overhead headroom. llama.cpp spreads weights across
+// GPUs but each card still needs its own activation buffer + cuBLAS
+// workspace, so the SUM of free VRAM across the chosen subset has to
+// exceed the model's needed VRAM by a margin. 10% empirically covers
+// the worst case I've seen on a 4-card box (Mahou-12B at 128K wants
+// ~17 GB; 2× 4060 Ti split takes ~19 GB sum to be safe).
+let MULTI_GPU_OVERHEAD_FRACTION: f64 = 0.10;
+
+// Picks the smallest GPU subset whose summed free VRAM covers needed_mb
+// + overhead. Within a given subset size, prefers the one with the most
+// total_free as a tiebreaker (more headroom = less risk of OOM during
+// tensor-parallel allocation).
+//
+// gpus: [{index, free_mb, total_mb, ...}]   (the node's full GPU list)
+// needed_mb: f64                            (estimated VRAM the model needs)
+//
+// Returns null if no subset of any size fits, otherwise:
+//   {
+//     indices:      [i32, ...]   (gpu indices in sorted order)
+//     tensor_split: [i32, ...]   (free_mb per gpu, in same order — passed
+//                                 verbatim to llama-server's --tensor-split,
+//                                 which interprets as relative weights)
+//     total_free:   i32          (diagnostic)
+//   }
+//
+// Bitmask enumeration: at N=4 we walk 15 subsets, at N=8 we'd walk 255.
+// Both trivial. If we ever care about much larger fleets per box we'd
+// switch to a smarter knapsack, but no homelab box has that many GPUs.
+fn pick_gpu_subset(gpus, needed_mb: f64) {
+	let n = gpus.length;
+	if (n == 0) { return null; }
+	let needed_with_overhead: f64 = needed_mb * (1.0 + MULTI_GPU_OVERHEAD_FRACTION);
+
+	// Try subset sizes 1..n. Within each size pick the one with most
+	// total_free (best headroom). Smallest-set-first dodges the
+	// degenerate case where the algorithm spreads a small model across
+	// every GPU — one card is cheaper than four.
+	let target_size = 1;
+	while (target_size <= n) {
+		let best_indices = null;
+		let best_split = null;
+		let best_total: i32 = -1;
+
+		// Walk every bitmask of length n; keep only those with the right
+		// popcount AND enough summed free.
+		let mask = 1;
+		let max_mask = 1;
+		let i = 0;
+		while (i < n) { max_mask = max_mask * 2; i = i + 1; }
+
+		while (mask < max_mask) {
+			// Count bits and collect indices for this mask
+			let bit = 0;
+			let popcount = 0;
+			let indices = [];
+			let split = [];
+			let total_free: i32 = 0;
+			while (bit < n) {
+				let m = 1;
+				let j = 0;
+				while (j < bit) { m = m * 2; j = j + 1; }
+				if ((mask & m) != 0) {
+					popcount = popcount + 1;
+					indices.push(gpus[bit].index);
+					split.push(gpus[bit].free_mb);
+					total_free = total_free + gpus[bit].free_mb;
+				}
+				bit = bit + 1;
+			}
+			if (popcount == target_size && f64(total_free) >= needed_with_overhead) {
+				if (total_free > best_total) {
+					best_indices = indices;
+					best_split = split;
+					best_total = total_free;
+				}
+			}
+			mask = mask + 1;
+		}
+
+		if (best_indices != null) {
+			return {
+				indices:      best_indices,
+				tensor_split: best_split,
+				total_free:   best_total,
+			};
+		}
+		target_size = target_size + 1;
+	}
+	return null;
+}
+
 // Catalog-driven placement. Walks every node that advertises this alias,
 // computes VRAM cost from the catalog row's ingredients (no file read on
-// CP's side), picks the first GPU with enough free memory.
+// CP's side), picks the smallest GPU subset that fits.
 //
 // Returns:
-//   { node_id, agent_url, gpu_index, est_mb, model_path }  -- a placement
+//   { node_id, agent_url, gpu_indices: [...], tensor_split: [...] | null,
+//     est_mb, model_path }                                 -- a placement
 //   null                                                    -- alias not in
 //                                                              any node's
 //                                                              catalog OR no
-//                                                              GPU fits
+//                                                              GPU subset fits
 //
-// model_path comes back so the spawn proxy knows the agent-local path
-// without the caller needing to keep separate state.
+// gpu_indices is always non-empty. tensor_split is null for single-GPU
+// placements (no -ts needed) and an array of relative weights for
+// multi-GPU splits. model_path comes back so the spawn proxy knows the
+// agent-local path without the caller needing to keep separate state.
 fn pick_placement_via_alias(alias: string, profile) {
 	let candidates = nodes_with_alias(alias);
 	if (candidates.length == 0) { return null; }
@@ -291,16 +385,18 @@ fn pick_placement_via_alias(alias: string, profile) {
 
 		let hw = parse(n.hardware_json);
 		let gpus = hw?.gpus ?? [];
-		for (gpu in gpus) {
-			if (f64(gpu.free_mb) >= needed_mb) {
-				return {
-					node_id:    cand.node_id,
-					agent_url:  n.agent_url,
-					gpu_index:  gpu.index,
-					est_mb:     needed_mb,
-					model_path: cand.path,
-				};
-			}
+		let subset = pick_gpu_subset(gpus, needed_mb);
+		if (subset != null) {
+			let split = null;
+			if (subset.indices.length > 1) { split = subset.tensor_split; }
+			return {
+				node_id:      cand.node_id,
+				agent_url:    n.agent_url,
+				gpu_indices:  subset.indices,
+				tensor_split: split,
+				est_mb:       needed_mb,
+				model_path:   cand.path,
+			};
 		}
 	}
 	return null;
@@ -347,15 +443,17 @@ fn pick_placement(model_path: string, profile) {
 	for (row in rows) {
 		let hw = parse(row.hardware_json);
 		let gpus = hw?.gpus ?? [];
-		for (gpu in gpus) {
-			if (f64(gpu.free_mb) >= needed_mb) {
-				return {
-					node_id: row.node_id,
-					agent_url: row.agent_url,
-					gpu_index: gpu.index,
-					est_mb: needed_mb,
-				};
-			}
+		let subset = pick_gpu_subset(gpus, needed_mb);
+		if (subset != null) {
+			let split = null;
+			if (subset.indices.length > 1) { split = subset.tensor_split; }
+			return {
+				node_id:      row.node_id,
+				agent_url:    row.agent_url,
+				gpu_indices:  subset.indices,
+				tensor_split: split,
+				est_mb:       needed_mb,
+			};
 		}
 	}
 	return null;
@@ -416,6 +514,7 @@ fn handle_spawn_proxy(req): object {
 	let node_id = payload?.node_id;
 	let gpus = payload?.gpus;
 	let port = payload?.port;
+	let tensor_split = payload?.tensor_split;
 
 	// If the operator didn't pin (node_id, gpus), do capacity-aware
 	// placement. Try alias-driven first (catalog → no FS access on CP);
@@ -458,7 +557,8 @@ fn handle_spawn_proxy(req): object {
 			})};
 		}
 		node_id = pick.node_id;
-		gpus = [pick.gpu_index];
+		gpus = pick.gpu_indices;
+		tensor_split = pick.tensor_split;
 		model = resolved_model;
 		if (port == null) { port = pick_port(pick.agent_url, profile.default_port); }
 	} else {
@@ -479,10 +579,11 @@ fn handle_spawn_proxy(req): object {
 
 	// Forward to the agent (which doesn't need node_id; it knows it's local).
 	let agent_payload = {
-		profile: profile_name,
-		model:   model,
-		port:    port,
-		gpus:    gpus,
+		profile:      profile_name,
+		model:        model,
+		port:         port,
+		gpus:         gpus,
+		tensor_split: tensor_split,
 	};
 	try {
 		let resp = post_json(agent_url + "/services", agent_payload);
@@ -675,14 +776,22 @@ fn auto_spawn(profile_name: string) {
 	}
 	let port = pick_port(pick.agent_url, profile.default_port);
 	let agent_payload = {
-		profile: profile_name,
-		model:   resolved_model,
-		port:    port,
-		gpus:    [pick.gpu_index],
+		profile:      profile_name,
+		model:        resolved_model,
+		port:         port,
+		gpus:         pick.gpu_indices,
+		tensor_split: pick.tensor_split,
 	};
 
+	let gpu_csv = "";
+	let gi = 0;
+	while (gi < pick.gpu_indices.length) {
+		if (gi > 0) { gpu_csv = gpu_csv + ","; }
+		gpu_csv = gpu_csv + pick.gpu_indices[gi];
+		gi = gi + 1;
+	}
 	print("[autospawn] " + profile_name + " on " + pick.node_id
-		+ " gpu=" + pick.gpu_index + " port=" + port);
+		+ " gpus=" + gpu_csv + " port=" + port);
 
 	let spawn_resp = null;
 	try {
