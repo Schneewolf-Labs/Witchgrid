@@ -40,102 +40,12 @@ fn new_id(db): string {
 }
 
 // ── profiles ──────────────────────────────────────────────────────────
-// Encode the Merlina-style defaults. These are the *whole point* of v0.x:
-// no consumer should ever have to remember `--cache-type-k q4_0`.
-//
-// Profiles are now INTENT-based. Each profile declares what it WANTS
-// (context window, KV cache quant, flash attention on/off, etc.) in
-// witchgrid-normalized terms; agent/intent.hml translates those into
-// whatever argv form the LOCAL llama-server binary accepts at spawn
-// time, looking each one up in the parsed --help capabilities. So a
-// profile that asks for `flash_attention: true` works on a 2024-era
-// llama.cpp (`-fa`) AND a 2026-era one (`-fa on`) without edits.
-//
-// extra_flags is the escape hatch — anything we haven't promoted to a
-// named intent (yet) goes there as raw strings, appended verbatim.
-//
-// context + kv_type still appear at the profile top level (duplicated
-// from intent.context / intent.kv_cache_k) because CP's placement math
-// needs them as plain data without round-tripping through the agent.
-//
-// default_model is opt-in. When set, CP's routing API can auto-spawn
-// the profile on first request. Path is per-deployment.
-
-let PROFILES = {
-	// 128K context, 4-bit KV cache (chat hot path; quality unchanged at
-	// this quant for most chat workloads). Single slot — RP models hate
-	// slot-shared sampler state.
-	//
-	// model_alias decouples the profile from any one node's filesystem
-	// layout: at spawn time CP looks up which nodes have this alias in
-	// their catalog and resolves to the right path per node. default_
-	// model is the legacy escape hatch — used only if no node advertises
-	// the alias (e.g. all agents are pre-v0.2 and haven't scanned).
-	"chat-mahou": {
-		binary: "llama-server",
-		intent: {
-			context: 131072,
-			kv_cache_k: "q4_0",
-			kv_cache_v: "q4_0",
-			parallel_slots: 1,
-			gpu_layers: 99,
-			flash_attention: true,
-		},
-		extra_flags: [],
-		// Ports 8080-8090 are de-facto convention space for AI tools
-		// (llama-server default 8080, koboldcpp 5001/8080, oobabooga
-		// 5000/7860, sd-webui 7860, ComfyUI 8188). Witchgrid lands at
-		// 18080+ to dodge collisions on real GPU boxes that already
-		// host one or more of those.
-		default_port: 18080,
-		context: 131072,
-		kv_type: "q4_0",
-		model_alias: "mahou-1.5-mistral-nemo-12b.q5_k_m",
-		// Where to fetch this if no node has it. Used when CP's
-		// /models/distribute resolves an alias to nothing on-disk
-		// across the fleet but the profile names a HF source.
-		// Verify the exact repo/file with the upstream publisher
-		// when bootstrapping a new operator's fleet.
-		hf_source: {
-			repo: "flammenai/Mahou-1.5-mistral-nemo-12B-gguf",
-			file: "Mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
-		},
-		default_model: "/mnt/BALTEUS/gguf_models/mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
-	},
-
-	// CPU profile — Q8 KV (quality > speed for grammar-constrained
-	// design pass), tighter context (designer prompts are short).
-	"designer-cpu": {
-		binary: "llama-server",
-		intent: {
-			context: 8192,
-			kv_cache_k: "q8_0",
-			kv_cache_v: "q8_0",
-		},
-		extra_flags: [],
-		default_port: 18081,
-		context: 8192,
-		kv_type: "q8_0",
-		default_model: null,
-	},
-
-	// Memory pipeline (Phoenix-style): JSON-mode capable, mid-context.
-	"memory-phoenix": {
-		binary: "llama-server",
-		intent: {
-			context: 32768,
-			kv_cache_k: "q4_0",
-			kv_cache_v: "q4_0",
-			gpu_layers: 99,
-			flash_attention: true,
-		},
-		extra_flags: [],
-		default_port: 18085,
-		context: 32768,
-		kv_type: "q4_0",
-		default_model: null,
-	},
-};
+// Profiles live on CP since v0.7 (was a baked-in PROFILES map here
+// pre-v0.7). The agent doesn't know what profiles exist anymore — it
+// just runs whatever profile object CP inlines into the spawn payload.
+// Same intent → argv translation via agent/intent.hml; same capability
+// gating; the only thing that changed is where the source of truth
+// lives.
 
 // ── schema ────────────────────────────────────────────────────────────
 
@@ -244,11 +154,11 @@ let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
 // ── core: spawn ───────────────────────────────────────────────────────
 
-export fn spawn_service(db, profile_name: string, model_path: string, port: i32, gpus, tensor_split, capabilities): object {
-	if (!PROFILES.has(profile_name)) {
-		throw "unknown profile: " + profile_name;
+export fn spawn_service(db, profile_name: string, prof, model_path: string, port: i32, gpus, tensor_split, capabilities): object {
+	if (prof == null) {
+		throw "spawn_service called without a profile object — "
+			+ "v0.7+ requires CP to inline the profile in the spawn payload";
 	}
-	let prof = PROFILES[profile_name];
 
 	// Build full argv: binary + intent-derived flags + extras + spawner-set
 	// model/port/host. capabilities is the parsed --help map for prof.binary
@@ -422,14 +332,20 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 	return {
 		create: fn(req): object {
 			let payload = parse(req.body);
+			// Since v0.7 CP inlines the profile object as `profile`,
+			// with the human-friendly name in `profile_name`. The
+			// agent doesn't have its own PROFILES map anymore.
 			let profile = payload?.profile;
+			let profile_name = payload?.profile_name;
 			let model = payload?.model;
 			if (profile == null || model == null) {
-				return { status: 400, body: "{\"error\":\"profile+model required\"}" };
+				return { status: 400, body: "{\"error\":\"profile+model required (CP must inline profile object since v0.7)\"}" };
 			}
+			if (profile_name == null) { profile_name = "<unnamed>"; }
 			let port = payload?.port;
+			if (port == null) { port = profile?.default_port; }
 			if (port == null) {
-				port = PROFILES[profile].default_port;
+				return { status: 400, body: "{\"error\":\"port required (profile has no default_port)\"}" };
 			}
 			// Refuse to bind on reserved ports. Caller (CP's pick_port)
 			// should never send one of these, but defense in depth.
@@ -445,8 +361,8 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 			let gpus = payload?.gpus ?? [];
 			let tensor_split = payload?.tensor_split;
 			try {
-				let caps = capabilities_for(PROFILES[profile].binary);
-				let svc = spawn_service(db, profile, model, port, gpus, tensor_split, caps);
+				let caps = capabilities_for(profile.binary);
+				let svc = spawn_service(db, profile_name, profile, model, port, gpus, tensor_split, caps);
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
 				// 502 vs 400: a port-bind / missing-model / OOM error from
@@ -473,25 +389,13 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 			}
 			return { status: 204, body: "" };
 		},
+		// /profiles handler removed in v0.7 — profiles live on CP.
+		// agent.hml dropped its registration; this stub stays so the
+		// handlers map shape doesn't break callers expecting `.profiles`.
 		profiles: fn(req): object {
-			// Return the full profile map so CP can use context/kv_type for
-			// placement math, not just names. Skip the binary `flags` array
-			// (the agent's responsibility, not CP's concern) to keep the
-			// payload small.
-			let out = {};
-			let names = PROFILES.keys();
-			for (n in names) {
-				let p = PROFILES[n];
-				out[n] = {
-					default_port: p.default_port,
-					context: p.context,
-					kv_type: p.kv_type,
-					default_model: p.default_model,
-					model_alias:   p?.model_alias,
-					hf_source:     p?.hf_source,
-				};
-			}
-			return { status: 200, body: stringify(out) };
+			return { status: 410, body: stringify({
+				error: "agent /profiles gone in v0.7 — see CP /api/profiles",
+			})};
 		},
 	};
 }

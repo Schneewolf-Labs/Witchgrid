@@ -623,8 +623,15 @@ export fn render_profiles(profiles_data): string {
 			model_cell = "<span class=\"alive-yes\">✓</span> "
 				+ "<code>" + esc(p.default_model) + "</code>";
 		}
+		// __version is stamped by all_profiles_map() since v0.7;
+		// shown as a small annotation so operators can see the
+		// edit count grow.
+		let version_badge = "";
+		if (p?.__version != null) {
+			version_badge = " <span class=\"meta\">v" + p.__version + "</span>";
+		}
 		html = html + "<tr>"
-			+ "<td><strong>" + esc(n) + "</strong></td>"
+			+ "<td><strong>" + esc(n) + "</strong>" + version_badge + "</td>"
 			+ "<td><code>" + p.context + "</code></td>"
 			+ "<td><code>" + esc(p.kv_type) + "</code></td>"
 			+ "<td><code>" + p.default_port + "</code></td>"

@@ -92,6 +92,100 @@ fn init_db(db): null {
 		+ ")", []);
 	exec(db, "create index if not exists ix_samples_lookup "
 		+ "on node_samples(node_id, metric, series, sampled_at)", []);
+
+	// Profiles. CP-owned now (was baked into agent binaries pre-v0.7).
+	// CRUD via /api/profiles[/{name}]; spawns get the full profile JSON
+	// inline so agents don't need to know what profiles exist.
+	// version bumps on every PUT; agents tag their service rows with
+	// the version that was current at spawn time.
+	exec(db, "create table if not exists profiles ("
+		+ "name text primary key,"
+		+ "profile_json text not null,"
+		+ "version integer not null default 1,"
+		+ "created_at text not null,"
+		+ "updated_at text not null"
+		+ ")", []);
+
+	seed_default_profiles(db);
+	return null;
+}
+
+// Built-in profile defaults. Seeded into the profiles table on first
+// CP boot (when the table is empty). After that, the operator owns
+// the set — edits via the dashboard don't get clobbered by a CP
+// restart. To re-seed, drop the rows manually and restart.
+fn seed_default_profiles(db): null {
+	let r = query(db, "select count(*) as n from profiles", []);
+	if (r[0].n > 0) { return null; }
+
+	let now = iso_now();
+	let defaults = [
+		{
+			name: "chat-mahou",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 131072,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18080,
+				context: 131072,
+				kv_type: "q4_0",
+				model_alias: "mahou-1.5-mistral-nemo-12b.q5_k_m",
+				hf_source: {
+					repo: "flammenai/Mahou-1.5-mistral-nemo-12B-gguf",
+					file: "Mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
+				},
+				default_model: "/mnt/BALTEUS/gguf_models/mahou-1.5-mistral-nemo-12b.Q5_K_M.gguf",
+			},
+		},
+		{
+			name: "designer-cpu",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 8192,
+					kv_cache_k: "q8_0",
+					kv_cache_v: "q8_0",
+				},
+				extra_flags: [],
+				default_port: 18081,
+				context: 8192,
+				kv_type: "q8_0",
+				default_model: null,
+			},
+		},
+		{
+			name: "memory-phoenix",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18085,
+				context: 32768,
+				kv_type: "q4_0",
+				default_model: null,
+			},
+		},
+	];
+	for (d in defaults) {
+		exec(db,
+			"insert into profiles (name, profile_json, version, created_at, updated_at) "
+			+ "values (?, ?, 1, ?, ?)",
+			[d.name, stringify(d.profile), now, now]);
+	}
+	print("[cp] seeded " + defaults.length + " default profiles");
 	return null;
 }
 
@@ -239,23 +333,14 @@ fn list_all_agents(): array {
 // flammen.ai actually has a model that needs more VRAM than any single
 // card on the fleet.
 
-// Fetch a profile's metadata (context, kv_type, default_port) from any
-// registered agent. Profiles are baked into the agent binary today, so
-// asking the first reachable agent is fine. Returns null if no agent is
-// reachable or the profile name isn't known.
+// fetch_profile: pre-v0.7 fan-out across agents (asking each agent's
+// /profiles endpoint) is gone. Profiles live in CP's table now.
+// Use fetch_profile_by_name() instead — it queries our own DB and
+// returns the profile object with __name + __version stamped.
+//
+// Kept as a thin alias so existing callers don't all need touching.
 fn fetch_profile(profile_name: string) {
-	let agents = list_all_agents();
-	for (a in agents) {
-		try {
-			let resp = get(a.agent_url + "/profiles", null);
-			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
-			let profiles = parse(resp.body);
-			if (profiles.has(profile_name)) {
-				return profiles[profile_name];
-			}
-		} catch (e) { }
-	}
-	return null;
+	return fetch_profile_by_name(profile_name);
 }
 
 // Tensor-parallel overhead headroom. llama.cpp spreads weights across
@@ -554,16 +639,21 @@ fn handle_spawn_proxy(req): object {
 	let port = payload?.port;
 	let tensor_split = payload?.tensor_split;
 
+	// Profile is needed in both branches (placement reads context/
+	// kv_type/default_port/etc., and we need to inline the full thing
+	// into the agent_payload regardless). Fetch once.
+	let profile = fetch_profile_by_name(profile_name);
+	if (profile == null) {
+		return { status: 400, body: stringify({
+			error: "unknown profile: " + profile_name
+				+ " (PUT /api/profiles/" + profile_name + " to create)",
+		})};
+	}
+
 	// If the operator didn't pin (node_id, gpus), do capacity-aware
 	// placement. Try alias-driven first (catalog → no FS access on CP);
 	// fall back to path-driven if no alias resolves.
 	if (node_id == null || gpus == null) {
-		let profile = fetch_profile(profile_name);
-		if (profile == null) {
-			return { status: 400, body: stringify({
-				error: "unknown profile (no agent advertises it): " + profile_name,
-			})};
-		}
 
 		let pick = null;
 		// Prefer explicit model: from the request, then alias, then default_model.
@@ -615,8 +705,13 @@ fn handle_spawn_proxy(req): object {
 	}
 
 	// Forward to the agent (which doesn't need node_id; it knows it's local).
+	// `profile` is the inline JSON object — agents don't have their own
+	// PROFILES map anymore (since v0.7), they just run what we hand them.
+	// `profile_name` is kept on the wire so service rows / logs / dashboard
+	// show the human-friendly identifier.
 	let agent_payload = {
-		profile:      profile_name,
+		profile_name: profile_name,
+		profile:      profile,
 		model:        model,
 		port:         port,
 		gpus:         gpus,
@@ -823,7 +918,8 @@ fn auto_spawn(profile_name: string) {
 	}
 	let port = pick_port(pick.agent_url, profile.default_port);
 	let agent_payload = {
-		profile:      profile_name,
+		profile_name: profile_name,
+		profile:      profile,
 		model:        resolved_model,
 		port:         port,
 		gpus:         pick.gpu_indices,
@@ -1003,29 +1099,11 @@ fn handle_ui_services(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
-// Aggregate /profiles across all reachable agents; first-seen wins on
-// name collisions. Used by both the JSON /profiles endpoint (for the
-// dashboard's spawn form) and the HTML /ui/profiles fragment.
-fn aggregated_profiles(): object {
-	let agents = list_all_agents();
-	let merged = {};
-	for (a in agents) {
-		try {
-			let resp = get(a.agent_url + "/profiles", null);
-			if (resp.status_code >= 200 && resp.status_code < 300) {
-				let profiles = parse(resp.body);
-				let names = profiles.keys();
-				for (n in names) {
-					if (!merged.has(n)) { merged[n] = profiles[n]; }
-				}
-			}
-		} catch (e) { }
-	}
-	return merged;
-}
-
+// Profiles live in CP's table since v0.7. all_profiles_map() (defined
+// near the CRUD handlers below) returns the same shape that the
+// agent-fan-out used to return — name → profile object.
 fn handle_ui_profiles(req): object {
-	return { status: 200, body: render_profiles(aggregated_profiles()),
+	return { status: 200, body: render_profiles(all_profiles_map()),
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
@@ -1116,7 +1194,7 @@ fn handle_ui_transfers(req): object {
 // no node has on disk. Each row carries known_sources + the profiles
 // that reference it so the UI can render an actionable hint.
 fn missing_models(): array {
-	let profiles = aggregated_profiles();
+	let profiles = all_profiles_map();
 	let names = profiles.keys();
 	let aliases_to_profiles = {};
 	for (n in names) {
@@ -1181,7 +1259,7 @@ fn known_sources_for(alias: string, target_node) {
 	// HF: scan aggregated profiles for any that name this alias and
 	// include an hf_source. Same alias may show up in multiple
 	// profiles; first match wins.
-	let profiles = aggregated_profiles();
+	let profiles = all_profiles_map();
 	let names = profiles.keys();
 	for (n in names) {
 		let p = profiles[n];
@@ -1284,6 +1362,155 @@ fn aggregated_transfers(): array {
 
 fn handle_list_transfers(req): object {
 	return { status: 200, body: stringify(aggregated_transfers()) };
+}
+
+// ── profile CRUD ─────────────────────────────────────────────────
+//
+// Profiles live in CP's sqlite (since v0.7). Spawn flow inlines the
+// full profile JSON into the agent_payload — agents don't need to
+// know what profiles exist, they just run what CP tells them.
+
+// Returns the parsed profile object for `name`, or null if absent.
+// Used by spawn/auto_spawn to inline profile data into agent calls.
+fn fetch_profile_by_name(name: string) {
+	let r = query(DB,
+		"select profile_json, version from profiles where name = ?",
+		[name]);
+	if (r.length == 0) { return null; }
+	let p = parse(r[0].profile_json);
+	p["__name"] = name;
+	p["__version"] = r[0].version;
+	return p;
+}
+
+// Map of name → profile object (with __name + __version stamped),
+// for callers that want the full set (dashboard, spawn form).
+fn all_profiles_map(): object {
+	let rows = query(DB,
+		"select name, profile_json, version from profiles order by name asc",
+		[]);
+	let out = {};
+	for (row in rows) {
+		let p = parse(row.profile_json);
+		p["__name"] = row.name;
+		p["__version"] = row.version;
+		out[row.name] = p;
+	}
+	return out;
+}
+
+fn handle_list_profiles_v2(req): object {
+	return { status: 200, body: stringify(all_profiles_map()) };
+}
+
+fn handle_get_profile(req): object {
+	// req.path = "/api/profiles/{name}" — strip prefix to get name.
+	let prefix = "/api/profiles/";
+	let name = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (name.length == 0) {
+		return { status: 400, body: "{\"error\":\"profile name required\"}" };
+	}
+	let p = fetch_profile_by_name(name);
+	if (p == null) {
+		return { status: 404, body: stringify({ error: "no such profile: " + name }) };
+	}
+	return { status: 200, body: stringify(p) };
+}
+
+// POST /api/profiles  body: { name, profile: {...} }
+// Refuses if name is taken; use PUT to update.
+fn handle_create_profile(req): object {
+	let payload = null;
+	try { payload = parse(req.body); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	let name = payload?.name;
+	let profile = payload?.profile;
+	if (name == null || profile == null) {
+		return { status: 400, body: "{\"error\":\"name + profile required\"}" };
+	}
+	let existing = query(DB, "select name from profiles where name = ?", [name]);
+	if (existing.length > 0) {
+		return { status: 409, body: stringify({
+			error: "profile '" + name + "' already exists; PUT to update",
+		})};
+	}
+	let now = iso_now();
+	exec(DB,
+		"insert into profiles (name, profile_json, version, created_at, updated_at) "
+		+ "values (?, ?, 1, ?, ?)",
+		[name, stringify(profile), now, now]);
+	return { status: 201, body: stringify({ name: name, version: 1 }) };
+}
+
+// PUT /api/profiles/{name}  body: profile object (the full thing)
+// Bumps version. Existing services keep their old profile (no auto-restart);
+// next spawn picks up the new version.
+fn handle_update_profile(req): object {
+	let prefix = "/api/profiles/";
+	let name = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (name.length == 0) {
+		return { status: 400, body: "{\"error\":\"profile name required\"}" };
+	}
+	let profile = null;
+	try { profile = parse(req.body); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	if (profile == null) {
+		return { status: 400, body: "{\"error\":\"profile body required\"}" };
+	}
+	let existing = query(DB,
+		"select version from profiles where name = ?", [name]);
+	if (existing.length == 0) {
+		return { status: 404, body: stringify({ error: "no such profile: " + name }) };
+	}
+	let new_version = existing[0].version + 1;
+	let now = iso_now();
+	exec(DB,
+		"update profiles set profile_json = ?, version = ?, updated_at = ? "
+		+ "where name = ?",
+		[stringify(profile), new_version, now, name]);
+	return { status: 200, body: stringify({ name: name, version: new_version }) };
+}
+
+// DELETE /api/profiles/{name}
+// Refuses if any agent has an alive service running this profile —
+// avoids leaving running services with no metadata. Operator stops
+// the services first.
+fn handle_delete_profile(req): object {
+	let prefix = "/api/profiles/";
+	let name = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (name.length == 0) {
+		return { status: 400, body: "{\"error\":\"profile name required\"}" };
+	}
+	let existing = query(DB, "select name from profiles where name = ?", [name]);
+	if (existing.length == 0) {
+		return { status: 404, body: stringify({ error: "no such profile: " + name }) };
+	}
+	// Check fleet for live services using this profile.
+	let agents = list_all_agents();
+	let in_use = [];
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/services", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let services = parse(resp.body);
+				for (s in services) {
+					if (s?.profile == name && s?.alive == true) {
+						in_use.push(a.node_id);
+					}
+				}
+			}
+		} catch (e) { }
+	}
+	if (in_use.length > 0) {
+		return { status: 409, body: stringify({
+			error: "profile '" + name + "' has live services on: "
+				+ in_use.join(", ") + ". Stop them first.",
+		})};
+	}
+	exec(DB, "delete from profiles where name = ?", [name]);
+	return { status: 204, body: "" };
 }
 
 // Fetch the last N samples for one (node, metric, series) ordered
@@ -1394,12 +1621,9 @@ fn handle_ui_stats(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
-// JSON profiles endpoint — for the dashboard's Alpine-driven spawn form
-// (profile dropdown auto-fills the model field from the profile's
-// default_model). Same shape the agents return, but merged.
-fn handle_list_profiles(req): object {
-	return { status: 200, body: stringify(aggregated_profiles()) };
-}
+// (handle_list_profiles removed — replaced by handle_list_profiles_v2
+// which reads from CP's own profiles table since v0.7. Spawn form
+// fetches /api/profiles, which routes to v2 directly.)
 
 // Static assets — HTML shell + CSS + JS + logo, all baked into the
 // binary at build time via scripts/embed_assets.sh. Served with a
@@ -1466,7 +1690,13 @@ fn main(): null {
 		// human-facing pages now own /catalog, /transfers, /profiles
 		// at the URL roots. Spawn form's onProfileChange() fetch
 		// updated to match.
-		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles },
+		// Profiles CRUD lives under /api/profiles[/{name}] since v0.7
+		// (CP-owned storage, was baked into agent binaries before).
+		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2 },
+		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
+		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile },
+		{ method: "PUT",  path: "/api/profiles/",   prefix: true, handler: handle_update_profile },
+		{ method: "DELETE", path: "/api/profiles/", prefix: true, handler: handle_delete_profile },
 		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog },
 		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog },
 		{ method: "POST", path: "/models/distribute", handler: handle_distribute },
