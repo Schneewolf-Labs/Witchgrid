@@ -20,10 +20,14 @@ on:
 #           inline arithmetic in concat stringifies correctly. The
 #           dashboard sparkline coords + per-GPU bar width % depend on
 #           f64 string precision; pre-2.3 they truncated to integer.
-#           Also: new @stdlib/http.stream() for SSE responses (not yet
-#           used; v0.4 routing proxy will pick it up for stream:true).
+#   2.3.1 — @stdlib/http.download_streaming() for bounded-memory peer
+#           pulls of large GGUFs (agent/transfers.hml). Pre-2.3.1 had
+#           to buffer the entire response via get_binary; would pinch
+#           on 40 GB+ models. Also fixes @stdlib/http.download() which
+#           silently wrote 0 bytes in compiled binaries. v0.4 routing
+#           proxy will use stream() / read_binary() for SSE passthrough.
 env:
-  HEMLOCK_VERSION: 2.3.0
+  HEMLOCK_VERSION: 2.3.1
 
 jobs:
   build:

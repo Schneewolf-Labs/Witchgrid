@@ -17,14 +17,13 @@
 //                  repo's enabled, handles auth + retries + chunk dedup.
 //                  Witchgrid never touches HF protocol bytes directly.
 //
-// Memory note: the peer path uses @stdlib/http.get_binary which
-// buffers the whole response before returning. For a 40 GB Saoirse
-// pull that's a lot. Move to a streaming write_to_file API once
-// Hemlock's stdlib exposes one (or a real consumer hits the limit).
+// Memory: peer pulls use @stdlib/http.download_streaming (Hemlock
+// 2.3.1+) which writes chunks straight to disk — bounded memory at
+// any model size.
 
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
-import { get_binary } from "@stdlib/http";
+import { download_streaming } from "@stdlib/http";
 import { file_stat, exists, remove_file, rename } from "@stdlib/fs";
 import { exec_argv } from "@stdlib/process";
 
@@ -70,7 +69,11 @@ export fn target_path_for(canonical_dir: string, alias: string): string {
 // to target.partial, atomic rename to target on success. Updates the
 // DB row at start, on success, on failure.
 //
-// Buffered (not streaming) — see module-header note.
+// Hemlock 2.3.1 download_streaming() handles the .partial + atomic
+// rename internally and chunks straight to disk — bounded memory
+// regardless of model size. Previous implementation buffered the
+// whole response via get_binary (worked for ≤ 8 GB on schneewolf;
+// would pinch at 40 GB Saoirse).
 async fn pull_peer_task(db, transfer_id: string, source_url: string,
                         target: string): null {
 	let partial = target + ".partial";
@@ -78,28 +81,7 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 		"update model_transfers set status='downloading' where id=?",
 		[transfer_id]);
 	try {
-		let resp = get_binary(source_url, null);
-		// get_binary returns { status_code, headers, body } where body
-		// is the buffer. Anything other than 2xx → fail loud.
-		if (resp.status_code < 200 || resp.status_code >= 300) {
-			throw "HTTP " + resp.status_code + " from " + source_url;
-		}
-		let buf = resp.body;
-		if (buf == null || buf.length == 0) {
-			throw "empty response body from " + source_url;
-		}
-		// Write to .partial then atomic rename so a crashed pull
-		// doesn't leave a half-file masquerading as a complete model.
-		//
-		// Buffer write only works via __open + write_bytes — the @stdlib
-		// wrappers (write_file, file.write) only accept strings, both
-		// in the interpreter and the compiled binary. compression.hml
-		// uses this same pattern for gzip output.
-		if (exists(partial)) { try { remove_file(partial); } catch (e) { } }
-		let out = __open(partial, "w");
-		out.write_bytes(buf);
-		out.close();
-		rename(partial, target);
+		let r = download_streaming(source_url, target);
 		let stat = file_stat(target);
 		let now = iso_now(db);
 		db_exec(db,
@@ -107,14 +89,15 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 			+ "set status='complete', bytes_downloaded=?, bytes_total=?, completed_at=? "
 			+ "where id=?",
 			[stat.size, stat.size, now, transfer_id]);
-		print("[transfer] " + transfer_id + " complete: " + target + " (" + stat.size + " bytes)");
+		print("[transfer] " + transfer_id + " complete: " + target
+			+ " (" + stat.size + " bytes, status " + r.status_code + ")");
 	} catch (e) {
 		let msg = "" + e;
 		db_exec(db,
 			"update model_transfers set status='error', error=? where id=?",
 			[msg, transfer_id]);
-		// Best-effort cleanup of the .partial — don't let half-files
-		// confuse the next scan.
+		// download_streaming cleans up its own .partial on success but
+		// not on every failure mode — best-effort sweep.
 		try { if (exists(partial)) { remove_file(partial); } } catch (ee) { }
 		eprint("[transfer] " + transfer_id + " failed: " + msg);
 	}
