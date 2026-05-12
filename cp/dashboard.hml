@@ -53,13 +53,102 @@ fn fmt_mb(mb): string {
 	return "" + i32(n) + " MB";
 }
 
-// CSS color token from VRAM utilization. Used for the free-mb bars —
-// green when plenty free, amber when tight, red when nearly full.
-fn vram_color(free_mb, total_mb): string {
-	let pct = (f64(free_mb) / f64(total_mb)) * 100.0;
-	if (pct >= 50.0) { return "var(--pico-color-green-500)"; }
-	if (pct >= 15.0) { return "var(--pico-color-amber-500)"; }
-	return "var(--pico-color-red-500)";
+// CSS class token from utilization — used for both the bar fill and
+// the matching sparkline color so they read as one element.
+//   bar-ok / spark-ok    : > 50% free
+//   bar-warn / spark-warn: 15-50% free
+//   bar-err / spark-err  : < 15% free
+fn util_class(free, total): string {
+	if (total <= 0) { return "warn"; }
+	let pct = (f64(free) / f64(total)) * 100.0;
+	if (pct >= 50.0) { return "ok"; }
+	if (pct >= 15.0) { return "warn"; }
+	return "err";
+}
+
+// ── server-rendered SVG sparkline ────────────────────────────────
+//
+// Single-color filled-area sparkline. Pure inline SVG so it ships
+// with the same HTMX fragment as the rest of the row — no client
+// chart lib, no separate fetch, no flicker on swap.
+//
+// values: array of i32 / i64 samples, oldest first
+// total: max value for normalization (e.g. gpu.total_mb so all GPUs
+//        share the same y-scale across sparklines)
+// kind: "ok" | "warn" | "err" → CSS class controlling stroke + fill
+fn render_sparkline(values, total, kind: string): string {
+	// Empty / single-point series → just an axis hint, no path.
+	if (values == null || values.length < 2) {
+		return "<svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 200 24\" preserveAspectRatio=\"none\">"
+			+ "<line class=\"axis\" x1=\"0\" y1=\"23.5\" x2=\"200\" y2=\"23.5\"/>"
+			+ "</svg>";
+	}
+
+	let w = 200;
+	let h = 24;
+	let n = values.length;
+	let denom: f64 = f64(total);
+	if (denom <= 0.0) { denom = 1.0; }
+
+	// Build the path: M x0,y0 L x1,y1 L ...
+	// y axis: 0 = top of chart, h = bottom. We invert so high values
+	// (more free MB) draw higher on the chart.
+	//
+	// SVG accepts integer coordinates fine at this resolution; rounding
+	// to integer pixels also dodges Hemlock's i32-in-string-concat quirk
+	// (operator precedence makes inline arithmetic stringify oddly when
+	// chained with + on strings).
+	let path = "";
+	let i = 0;
+	while (i < n) {
+		let x: f64 = (f64(i) * f64(w - 2)) / f64(n - 1) + 1.0;
+		let v: f64 = f64(values[i]);
+		let frac: f64 = v / denom;
+		if (frac < 0.0) { frac = 0.0; }
+		if (frac > 1.0) { frac = 1.0; }
+		let y: f64 = f64(h) - (frac * f64(h - 2)) - 1.0;
+		let xi: i32 = i32(x);
+		let yi: i32 = i32(y);
+		if (i == 0) { path = "M" + xi + "," + yi; }
+		else        { path = path + " L" + xi + "," + yi; }
+		i = i + 1;
+	}
+	// Area path = stroke path + bottom-right corner + bottom-left corner + close.
+	let area = path + " L" + (w - 1) + "," + (h - 1) + " L1," + (h - 1) + " Z";
+
+	return "<svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 " + w + " " + h
+		+ "\" preserveAspectRatio=\"none\">"
+		+ "<line class=\"axis\" x1=\"0\" y1=\"" + (h - 0) + "\" x2=\"" + w + "\" y2=\"" + (h - 0) + "\"/>"
+		+ "<path class=\"area\" d=\"" + area + "\"/>"
+		+ "<path class=\"line\" d=\"" + path + "\"/>"
+		+ "</svg>";
+}
+
+// ── render_stats: top-of-page summary tiles ──────────────────────
+//
+// stats: { nodes, nodes_live, total_gpus, vram_free_mb, vram_total_mb,
+//          catalog_models, catalog_total_mb, services_running }
+export fn render_stats(stats): string {
+	let vram_pct = 0;
+	if (stats.vram_total_mb > 0) {
+		vram_pct = i32((f64(stats.vram_free_mb) * 100.0) / f64(stats.vram_total_mb));
+	}
+	let html = "<div class=\"stats\">"
+		+ "<div class=\"stat\"><p class=\"stat-label\">nodes live</p>"
+			+ "<p class=\"stat-value\">" + stats.nodes_live
+			+ "<span class=\"unit\">/ " + stats.nodes + "</span></p></div>"
+		+ "<div class=\"stat\"><p class=\"stat-label\">GPUs</p>"
+			+ "<p class=\"stat-value\">" + stats.total_gpus + "</p></div>"
+		+ "<div class=\"stat\"><p class=\"stat-label\">VRAM free</p>"
+			+ "<p class=\"stat-value\">" + fmt_mb(stats.vram_free_mb)
+			+ "<span class=\"unit\">" + vram_pct + "%</span></p></div>"
+		+ "<div class=\"stat\"><p class=\"stat-label\">catalog</p>"
+			+ "<p class=\"stat-value\">" + stats.catalog_models
+			+ "<span class=\"unit\">" + fmt_mb(stats.catalog_total_mb) + "</span></p></div>"
+		+ "<div class=\"stat\"><p class=\"stat-label\">services</p>"
+			+ "<p class=\"stat-value\">" + stats.services_running + "</p></div>"
+		+ "</div>";
+	return html;
 }
 
 // ── /ui/nodes fragment ───────────────────────────────────────────────
@@ -69,22 +158,29 @@ fn vram_color(free_mb, total_mb): string {
 //                           gpus: [...], disks: [...] },
 //               agent_url, registered_at, last_seen_at, age_seconds}]
 //
+// samples_by_node: { node_id → { gpu: { idx_str → [vals...] },
+//                                ram: [vals...],
+//                                disk: { path → [vals...] } } }
+//
 // Each row gets a clickable expander (<details>) revealing the full
-// hardware breakdown — CPU cores, RAM, per-disk capacity. Default
-// collapsed so the table stays dense for fleets > 3 nodes.
-export fn render_nodes(nodes_data, stale_seconds: i32): string {
+// hardware breakdown — CPU cores, RAM, per-disk capacity, all with
+// 30-min sparklines. Default collapsed so the table stays dense for
+// fleets > 3 nodes.
+export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
 	}
 	let html = "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>node</th><th>role</th><th>last seen</th>"
-		+ "<th>GPUs (free / total)</th>"
+		+ "<th>GPUs (free / total · 30 min trend)</th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (n in nodes_data) {
 		let stale = n.age_seconds > stale_seconds;
 		let last_class = "";
 		if (stale) { last_class = " class=\"stale\""; }
+
+		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
 
 		// Top row: identity + GPUs (the "what's hot" view).
 		let hw = n.hardware ?? {};
@@ -100,22 +196,24 @@ export fn render_nodes(nodes_data, stale_seconds: i32): string {
 		} else {
 			for (g in gpus) {
 				let pct = (f64(g.free_mb) / f64(g.total_mb)) * 100.0;
-				let color = vram_color(g.free_mb, g.total_mb);
+				let kind = util_class(g.free_mb, g.total_mb);
+				let series = bundle?.gpu?["" + g.index] ?? [];
 				html = html + "<div class=\"gpu-row\">"
 					+ "<span class=\"gpu-name\">[" + g.index + "] "
 						+ esc(g.name) + "</span>"
-					+ "<div class=\"gpu-bar\"><div style=\"width: "
-						+ pct + "%; background: " + color + ";\"></div></div>"
+					+ "<div class=\"gpu-bar\"><div class=\"bar-" + kind
+						+ "\" style=\"width: " + pct + "%;\"></div></div>"
 					+ "<span class=\"gpu-mem\">" + fmt_mb(g.free_mb)
 						+ " / " + fmt_mb(g.total_mb) + "</span>"
-					+ "</div>";
+					+ "</div>"
+					+ render_sparkline(series, g.total_mb, kind);
 			}
 		}
 		html = html + "</td></tr>\n";
 
 		// Hardware expander row — sub-row spanning all columns. Holds CPU,
-		// RAM, and per-disk capacity. Collapsed by default; one click to
-		// inspect.
+		// RAM, and per-disk capacity, each with their own sparkline.
+		// Collapsed by default; one click to inspect.
 		let cpu_cores = hw?.cpu_cores;
 		let ram_total = hw?.ram_total_mb;
 		let ram_free  = hw?.ram_free_mb;
@@ -132,9 +230,12 @@ export fn render_nodes(nodes_data, stale_seconds: i32): string {
 				if (ram_free != null && ram_total > 0) {
 					ram_pct = (f64(ram_free) / f64(ram_total)) * 100.0;
 				}
+				let ram_kind = util_class(ram_free, ram_total);
 				html = html + "<dt>RAM</dt><dd>"
 					+ fmt_mb(ram_free) + " free / " + fmt_mb(ram_total)
-					+ " <span class=\"meta\">(" + i32(ram_pct) + "% free)</span></dd>";
+					+ " <span class=\"meta\">(" + i32(ram_pct) + "% free)</span>"
+					+ render_sparkline(bundle?.ram ?? [], ram_total, ram_kind)
+					+ "</dd>";
 			}
 			if (disks.length > 0) {
 				html = html + "<dt>Storage</dt><dd>";
@@ -145,9 +246,11 @@ export fn render_nodes(nodes_data, stale_seconds: i32): string {
 					} else {
 						role_badge = " <span class=\"badge badge-scan\">scan</span>";
 					}
+					let disk_kind = util_class(d.free_mb, d.total_mb);
 					html = html + "<div class=\"disk-row\">"
 						+ "<code>" + esc(d.path) + "</code>" + role_badge
 						+ " — " + fmt_mb(d.free_mb) + " free / " + fmt_mb(d.total_mb)
+						+ render_sparkline(bundle?.disk?[d.path] ?? [], d.total_mb, disk_kind)
 						+ "</div>";
 				}
 				html = html + "</dd>";

@@ -5,6 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>witchgrid</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
+
+  <!-- Pre-paint theme apply to avoid FOUC. Reads localStorage and
+       sets data-theme on <html> before any CSS evaluates. -->
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('witchgrid-theme'); } catch (e) {}
+      if (t !== 'light' && t !== 'dark') { t = 'dark'; }
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   <link rel="stylesheet" href="/assets/styles.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
@@ -12,12 +24,22 @@
   <script src="/assets/spawn_form.js"></script>
 </head>
 <body>
-  <main>
-    <div class="brand">
-      <img src="/assets/logo.svg" alt="witchgrid">
-      <h1>witchgrid</h1>
+  <main x-data="themeToggle()">
+    <div class="topbar">
+      <div class="brand">
+        <img src="/assets/logo.svg" alt="witchgrid">
+        <h1>witchgrid<span class="cursor">_</span></h1>
+      </div>
+      <button class="theme-toggle" @click="toggle()" :title="theme === 'dark' ? 'switch to light' : 'switch to dark'">
+        <span x-text="theme === 'dark' ? '☀' : '☾'"></span>
+      </button>
     </div>
-    <p class="meta">control plane · live every 5s</p>
+
+    <div hx-get="/ui/stats" hx-trigger="load, every 5s" class="stats-wrap">
+      <div class="stats">
+        <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>
+      </div>
+    </div>
 
     <section>
       <h2>Spawn</h2>
@@ -32,7 +54,7 @@
           </select>
         </div>
         <div>
-          <label for="mdl">model path <span class="meta">(optional — profile alias resolves via catalog if blank)</span></label>
+          <label for="mdl">model path <span class="meta">(optional — alias resolves via catalog if blank)</span></label>
           <input id="mdl" type="text" x-model="model" placeholder="/path/to/model.gguf or leave blank for catalog">
         </div>
         <button type="submit" :disabled="busy" x-text="busy ? '…' : 'spawn'"></button>
@@ -60,7 +82,7 @@
 
     <section>
       <h2>Catalog</h2>
-      <p class="meta" style="margin-left:0">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time.</p>
+      <p class="meta" style="margin: 0 0 0.5rem 0">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time.</p>
       <div hx-get="/ui/catalog" hx-trigger="load, every 30s">loading…</div>
     </section>
 
@@ -71,7 +93,7 @@
 
     <section>
       <h2>Capabilities</h2>
-      <p class="meta" style="margin-left:0">What flags each agent's binaries actually support. Refreshed when an agent restarts.</p>
+      <p class="meta" style="margin: 0 0 0.5rem 0">What flags each agent's binaries actually support. Refreshed when an agent restarts.</p>
       <div hx-get="/ui/capabilities" hx-trigger="load, every 30s">loading…</div>
     </section>
   </main>

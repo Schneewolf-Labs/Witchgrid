@@ -35,7 +35,7 @@ import { sleep } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
-import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
+import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, SHELL_HTML, SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
@@ -74,8 +74,29 @@ fn init_db(db): null {
 		+ "primary key (node_id, alias)"
 		+ ")", []);
 	exec(db, "create index if not exists ix_node_models_alias on node_models(alias)", []);
+
+	// Hardware time-series for sparklines. One row per (metric, series)
+	// per heartbeat. Pruned to last 1hr each ingest. Tiny table —
+	// 1 node × (4 GPUs + 1 RAM + N disks) × 120 samples ≈ 700 rows.
+	//
+	//   metric: 'gpu_free_mb' | 'ram_free_mb' | 'disk_free_mb'
+	//   series: gpu_index as text, disk path, or null for ram
+	exec(db, "create table if not exists node_samples ("
+		+ "node_id text not null,"
+		+ "metric text not null,"
+		+ "series text,"
+		+ "value integer not null,"
+		+ "sampled_at text not null"
+		+ ")", []);
+	exec(db, "create index if not exists ix_samples_lookup "
+		+ "on node_samples(node_id, metric, series, sampled_at)", []);
 	return null;
 }
+
+// How long we keep hardware samples. 1 hour at 30s heartbeat = 120
+// samples per (node, metric, series) — tiny on disk, plenty for the
+// dashboard's 30-min sparkline window with headroom.
+let SAMPLE_RETENTION_SECONDS = 3600;
 
 fn iso_now(): string {
 	let r = query(DB, "select datetime('now') as ts", []);
@@ -125,6 +146,33 @@ fn handle_register(req): object {
 				 m?.general_name, m?.source_url]);
 		}
 	}
+
+	// Hardware time-series ingest. One row per metric per heartbeat;
+	// the dashboard renders sparklines from these. Prune > 1hr at the
+	// same time so the table stays bounded without a separate cron.
+	let hw = payload?.hardware ?? {};
+	if (hw?.gpus != null) {
+		for (g in hw.gpus) {
+			exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+				+ "values (?, 'gpu_free_mb', ?, ?, ?)",
+				[node_id, "" + g.index, g.free_mb, now]);
+		}
+	}
+	if (hw?.ram_free_mb != null) {
+		exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+			+ "values (?, 'ram_free_mb', null, ?, ?)",
+			[node_id, hw.ram_free_mb, now]);
+	}
+	if (hw?.disks != null) {
+		for (d in hw.disks) {
+			exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+				+ "values (?, 'disk_free_mb', ?, ?, ?)",
+				[node_id, d.path, d.free_mb, now]);
+		}
+	}
+	exec(DB, "delete from node_samples where node_id = ? "
+		+ "and sampled_at < datetime('now', ?)",
+		[node_id, "-" + SAMPLE_RETENTION_SECONDS + " seconds"]);
 
 	return { status: 200, body: stringify({
 		node_id: node_id, registered_at: now, welcome: "joined the grid",
@@ -733,7 +781,9 @@ fn nodes_for_dashboard(): array {
 }
 
 fn handle_ui_nodes(req): object {
-	let body = render_nodes(nodes_for_dashboard(), STALE_NODE_SECONDS);
+	let nodes = nodes_for_dashboard();
+	let samples = samples_for_dashboard(nodes);
+	let body = render_nodes(nodes, samples, STALE_NODE_SECONDS);
 	return { status: 200, body: body,
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
@@ -862,6 +912,114 @@ fn handle_ui_catalog(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
+// Fetch the last N samples for one (node, metric, series) ordered
+// oldest → newest, for sparkline rendering. Returns an array of i32
+// values. Empty array when there's no history yet (just-registered
+// node, or before the next heartbeat lands).
+fn fetch_samples(node_id: string, metric: string, series, limit: i32): array {
+	let rows = null;
+	if (series == null) {
+		rows = query(DB,
+			"select value from node_samples "
+			+ "where node_id = ? and metric = ? and series is null "
+			+ "order by sampled_at desc limit ?",
+			[node_id, metric, limit]);
+	} else {
+		rows = query(DB,
+			"select value from node_samples "
+			+ "where node_id = ? and metric = ? and series = ? "
+			+ "order by sampled_at desc limit ?",
+			[node_id, metric, series, limit]);
+	}
+	// Reverse to oldest-first for the sparkline path.
+	let out = [];
+	let i = rows.length - 1;
+	while (i >= 0) { out.push(rows[i].value); i = i - 1; }
+	return out;
+}
+
+// Build the samples-per-node map the dashboard needs to render
+// sparklines inline with the nodes table. Shape:
+//   { node_id → {
+//       gpu: { idx_str → [values...] },
+//       ram: [values...],
+//       disk: { path → [values...] },
+//   }}
+// SAMPLE_HISTORY_POINTS is the visual history length. 60 points at
+// 30s heartbeat = 30 minutes of context — enough to see a load
+// pattern emerge without overwhelming a 200px-wide sparkline.
+let SAMPLE_HISTORY_POINTS = 60;
+
+fn samples_for_dashboard(nodes_data): object {
+	let out = {};
+	for (n in nodes_data) {
+		let bundle = { gpu: {}, ram: [], disk: {} };
+		let gpus = n.hardware?.gpus ?? [];
+		for (g in gpus) {
+			bundle.gpu["" + g.index] = fetch_samples(n.node_id,
+				"gpu_free_mb", "" + g.index, SAMPLE_HISTORY_POINTS);
+		}
+		bundle.ram = fetch_samples(n.node_id, "ram_free_mb", null,
+			SAMPLE_HISTORY_POINTS);
+		let disks = n.hardware?.disks ?? [];
+		for (d in disks) {
+			bundle.disk[d.path] = fetch_samples(n.node_id,
+				"disk_free_mb", d.path, SAMPLE_HISTORY_POINTS);
+		}
+		out[n.node_id] = bundle;
+	}
+	return out;
+}
+
+// ── stats strip ──────────────────────────────────────────────────
+// Top-of-page summary tiles. Pure aggregation over the existing
+// /nodes + /catalog data, plus a fan-out to agents for service count.
+fn compute_stats(): object {
+	let agents = list_all_agents();
+	let total_gpus = 0;
+	let total_vram_free_mb: i64 = 0;
+	let total_vram_mb: i64 = 0;
+	let nodes = nodes_for_dashboard();
+	for (n in nodes) {
+		let gpus = n.hardware?.gpus ?? [];
+		total_gpus = total_gpus + gpus.length;
+		for (g in gpus) {
+			total_vram_free_mb = total_vram_free_mb + g.free_mb;
+			total_vram_mb = total_vram_mb + g.total_mb;
+		}
+	}
+	let catalog = catalog_grouped();
+	let total_catalog_mb: i64 = 0;
+	for (e in catalog) { total_catalog_mb = total_catalog_mb + e.size_mb; }
+
+	let running = 0;
+	for (a in agents) {
+		try {
+			let resp = get(a.agent_url + "/services", null);
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let entries = parse(resp.body);
+				for (e in entries) { if (e?.alive == true) { running = running + 1; } }
+			}
+		} catch (e) { }
+	}
+
+	return {
+		nodes:            nodes.length,
+		nodes_live:       agents.length,
+		total_gpus:       total_gpus,
+		vram_free_mb:     total_vram_free_mb,
+		vram_total_mb:    total_vram_mb,
+		catalog_models:   catalog.length,
+		catalog_total_mb: total_catalog_mb,
+		services_running: running,
+	};
+}
+
+fn handle_ui_stats(req): object {
+	return { status: 200, body: render_stats(compute_stats()),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
 // JSON profiles endpoint — for the dashboard's Alpine-driven spawn form
 // (profile dropdown auto-fills the model field from the profile's
 // default_model). Same shape the agents return, but merged.
@@ -924,6 +1082,7 @@ fn main(): null {
 		{ method: "GET",  path: "/profiles",        handler: handle_list_profiles },
 		{ method: "GET",  path: "/catalog",         handler: handle_list_catalog },
 		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog },
+		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats },
 		// Inference routing — prefix-matches anything under /v1/llama/.
 		// method "*" means any HTTP method is forwarded.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,

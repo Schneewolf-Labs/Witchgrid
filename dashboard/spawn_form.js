@@ -1,7 +1,29 @@
-// Alpine.js component for the spawn form. Pure client state — fetches
-// the profile map once on init, POSTs to /services on submit, shows
-// inline status. The auto-refreshing services table picks up the new
-// row on its next 5s tick.
+// Alpine.js components for the dashboard.
+//
+//   themeToggle() — dark/light switcher, persists to localStorage.
+//                   Pre-paint script in index.html applies the saved
+//                   theme before any CSS evaluates so we don't flash
+//                   the wrong palette on load.
+//
+//   spawnForm()   — the /services POST form. Pure client state, fetches
+//                   the profile map once on init, leaves model blank
+//                   when the profile has an alias (catalog resolves).
+
+function themeToggle() {
+  return {
+    theme: 'dark',
+    init() {
+      const saved = (() => { try { return localStorage.getItem('witchgrid-theme'); } catch (e) { return null; } })();
+      this.theme = (saved === 'light' || saved === 'dark') ? saved : 'dark';
+      document.documentElement.setAttribute('data-theme', this.theme);
+    },
+    toggle() {
+      this.theme = (this.theme === 'dark') ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', this.theme);
+      try { localStorage.setItem('witchgrid-theme', this.theme); } catch (e) {}
+    },
+  };
+}
 
 function spawnForm() {
   return {
