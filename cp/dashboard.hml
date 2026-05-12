@@ -605,7 +605,7 @@ export fn render_profiles(profiles_data): string {
 	let html = "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>profile</th><th>context</th><th>kv</th>"
-		+ "<th>default port</th><th>model</th>"
+		+ "<th>default port</th><th>model</th><th></th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (n in names) {
 		let p = profiles_data[n];
@@ -630,12 +630,19 @@ export fn render_profiles(profiles_data): string {
 		if (p?.__version != null) {
 			version_badge = " <span class=\"meta\">v" + p.__version + "</span>";
 		}
+		// Per-row edit / delete buttons hand off to the Alpine
+		// editor via custom events (defined in dashboard.js).
+		let actions = "<button class=\"row-action\" onclick=\"editProfile('"
+			+ esc(n) + "')\">edit</button>"
+			+ " <button class=\"row-action row-action-danger\" "
+			+ "onclick=\"deleteProfile('" + esc(n) + "')\">delete</button>";
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(n) + "</strong>" + version_badge + "</td>"
 			+ "<td><code>" + p.context + "</code></td>"
 			+ "<td><code>" + esc(p.kv_type) + "</code></td>"
 			+ "<td><code>" + p.default_port + "</code></td>"
 			+ "<td>" + model_cell + "</td>"
+			+ "<td class=\"row-actions\">" + actions + "</td>"
 			+ "</tr>\n";
 	}
 	html = html + "</tbody></table>";

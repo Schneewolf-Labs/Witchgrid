@@ -43,10 +43,82 @@
       </div>
     </div>
 
-    <section>
-      <h2>Profiles</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Spawn templates baked into each agent. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time.</p>
+    <section x-data="profileEditor()">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+        <h2 style="margin:0">Profiles</h2>
+        <button class="row-action" onclick="newProfile()">+ new profile</button>
+      </div>
+      <p class="meta" style="margin: 0.25rem 0 0.5rem 0">Spawn templates owned by CP. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time. Edits bump the version; running services keep their old argv.</p>
       <div hx-get="/ui/profiles" hx-trigger="load, every 5s">loading…</div>
+
+      <!-- ── Profile editor modal ─────────────────────────────────── -->
+      <div class="modal-backdrop" x-show="open" x-cloak @click.self="cancel()" style="display:none">
+        <div class="modal-card" @click.stop>
+          <h3 style="margin:0 0 0.75rem 0" x-text="isNew ? 'New profile' : 'Edit ' + name"></h3>
+          <div class="form-grid">
+            <template x-if="isNew">
+              <div>
+                <label>name</label>
+                <input type="text" x-model="name" placeholder="my-profile">
+              </div>
+            </template>
+            <div>
+              <label>binary</label>
+              <input type="text" x-model="binary">
+            </div>
+            <div>
+              <label>default port</label>
+              <input type="number" x-model="default_port">
+            </div>
+            <div>
+              <label>context</label>
+              <input type="number" x-model="context">
+            </div>
+            <div>
+              <label>kv type</label>
+              <input type="text" x-model="kv_type" placeholder="q4_0 / q8_0 / f16">
+            </div>
+            <div class="full">
+              <label>model alias <span class="meta">(catalog lookup; preferred)</span></label>
+              <input type="text" x-model="model_alias" placeholder="mahou-1.5-mistral-nemo-12b.q5_k_m">
+            </div>
+            <div class="full">
+              <label>default model <span class="meta">(legacy fallback path)</span></label>
+              <input type="text" x-model="default_model" placeholder="/path/to/model.gguf">
+            </div>
+            <div>
+              <label>HF repo</label>
+              <input type="text" x-model="hf_repo" placeholder="org/repo-name">
+            </div>
+            <div>
+              <label>HF file</label>
+              <input type="text" x-model="hf_file" placeholder="model.Q5_K_M.gguf">
+            </div>
+            <div class="full">
+              <label>intent <span class="meta">(witchgrid-normalized → llama-server flags)</span></label>
+              <template x-for="(row, i) in intentRows" :key="i">
+                <div class="intent-row">
+                  <input type="text" x-model="row.k" placeholder="key (e.g. flash_attention)">
+                  <input type="text" x-model="row.v" placeholder="value (true / 131072 / q4_0)">
+                  <button type="button" class="row-action row-action-danger" @click="removeIntent(i)">×</button>
+                </div>
+              </template>
+              <button type="button" class="row-action" @click="addIntent()" style="margin-top:0.25rem">+ intent</button>
+            </div>
+            <div class="full">
+              <label>extra flags <span class="meta">(one per line, raw argv tokens)</span></label>
+              <textarea x-model="extra_flags" rows="3" placeholder="--no-mmap&#10;--log-disable"></textarea>
+            </div>
+          </div>
+
+          <p class="msg err" x-show="error" x-text="error" style="margin-top:0.75rem"></p>
+
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem">
+            <button type="button" class="row-action" @click="cancel()" :disabled="busy">cancel</button>
+            <button type="button" @click="save()" :disabled="busy" x-text="busy ? '…' : 'save'"></button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section>

@@ -258,10 +258,82 @@ export let PROFILES_HTML = "<!doctype html>
       </div>
     </div>
 
-    <section>
-      <h2>Profiles</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Spawn templates baked into each agent. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time.</p>
+    <section x-data=\"profileEditor()\">
+      <div style=\"display:flex; align-items:center; justify-content:space-between; gap:1rem;\">
+        <h2 style=\"margin:0\">Profiles</h2>
+        <button class=\"row-action\" onclick=\"newProfile()\">+ new profile</button>
+      </div>
+      <p class=\"meta\" style=\"margin: 0.25rem 0 0.5rem 0\">Spawn templates owned by CP. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time. Edits bump the version; running services keep their old argv.</p>
       <div hx-get=\"/ui/profiles\" hx-trigger=\"load, every 5s\">loading…</div>
+
+      <!-- ── Profile editor modal ─────────────────────────────────── -->
+      <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"cancel()\" style=\"display:none\">
+        <div class=\"modal-card\" @click.stop>
+          <h3 style=\"margin:0 0 0.75rem 0\" x-text=\"isNew ? 'New profile' : 'Edit ' + name\"></h3>
+          <div class=\"form-grid\">
+            <template x-if=\"isNew\">
+              <div>
+                <label>name</label>
+                <input type=\"text\" x-model=\"name\" placeholder=\"my-profile\">
+              </div>
+            </template>
+            <div>
+              <label>binary</label>
+              <input type=\"text\" x-model=\"binary\">
+            </div>
+            <div>
+              <label>default port</label>
+              <input type=\"number\" x-model=\"default_port\">
+            </div>
+            <div>
+              <label>context</label>
+              <input type=\"number\" x-model=\"context\">
+            </div>
+            <div>
+              <label>kv type</label>
+              <input type=\"text\" x-model=\"kv_type\" placeholder=\"q4_0 / q8_0 / f16\">
+            </div>
+            <div class=\"full\">
+              <label>model alias <span class=\"meta\">(catalog lookup; preferred)</span></label>
+              <input type=\"text\" x-model=\"model_alias\" placeholder=\"mahou-1.5-mistral-nemo-12b.q5_k_m\">
+            </div>
+            <div class=\"full\">
+              <label>default model <span class=\"meta\">(legacy fallback path)</span></label>
+              <input type=\"text\" x-model=\"default_model\" placeholder=\"/path/to/model.gguf\">
+            </div>
+            <div>
+              <label>HF repo</label>
+              <input type=\"text\" x-model=\"hf_repo\" placeholder=\"org/repo-name\">
+            </div>
+            <div>
+              <label>HF file</label>
+              <input type=\"text\" x-model=\"hf_file\" placeholder=\"model.Q5_K_M.gguf\">
+            </div>
+            <div class=\"full\">
+              <label>intent <span class=\"meta\">(witchgrid-normalized → llama-server flags)</span></label>
+              <template x-for=\"(row, i) in intentRows\" :key=\"i\">
+                <div class=\"intent-row\">
+                  <input type=\"text\" x-model=\"row.k\" placeholder=\"key (e.g. flash_attention)\">
+                  <input type=\"text\" x-model=\"row.v\" placeholder=\"value (true / 131072 / q4_0)\">
+                  <button type=\"button\" class=\"row-action row-action-danger\" @click=\"removeIntent(i)\">×</button>
+                </div>
+              </template>
+              <button type=\"button\" class=\"row-action\" @click=\"addIntent()\" style=\"margin-top:0.25rem\">+ intent</button>
+            </div>
+            <div class=\"full\">
+              <label>extra flags <span class=\"meta\">(one per line, raw argv tokens)</span></label>
+              <textarea x-model=\"extra_flags\" rows=\"3\" placeholder=\"--no-mmap&#10;--log-disable\"></textarea>
+            </div>
+          </div>
+
+          <p class=\"msg err\" x-show=\"error\" x-text=\"error\" style=\"margin-top:0.75rem\"></p>
+
+          <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem\">
+            <button type=\"button\" class=\"row-action\" @click=\"cancel()\" :disabled=\"busy\">cancel</button>
+            <button type=\"button\" @click=\"save()\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save'\"></button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section>
@@ -689,6 +761,93 @@ tr.hw-detail details summary:hover { color: var(--accent); }
 .distribute-row select { margin: 0; padding: 0.2rem 0.4rem; font-size: 0.78rem; height: 28px; min-width: 120px; }
 .distribute-row button { margin: 0; padding: 0.2rem 0.7rem; font-size: 0.78rem; }
 
+/* In-row action buttons (edit / delete on profiles, etc.) */
+.row-action {
+  background: var(--bg-2);
+  color: var(--fg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.78rem;
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+  margin: 0;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.row-action:hover { background: var(--bg-3); color: var(--fg-1); border-color: var(--accent); }
+.row-action-danger { color: var(--err); }
+.row-action-danger:hover { background: var(--err-soft); border-color: var(--err); color: var(--err); }
+.row-actions { white-space: nowrap; text-align: right; }
+
+/* ─── modal (profile editor) ──────────────────────────────────── */
+
+[x-cloak] { display: none !important; }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 14, 0.7);
+  backdrop-filter: blur(2px);
+  display: flex !important;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4rem 1rem 2rem;
+  z-index: 1000;
+  overflow-y: auto;
+}
+.modal-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  max-width: 700px;
+  width: 100%;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-card h3 {
+  font-family: ui-monospace, monospace;
+  font-size: 1rem;
+  color: var(--fg-1);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem 0.75rem;
+}
+.form-grid .full { grid-column: 1 / -1; }
+.form-grid label {
+  display: block;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  margin-bottom: 0.15rem;
+}
+.form-grid label .meta { text-transform: none; letter-spacing: 0; font-size: 0.72rem; }
+.form-grid input, .form-grid textarea {
+  margin: 0;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.85rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-1);
+  font-family: ui-monospace, monospace;
+  width: 100%;
+}
+.form-grid textarea { resize: vertical; min-height: 60px; }
+
+.intent-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 32px;
+  gap: 0.4rem;
+  margin-bottom: 0.3rem;
+}
+.intent-row input { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
+.intent-row .row-action-danger { padding: 0.2rem; text-align: center; }
+
 /* ─── spawn form ────────────────────────────────────────────────── */
 
 form.spawn {
@@ -848,6 +1007,178 @@ function spawnForm() {
       this.busy = false;
     },
   };
+}
+
+// ── profile editor (CRUD modal, Profiles page only) ──────────────
+//
+// Driven by buttons in the rendered profiles table:
+//   onclick=\"openEditor()\"            — new profile
+//   onclick=\"openEditor('chat-mahou')\" — edit existing
+//   onclick=\"deleteProfile('name')\"   — delete with confirm
+//
+// The component reads /api/profiles/{name} on edit so we get the
+// canonical JSON shape; on save it PUTs (existing) or POSTs (new)
+// and reloads the page so the rendered table refreshes (cheap;
+// htmx-swap-on-event would be cleaner but we'd need a custom event
+// dispatch which adds a moving part for one form).
+
+function profileEditor() {
+  return {
+    open: false,
+    isNew: true,
+    name: '',
+    binary: 'llama-server',
+    default_port: 18080,
+    context: 4096,
+    kv_type: 'f16',
+    model_alias: '',
+    default_model: '',
+    hf_repo: '',
+    hf_file: '',
+    extra_flags: '',
+    intentRows: [{ k: '', v: '' }],
+    error: '',
+    busy: false,
+
+    init() {
+      // Listen for synthetic events fired by the in-table buttons.
+      window.addEventListener('witchgrid:edit-profile', (e) => this.openFor(e.detail.name));
+      window.addEventListener('witchgrid:new-profile',  ()  => this.openNew());
+    },
+
+    addIntent()        { this.intentRows.push({ k: '', v: '' }); },
+    removeIntent(i)    { this.intentRows.splice(i, 1); if (this.intentRows.length === 0) this.intentRows.push({k:'',v:''}); },
+
+    reset() {
+      this.name = ''; this.binary = 'llama-server';
+      this.default_port = 18080; this.context = 4096; this.kv_type = 'f16';
+      this.model_alias = ''; this.default_model = '';
+      this.hf_repo = ''; this.hf_file = '';
+      this.extra_flags = '';
+      this.intentRows = [{ k: '', v: '' }];
+      this.error = '';
+    },
+
+    openNew() {
+      this.reset();
+      this.isNew = true;
+      this.open = true;
+    },
+
+    async openFor(name) {
+      this.reset();
+      this.isNew = false;
+      this.open = true;
+      this.busy = true;
+      try {
+        const r = await fetch('/api/profiles/' + encodeURIComponent(name));
+        if (!r.ok) { this.error = 'load failed: HTTP ' + r.status; this.busy = false; return; }
+        const p = await r.json();
+        this.name = name;
+        this.binary = p.binary || 'llama-server';
+        this.default_port = p.default_port || 18080;
+        this.context = p.context || 4096;
+        this.kv_type = p.kv_type || 'f16';
+        this.model_alias = p.model_alias || '';
+        this.default_model = p.default_model || '';
+        if (p.hf_source) {
+          this.hf_repo = p.hf_source.repo || '';
+          this.hf_file = p.hf_source.file || '';
+        }
+        this.extra_flags = (p.extra_flags || []).join('\\n');
+        this.intentRows = Object.entries(p.intent || {}).map(([k, v]) => ({ k, v: String(v) }));
+        if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+      } catch (e) {
+        this.error = 'load failed: ' + e;
+      }
+      this.busy = false;
+    },
+
+    cancel() { this.open = false; this.error = ''; },
+
+    buildPayload() {
+      const intent = {};
+      for (const r of this.intentRows) {
+        const k = (r.k || '').trim();
+        if (!k) continue;
+        const v = (r.v || '').trim();
+        // Coerce to int / bool / string by shape — operators commonly type
+        // 131072 / true / q4_0 and don't want to think about JSON quoting.
+        if (v === 'true')        intent[k] = true;
+        else if (v === 'false')  intent[k] = false;
+        else if (/^-?\\d+$/.test(v)) intent[k] = parseInt(v, 10);
+        else                     intent[k] = v;
+      }
+      const profile = {
+        binary: this.binary,
+        intent,
+        extra_flags: this.extra_flags.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean),
+        default_port: parseInt(this.default_port, 10),
+        context: parseInt(this.context, 10),
+        kv_type: this.kv_type,
+      };
+      if (this.model_alias)   profile.model_alias = this.model_alias;
+      if (this.default_model) profile.default_model = this.default_model;
+      if (this.hf_repo && this.hf_file) {
+        profile.hf_source = { repo: this.hf_repo, file: this.hf_file };
+      }
+      return profile;
+    },
+
+    async save() {
+      this.busy = true; this.error = '';
+      const profile = this.buildPayload();
+      try {
+        let r;
+        if (this.isNew) {
+          if (!this.name) { this.error = 'name required'; this.busy = false; return; }
+          r = await fetch('/api/profiles', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ name: this.name, profile }),
+          });
+        } else {
+          r = await fetch('/api/profiles/' + encodeURIComponent(this.name), {
+            method: 'PUT',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(profile),
+          });
+        }
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          this.error = d.error || ('HTTP ' + r.status);
+          this.busy = false;
+          return;
+        }
+        this.open = false;
+        // Refresh the page so the rendered table picks up the new
+        // version + any added/removed rows. HTMX-swap would be slicker
+        // but reload's two lines and matches reload-after-spawn UX.
+        window.location.reload();
+      } catch (e) {
+        this.error = 'save failed: ' + e;
+        this.busy = false;
+      }
+    },
+  };
+}
+
+async function deleteProfile(name) {
+  if (!confirm('Delete profile \"' + name + '\"?')) return;
+  const r = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    alert('Delete failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  window.location.reload();
+}
+
+function editProfile(name) {
+  window.dispatchEvent(new CustomEvent('witchgrid:edit-profile', { detail: { name } }));
+}
+function newProfile() {
+  window.dispatchEvent(new CustomEvent('witchgrid:new-profile'));
 }
 
 // ── nav active highlight ──────────────────────────────────────────

@@ -413,6 +413,93 @@ tr.hw-detail details summary:hover { color: var(--accent); }
 .distribute-row select { margin: 0; padding: 0.2rem 0.4rem; font-size: 0.78rem; height: 28px; min-width: 120px; }
 .distribute-row button { margin: 0; padding: 0.2rem 0.7rem; font-size: 0.78rem; }
 
+/* In-row action buttons (edit / delete on profiles, etc.) */
+.row-action {
+  background: var(--bg-2);
+  color: var(--fg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.78rem;
+  font-family: ui-monospace, monospace;
+  cursor: pointer;
+  margin: 0;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.row-action:hover { background: var(--bg-3); color: var(--fg-1); border-color: var(--accent); }
+.row-action-danger { color: var(--err); }
+.row-action-danger:hover { background: var(--err-soft); border-color: var(--err); color: var(--err); }
+.row-actions { white-space: nowrap; text-align: right; }
+
+/* ─── modal (profile editor) ──────────────────────────────────── */
+
+[x-cloak] { display: none !important; }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(10, 10, 14, 0.7);
+  backdrop-filter: blur(2px);
+  display: flex !important;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 4rem 1rem 2rem;
+  z-index: 1000;
+  overflow-y: auto;
+}
+.modal-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.5rem;
+  max-width: 700px;
+  width: 100%;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+.modal-card h3 {
+  font-family: ui-monospace, monospace;
+  font-size: 1rem;
+  color: var(--fg-1);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.6rem 0.75rem;
+}
+.form-grid .full { grid-column: 1 / -1; }
+.form-grid label {
+  display: block;
+  font-family: ui-monospace, monospace;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--fg-dim);
+  margin-bottom: 0.15rem;
+}
+.form-grid label .meta { text-transform: none; letter-spacing: 0; font-size: 0.72rem; }
+.form-grid input, .form-grid textarea {
+  margin: 0;
+  padding: 0.4rem 0.55rem;
+  font-size: 0.85rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--fg-1);
+  font-family: ui-monospace, monospace;
+  width: 100%;
+}
+.form-grid textarea { resize: vertical; min-height: 60px; }
+
+.intent-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 32px;
+  gap: 0.4rem;
+  margin-bottom: 0.3rem;
+}
+.intent-row input { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
+.intent-row .row-action-danger { padding: 0.2rem; text-align: center; }
+
 /* ─── spawn form ────────────────────────────────────────────────── */
 
 form.spawn {
