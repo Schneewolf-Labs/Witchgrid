@@ -473,13 +473,40 @@ fn extract_port(agent_url: string): i32 {
 	return i32(port_str);
 }
 
+// Cap on how many ports we probe before giving up. 50 is plenty —
+// realistic usage has at most ~5 collisions before finding a free
+// slot. Beyond 50, something's badly wrong and the operator should
+// know; we return the default and let the agent's own EADDRINUSE
+// surface the real problem.
+let PORT_PROBE_MAX_ATTEMPTS = 50;
+
+// Ask the agent's OS whether a port is actually bindable. Used to
+// catch non-Witchgrid services (kobold, ooba, sd-webui, etc.) that
+// the /services walk wouldn't see. The agent does the bind probe
+// from its own host — that's the OS we care about.
+//
+// Returns true on confirmed-free, false on confirmed-in-use, true
+// on probe failure (better to let the spawn try and fail loudly than
+// to dance forever past unprobeable ports).
+fn port_free_on_agent(agent_url: string, port: i32): bool {
+	try {
+		let resp = post_json(agent_url + "/port_check", { port: port });
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			let body = parse(resp.body);
+			return body?.available == true;
+		}
+		// 404 → old agent without the endpoint. Trust = optimistic.
+		return true;
+	} catch (e) {
+		return true;
+	}
+}
+
 // Pick a port the chosen agent isn't already using AND that doesn't
-// collide with the agent's own listen port. Walks the agent's running
-// services and bumps past any conflict; the agent itself enforces this
-// too (defense in depth) but doing it here saves a round-trip on the
-// common case.
+// collide with the agent's own listen port AND isn't taken by some
+// non-Witchgrid process (kobold, ooba, etc.). Walks ports upward from
+// default until we find one that passes both checks.
 fn pick_port(agent_url: string, default_port: i32): i32 {
-	let port = default_port;
 	let used = {};
 	let agent_port = extract_port(agent_url);
 	if (agent_port > 0) { used["" + agent_port] = true; }
@@ -490,8 +517,17 @@ fn pick_port(agent_url: string, default_port: i32): i32 {
 			for (s in services) { used["" + s.port] = true; }
 		}
 	} catch (e) { }
-	while (used.has("" + port)) { port = port + 1; }
-	return port;
+
+	let port = default_port;
+	let attempts = 0;
+	while (attempts < PORT_PROBE_MAX_ATTEMPTS) {
+		if (!used.has("" + port) && port_free_on_agent(agent_url, port)) {
+			return port;
+		}
+		port = port + 1;
+		attempts = attempts + 1;
+	}
+	return default_port;
 }
 
 // ── service proxy ────────────────────────────────────────────────────

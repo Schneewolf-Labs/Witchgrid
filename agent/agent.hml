@@ -42,7 +42,7 @@
 //                                         is concerned; just discovered)
 
 import { open_db, close_db } from "@stdlib/sqlite";
-import { stringify } from "@stdlib/json";
+import { stringify, parse } from "@stdlib/json";
 import { getenv } from "@stdlib/env";
 import { exec_argv } from "@stdlib/process";
 import { post_json } from "@stdlib/http";
@@ -149,6 +149,33 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		}
 	}
 	return null;
+}
+
+// Probe whether a TCP port is currently bindable on this host. Shells
+// out to `ss -tln 'sport = :N'` and checks for a LISTEN line — if any
+// process has the port open, the output has > 1 line (header + match).
+//
+// Why not socket.bind() directly: Hemlock's compiled binaries currently
+// runtime-crash on EADDRINUSE rather than throwing a catchable
+// exception (interpreter throws fine; same parity gap that bites
+// file_stat — see cp/cp.hml's pick_placement comment). Same with
+// TcpStream's connect-refused. `ss` is universally available on Linux,
+// fast (~5ms), and gives us OS truth without the language quirk.
+fn port_is_free(port: i32): bool {
+	let r = null;
+	try {
+		r = exec_argv(["ss", "-tln", "sport = :" + port]);
+	} catch (e) {
+		// `ss` not on PATH (rare on modern Linux). Optimistic — let the
+		// spawn try and surface any real bind error.
+		return true;
+	}
+	if (r.exit_code != 0) { return true; }
+	// `ss` always prints a one-line header; lines beyond that = matches.
+	let lines = r.output.split("\n");
+	let count = 0;
+	for (line in lines) { if (line.trim().length > 0) { count = count + 1; } }
+	return count <= 1;
 }
 
 // Default canonical dir is ~/.witchgrid/models. Created if missing so
@@ -291,6 +318,26 @@ fn main(): null {
 			return { status: 200, body: stringify({
 				count: fresh.length,
 			})};
+		} },
+		{ method: "POST", path: "/port_check",    handler: fn(req): object {
+			// CP calls this to OS-truth-check candidate ports before
+			// telling us to spawn there. Existing pick_port logic only
+			// dodges Witchgrid-spawned services; non-Witchgrid stuff
+			// (kobold/ooba/sd-webui) is invisible to it. This endpoint
+			// closes that gap.
+			//
+			// Body: { port: N }
+			let body = req?.body ?? "{}";
+			let payload = null;
+			try { payload = parse(body); } catch (e) {
+				return { status: 400, body: "{\"error\":\"bad json\"}" };
+			}
+			let p = payload?.port;
+			if (p == null) {
+				return { status: 400, body: "{\"error\":\"port required\"}" };
+			}
+			let free = port_is_free(i32(p));
+			return { status: 200, body: stringify({ port: p, available: free }) };
 		} },
 		{ method: "GET",  path: "/healthz",       handler: fn(req): object {
 			return { status: 200, body: "{\"status\":\"ok\"}" };
