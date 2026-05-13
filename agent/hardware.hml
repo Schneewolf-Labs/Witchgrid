@@ -34,7 +34,7 @@ fn probe_gpus_nvidia(): array {
 	let r = null;
 	try {
 		r = exec_argv(["nvidia-smi",
-			"--query-gpu=index,name,memory.total,memory.free,uuid",
+			"--query-gpu=index,name,memory.total,memory.free,uuid,power.draw,power.limit",
 			"--format=csv,noheader,nounits"]);
 	} catch (e) {
 		return [];
@@ -50,12 +50,25 @@ fn probe_gpus_nvidia(): array {
 		if (trimmed.length == 0) { continue; }
 		let parts = trimmed.split(",");
 		if (parts.length < 5) { continue; }
+		// power.draw / power.limit can be "[N/A]" on cards without
+		// a power sensor — keep null in that case so the dashboard
+		// renders "—" instead of bogus zeroes.
+		let power_draw = null;
+		let power_limit = null;
+		if (parts.length >= 7) {
+			let pd = parts[5].trim();
+			let pl = parts[6].trim();
+			if (pd != "[N/A]" && pd.length > 0) { power_draw = f64(pd); }
+			if (pl != "[N/A]" && pl.length > 0) { power_limit = f64(pl); }
+		}
 		gpus.push({
-			index:    i32(parts[0].trim()),
-			name:     parts[1].trim(),
-			total_mb: i32(parts[2].trim()),
-			free_mb:  i32(parts[3].trim()),
-			uuid:     parts[4].trim(),
+			index:        i32(parts[0].trim()),
+			name:         parts[1].trim(),
+			total_mb:     i32(parts[2].trim()),
+			free_mb:      i32(parts[3].trim()),
+			uuid:         parts[4].trim(),
+			power_draw_w:  power_draw,
+			power_limit_w: power_limit,
 		});
 	}
 	return gpus;
@@ -191,6 +204,89 @@ export fn probe_disks(canonical, extras): array {
 // canonical_dir + extra_dirs are nullable; pass null when the model
 // catalog isn't configured yet (early boot, or future CPU-only nodes
 // that don't host any models).
+// Unmanaged-process probe (slice C5).
+//
+// Lists every process holding GPU memory according to nvidia-smi, then
+// drops the ones witchgrid spawned itself (matched against `known_pids`,
+// the set of PIDs from the agent's services table). Output:
+//
+//   [{ pid, process_name, vram_mb, gpu_index, owner_uid, owner_name }]
+//
+// owner_uid/owner_name are best-effort via stat(/proc/<pid>) — empty
+// strings if /proc isn't readable (rare on default Linux). gpu_index
+// resolved from gpu_uuid by walking the gpus list we already probed.
+//
+// Why this exists: on shared boxes (e.g. schneewolf — nbeerbower owns
+// the agent, flammenai owns FlameWorker, jupyter has its own llama-server)
+// vram contention is invisible to placement unless we surface it.
+// Reporting these to CP doesn't grant control over them — it just
+// stops the dashboard from claiming "47 GB free" when 28 GB is in use.
+export fn probe_unmanaged_procs(gpus, known_pids): array {
+	if (gpus.length == 0) { return []; }
+
+	let r = null;
+	try {
+		r = exec_argv(["nvidia-smi",
+			"--query-compute-apps=pid,process_name,used_memory,gpu_uuid",
+			"--format=csv,noheader,nounits"]);
+	} catch (e) {
+		return [];
+	}
+	if (r.exit_code != 0 || r.output.length == 0) { return []; }
+
+	// Build uuid→index lookup once.
+	let uuid_to_idx = {};
+	for (g in gpus) {
+		if (g?.uuid != null) { uuid_to_idx[g.uuid] = g.index; }
+	}
+	// Hash-style "set" for quick known-pid lookup. Hemlock dicts are
+	// fine for this — no native set type.
+	let known = {};
+	for (p in known_pids) { known["" + p] = true; }
+
+	let out = [];
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let trimmed = line.trim();
+		if (trimmed.length == 0) { continue; }
+		let parts = trimmed.split(",");
+		if (parts.length < 4) { continue; }
+		let pid = i32(parts[0].trim());
+		if (known.has("" + pid)) { continue; }
+		let name = parts[1].trim();
+		let vram = i32(parts[2].trim());
+		let uuid = parts[3].trim();
+		let gpu_idx = -1;
+		if (uuid_to_idx.has(uuid)) { gpu_idx = uuid_to_idx[uuid]; }
+
+		// Owner via stat(1) — cheap, cross-distro, and survives /proc
+		// hidepid=1 since stat just needs +x on /proc itself. Format
+		// is "username uid", so split on whitespace.
+		let owner_name = "";
+		let owner_uid = -1;
+		try {
+			let s = exec_argv(["stat", "-c", "%U %u", "/proc/" + pid]);
+			if (s.exit_code == 0) {
+				let stxt = s.output.trim().split(" ");
+				if (stxt.length >= 2) {
+					owner_name = stxt[0];
+					owner_uid = i32(stxt[1]);
+				}
+			}
+		} catch (e) { }
+
+		out.push({
+			pid:           pid,
+			process_name:  name,
+			vram_mb:       vram,
+			gpu_index:     gpu_idx,
+			owner_name:    owner_name,
+			owner_uid:     owner_uid,
+		});
+	}
+	return out;
+}
+
 export fn probe(canonical_dir, extra_dirs): object {
 	// Convert bytes → MB up front so the wire payload is small ints,
 	// not 64-bit byte counts CP would have to divide every render.

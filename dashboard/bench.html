@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>witchgrid — bench</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('witchgrid-theme'); } catch (e) {}
+      if (t !== 'light' && t !== 'dark') { t = 'dark'; }
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.3/dist/cdn.min.js"></script>
+  <script src="/assets/dashboard.js"></script>
+</head>
+<body>
+  <main x-data="themeToggle()">
+    <div class="topbar">
+      <div class="brand">
+        <img src="/assets/logo.svg" alt="witchgrid">
+        <h1>witchgrid<span class="cursor">_</span></h1>
+      </div>
+      <nav class="page-nav">
+        <a href="/">overview</a>
+        <a href="/catalog">catalog</a>
+        <a href="/transfers">transfers</a>
+        <a href="/profiles">profiles</a>
+        <a href="/bench">bench</a>
+      </nav>
+      <button class="theme-toggle" @click="toggle()" :title="theme === 'dark' ? 'switch to light' : 'switch to dark'">
+        <span x-text="theme === 'dark' ? '☀' : '☾'"></span>
+      </button>
+    </div>
+
+    <div hx-get="/ui/stats" hx-trigger="load, every 5s" class="stats-wrap">
+      <div class="stats">
+        <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>
+      </div>
+    </div>
+
+    <section x-data="benchPage()">
+      <h2>Bench</h2>
+      <p class="meta" style="margin: 0 0 0.75rem 0">
+        Pin-spawn a profile on a target node, fire N timed completion requests,
+        record median ttft + tok/s + total. Stop when done. Bench rows pin to
+        the build that ran them so you can compare across llama.cpp upgrades.
+      </p>
+
+      <form class="spawn" @submit.prevent="run()">
+        <div>
+          <label for="bn">target node</label>
+          <select id="bn" x-model="target_node" required>
+            <option value="">— select —</option>
+            <template x-for="n in nodes" :key="n.node_id">
+              <option :value="n.node_id" x-text="n.node_id + ' (' + n.role + ')'"></option>
+            </template>
+          </select>
+        </div>
+        <div>
+          <label for="bp">profile</label>
+          <select id="bp" x-model="profile_name" required>
+            <option value="">— select —</option>
+            <template x-for="(p, name) in profiles" :key="name">
+              <option :value="name" x-text="name"></option>
+            </template>
+          </select>
+        </div>
+        <div style="grid-column: 1 / -1">
+          <label for="bpr">prompt</label>
+          <textarea id="bpr" x-model="prompt" rows="3" style="width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+        </div>
+        <div>
+          <label for="bnp">n_predict</label>
+          <input id="bnp" type="number" x-model="n_predict" min="1" max="2048">
+        </div>
+        <div>
+          <label for="bre">repetitions</label>
+          <input id="bre" type="number" x-model="repetitions" min="1" max="20">
+        </div>
+        <button type="submit" :disabled="busy" x-text="busy ? '…' : 'run bench'"></button>
+        <p class="msg" :class="msg.startsWith('error') ? 'err' : 'ok'" x-show="msg" x-text="msg"></p>
+      </form>
+    </section>
+
+    <section>
+      <h2>Results</h2>
+      <p class="meta" style="margin: 0 0 0.5rem 0">Last 100, newest first. Polls every 5s.</p>
+      <div hx-get="/ui/bench" hx-trigger="load, every 5s">loading…</div>
+    </section>
+  </main>
+
+  <script>
+    function benchPage() {
+      return {
+        nodes: [], profiles: {},
+        target_node: '', profile_name: '',
+        prompt: '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWrite a haiku about a thunderstorm.<|im_end|>\n<|im_start|>assistant\n',
+        n_predict: 100, repetitions: 3,
+        busy: false, msg: '',
+        async init() {
+          try {
+            const [r1, r2] = await Promise.all([fetch('/nodes'), fetch('/api/profiles')]);
+            this.nodes = await r1.json();
+            this.profiles = await r2.json();
+          } catch (e) { this.msg = 'error: ' + e; }
+        },
+        async run() {
+          if (!this.target_node || !this.profile_name) {
+            this.msg = 'error: target_node + profile required';
+            return;
+          }
+          this.busy = true; this.msg = '';
+          try {
+            const r = await fetch('/api/bench', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                target_node: this.target_node,
+                profile_name: this.profile_name,
+                prompt: this.prompt,
+                n_predict: parseInt(this.n_predict, 10),
+                repetitions: parseInt(this.repetitions, 10),
+              }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { this.msg = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else      { this.msg = 'queued ' + d.bench_id + ' on ' + d.target_node + ' (poll Results)'; }
+          } catch (e) { this.msg = 'error: ' + e; }
+          this.busy = false;
+        },
+      };
+    }
+  </script>
+</body>
+</html>

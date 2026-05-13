@@ -29,6 +29,7 @@ ASSETS = [
     ("CATALOG_HTML",   "dashboard/catalog.html"),     # /catalog
     ("TRANSFERS_HTML", "dashboard/transfers.html"),   # /transfers
     ("PROFILES_HTML",  "dashboard/profiles.html"),    # /profiles
+    ("BENCH_HTML",     "dashboard/bench.html"),       # /bench
     # Shared assets
     ("STYLES_CSS",     "dashboard/styles.css"),
     ("DASHBOARD_JS",   "dashboard/dashboard.js"),

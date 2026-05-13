@@ -41,18 +41,19 @@
 //                                         (read-only as far as Witchgrid
 //                                         is concerned; just discovered)
 
-import { open_db, close_db } from "@stdlib/sqlite";
+import { open_db, close_db, query as db_query } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
 import { getenv } from "@stdlib/env";
 import { exec_argv } from "@stdlib/process";
-import { post_json } from "@stdlib/http";
+import { post_json, post } from "@stdlib/http";
+import { sha256 } from "@stdlib/hash";
 import { sleep } from "@stdlib/time";
 import { homedir } from "@stdlib/os";
 import { exists, make_dirs } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
-import { probe } from "./hardware";
+import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
@@ -64,6 +65,78 @@ let DB_PATH = "witchgrid-agent.db";
 // without burning excessive RPC. CP's stale-node cutoff is 90s (3x
 // this) so a single missed heartbeat doesn't flap us out of placement.
 let HEARTBEAT_SECONDS = 30;
+
+// ── auth (shared bearer; matches CP's slice-1 design) ─────────────
+//
+// Same model as CP: WITCHGRID_SHARED_SECRET, sent on every outbound
+// CP call AND required on every inbound CP→agent call. Unset = legacy
+// mode (warn at boot, accept all). When CP and agent disagree (one has
+// secret set, other doesn't), the side with auth on rejects with 401
+// — easy to spot in the log.
+//
+// Read fresh from env on every call rather than caching in a let:
+// Hemlock spawn() snapshots module state at spawn time, so the
+// heartbeat task would see whatever SHARED_SECRET was BEFORE init_auth
+// ran. Re-reading dodges that. getenv is microseconds — once per
+// heartbeat (30s) or per inbound request, well under the noise floor.
+fn shared_secret(): string {
+	return env_or("WITCHGRID_SHARED_SECRET", "");
+}
+
+fn init_auth(): null {
+	let s = shared_secret();
+	if (s.length > 0) {
+		print("[auth] enabled (" + s.length + "-char shared secret)");
+	} else {
+		print("[auth] DISABLED — set WITCHGRID_SHARED_SECRET to enable");
+	}
+	return null;
+}
+
+fn auth_match(provided): bool {
+	let secret = shared_secret();
+	if (secret == "") { return true; }
+	if (provided == null || provided.length == 0) { return false; }
+	let prefix = "Bearer ";
+	if (provided.length < prefix.length) { return false; }
+	if (provided.substr(0, prefix.length) != prefix) { return false; }
+	let raw = provided.substr(prefix.length, provided.length - prefix.length);
+	return sha256(raw) == sha256(secret);
+}
+
+fn agent_auth_check(req, route) {
+	if (shared_secret() == "") { return null; }
+	if (route?.public == true) { return null; }
+	let header = req?.headers?["authorization"] ?? "";
+	if (auth_match(header)) { return null; }
+	// Body fallback — see CP's matching cp_auth_check for context.
+	if (req?.body != null && req.body.length > 0
+		&& req.body.length < 1048576) {
+		try {
+			let payload = parse(req.body);
+			let tok = payload?._auth_token;
+			if (tok != null && auth_match("Bearer " + tok)) { return null; }
+		} catch (e) { }
+	}
+	return { status: 401,
+		body: "{\"error\":\"unauthorized\"}",
+		headers: { "content-type": "application/json",
+			"www-authenticate": "Bearer realm=\"witchgrid\"" } };
+}
+
+// Outbound — agent→CP (register, heartbeat). POSTs inject the bearer
+// as `_auth_token` in the JSON body (Hemlock workaround — its lws POST
+// wrapper drops arbitrary headers). Authorization header sent too so
+// the day Hemlock gains POST-with-headers we can drop the body field.
+fn cp_post_json(url: string, data) {
+	let secret = shared_secret();
+	let payload = data;
+	if (secret != "" && payload != null) { payload["_auth_token"] = secret; }
+	let body = stringify(payload);
+	let h = ["Content-Type: application/json"];
+	if (secret != "") { h.push("Authorization: Bearer " + secret); }
+	return post(url, body, h);
+}
 
 fn require_env(name: string): string {
 	let v = getenv(name);
@@ -106,7 +179,7 @@ fn register_with_cp(cp_url: string, payload): null {
 	let url = cp_url + "/register";
 	print("[agent] registering with CP at " + url);
 	try {
-		let resp = post_json(url, payload);
+		let resp = cp_post_json(url, payload);
 		if (resp.status_code >= 200 && resp.status_code < 300) {
 			print("[agent] registered OK: " + resp.body);
 		} else {
@@ -127,16 +200,29 @@ fn register_with_cp(cp_url: string, payload): null {
 // /rescan covers the realistic cadence; per-heartbeat rescan would
 // repeatedly read every GGUF header for no operational gain).
 //
+// Pull every PID the agent has ever spawned and not reaped — these
+// are "ours" for the unmanaged-proc cross-reference. Includes zombies
+// the next reap_zombie_services() pass would cull, but that's harmless;
+// nvidia-smi already won't list them.
+fn collect_known_pids(db): array {
+	let rows = db_query(db, "select pid from services", []);
+	let out = [];
+	for (r in rows) { out.push(r.pid); }
+	return out;
+}
+
 // Transient CP failures are swallowed — we'll succeed on the next
 // tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
                         agent_url: string, canonical_dir: string,
-                        extra_dirs, models_ref, runtime_ref, interval_seconds: i32): null {
+                        extra_dirs, models_ref, runtime_ref, db,
+                        interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
 		let hw = probe(canonical_dir, extra_dirs);
+		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));
 		try {
-			let resp = post_json(cp_url + "/register", {
+			let resp = cp_post_json(cp_url + "/register", {
 				node_id:   node_id,
 				hostname:  hostname,
 				role:      hw.role,
@@ -144,6 +230,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				agent_url: agent_url,
 				models:    models_ref.entries,
 				runtime:   runtime_ref.value,
+				unmanaged_processes: unmanaged,
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -210,6 +297,7 @@ fn ensure_canonical_dir(path: string): null {
 }
 
 fn main(): null {
+	init_auth();
 	let cp_url     = require_env("WITCHGRID_CP_URL");
 	let agent_url  = require_env("WITCHGRID_AGENT_URL");
 	let host       = env_or("WITCHGRID_AGENT_HOST", "0.0.0.0");
@@ -280,6 +368,14 @@ fn main(): null {
 	// holder dodges any reassignment-vs-mutation ambiguity.)
 	let models_ref = { entries: model_entries };
 
+	// Open db before initial register so the heartbeat (and the very
+	// first /register) can include the unmanaged-proc list — needs the
+	// services table to know which PIDs are ours vs. the rest.
+	let db = open_db(DB_PATH);
+	init_services_schema(db);
+	init_transfers_schema(db);
+	init_llama_cpp_schema(db);
+
 	register_with_cp(cp_url, {
 		node_id:   node_id,
 		hostname:  hostname,
@@ -288,18 +384,17 @@ fn main(): null {
 		agent_url: agent_url,
 		models:    models_ref.entries,
 		runtime:   runtime_ref.value,
+		unmanaged_processes: probe_unmanaged_procs(hw.gpus,
+			collect_known_pids(db)),
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               canonical_dir, extra_dirs, models_ref, runtime_ref, HEARTBEAT_SECONDS);
+	               canonical_dir, extra_dirs, models_ref, runtime_ref,
+	               db, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
-	let db = open_db(DB_PATH);
-	init_services_schema(db);
-	init_transfers_schema(db);
-	init_llama_cpp_schema(db);
 	let reaped = reap_zombie_services(db);
 	if (reaped > 0) {
 		print("[agent] reaped " + reaped + " zombie service rows from prior run");
@@ -448,10 +543,10 @@ fn main(): null {
 		} },
 		{ method: "GET",  path: "/healthz",       handler: fn(req): object {
 			return { status: 200, body: "{\"status\":\"ok\"}" };
-		} },
+		}, public: true },
 	];
 
-	serve(host, port, routes);
+	serve(host, port, routes, agent_auth_check);
 	close_db(db);
 	return null;
 }

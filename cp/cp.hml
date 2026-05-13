@@ -28,20 +28,127 @@
 // Run:    hemlock cp.hml
 // Build:  hemlockc cp.hml -o witchgrid-cp && ./witchgrid-cp
 
-import { open_db, exec, query, close_db } from "@stdlib/sqlite";
+import { open_db, exec, exec as db_exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
-import { post_json, get, request as http_request, stream as http_stream } from "@stdlib/http";
-import { sleep } from "@stdlib/time";
+import { post_json, post, get, request as http_request, stream as http_stream, request_timeout as http_request_timeout } from "@stdlib/http";
+import { sleep, time_ms as unix_ms } from "@stdlib/time";
 import { exists } from "@stdlib/fs";
+import { getenv } from "@stdlib/env";
+import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
-import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing,
-         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES,
+import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
+         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
 let PORT = 8765;
+
+// ── auth (slice 1: shared bearer for CP↔agent) ─────────────────────
+//
+// Single shared secret, env-injected. When set, every inbound request
+// EXCEPT routes flagged `public: true` must carry
+//   Authorization: Bearer <secret>
+// or it gets a 401. Same secret is sent on every CP→agent call so the
+// agent can validate us in turn.
+//
+// Unset (the default) = legacy mode: no checks, just a [auth] DISABLED
+// warning at boot. This lets the operator roll out updated agents
+// before flipping the switch on CP. Once every node is on a binary
+// that knows the secret, set it on CP last.
+//
+// Comparison goes through sha256 to bound timing-leak surface to a
+// fixed-length digest regardless of secret length. Not strict CT but
+// the threat model is LAN/WireGuard, not a remote network attacker.
+//
+// Read fresh from env on every call rather than caching in a let:
+// Hemlock spawn() snapshots module state at spawn time, so async
+// tasks (per-accept worker, bench task) would see whatever the let
+// was BEFORE init_auth ran. Re-reading dodges that.
+fn shared_secret(): string {
+	let s = getenv("WITCHGRID_SHARED_SECRET");
+	if (s == null) { return ""; }
+	return s;
+}
+
+fn init_auth(): null {
+	let s = shared_secret();
+	if (s.length > 0) {
+		print("[auth] enabled (shared bearer; "
+			+ s.length + "-char secret)");
+	} else {
+		print("[auth] DISABLED — set WITCHGRID_SHARED_SECRET on CP "
+			+ "and every agent to enable");
+	}
+	return null;
+}
+
+fn auth_match(provided: string): bool {
+	let secret = shared_secret();
+	if (secret == "") { return true; }
+	if (provided == null || provided.length == 0) { return false; }
+	let prefix = "Bearer ";
+	if (provided.length < prefix.length) { return false; }
+	if (provided.substr(0, prefix.length) != prefix) { return false; }
+	let raw = provided.substr(prefix.length, provided.length - prefix.length);
+	return sha256(raw) == sha256(secret);
+}
+
+// Dispatcher hook. Returns null when the request may proceed, or a
+// 401 response object when not. Routes flagged `public: true` always
+// pass; everything else needs the bearer (when SHARED_SECRET is set).
+//
+// Two acceptable token locations:
+//   1. `Authorization: Bearer <secret>` header — preferred path used
+//      by curl, browser fetch(), the dashboard, future API consumers.
+//   2. `_auth_token` field in the JSON body — workaround used by
+//      CP↔agent (Hemlock's libwebsockets POST wrapper drops arbitrary
+//      headers; only Content-Type makes it through). Body fallback
+//      is the in-band equivalent. To remove once a Hemlock POST-with-
+//      headers runtime fn lands.
+fn cp_auth_check(req, route) {
+	if (shared_secret() == "") { return null; }
+	if (route?.public == true) { return null; }
+	let header = req?.headers?["authorization"] ?? "";
+	if (auth_match(header)) { return null; }
+	// Body fallback for Hemlock-originated POSTs.
+	if (req?.body != null && req.body.length > 0
+		&& req.body.length < 1048576) {
+		try {
+			let payload = parse(req.body);
+			let tok = payload?._auth_token;
+			if (tok != null && auth_match("Bearer " + tok)) { return null; }
+		} catch (e) { }
+	}
+	return { status: 401,
+		body: "{\"error\":\"unauthorized\"}",
+		headers: { "content-type": "application/json",
+			"www-authenticate": "Bearer realm=\"witchgrid\"" } };
+}
+
+// Outbound auth — every CP→agent call goes through these wrappers
+// so they pick up the bearer automatically when the secret is set.
+// Same response shape as the underlying @stdlib/http calls.
+//
+// POSTs add `_auth_token` to the body (Hemlock workaround); GETs
+// use the headers list (which Hemlock's libwebsockets wrapper does
+// pass through for GET).
+fn cp_post_json(url: string, data) {
+	let secret = shared_secret();
+	let payload = data;
+	if (secret != "" && payload != null) { payload["_auth_token"] = secret; }
+	let body = stringify(payload);
+	let h = ["Content-Type: application/json"];
+	if (secret != "") { h.push("Authorization: Bearer " + secret); }
+	return post(url, body, h);
+}
+fn cp_get(url: string) {
+	let h = [];
+	let secret = shared_secret();
+	if (secret != "") { h.push("Authorization: Bearer " + secret); }
+	return get(url, h);
+}
 
 // One global db handle — cp.hml is small enough to live with it.
 let DB = null;
@@ -99,11 +206,52 @@ fn init_db(db): null {
 	exec(db, "create index if not exists ix_samples_lookup "
 		+ "on node_samples(node_id, metric, series, sampled_at)", []);
 
+	// Unmanaged GPU processes (slice C5). Replace-all-per-node every
+	// heartbeat — same model as node_models. These are processes
+	// nvidia-smi sees holding vram that witchgrid did NOT spawn
+	// (e.g. another user's llama-server, jupyter). Surfaced in the
+	// dashboard so operators understand "free vram" properly.
+	exec(db, "create table if not exists node_unmanaged_procs ("
+		+ "node_id text not null,"
+		+ "pid integer not null,"
+		+ "process_name text not null,"
+		+ "vram_mb integer not null,"
+		+ "gpu_index integer,"
+		+ "owner_uid integer,"
+		+ "owner_name text,"
+		+ "observed_at text not null,"
+		+ "primary key (node_id, pid)"
+		+ ")", []);
+
 	// Profiles. CP-owned now (was baked into agent binaries pre-v0.7).
 	// CRUD via /api/profiles[/{name}]; spawns get the full profile JSON
 	// inline so agents don't need to know what profiles exist.
 	// version bumps on every PUT; agents tag their service rows with
 	// the version that was current at spawn time.
+	// Bench runs. CP-orchestrated benchmarks of (node × profile ×
+	// build) combos. Each run pin-spawns the profile on a target
+	// node, fires N timed completion requests, records aggregate
+	// stats, stops the service. Results live forever (operator can
+	// purge manually) — disk cost is rounding error.
+	exec(db, "create table if not exists bench_runs ("
+		+ "id text primary key,"
+		+ "node_id text not null,"
+		+ "profile_name text not null,"
+		+ "build_hash text,"                     // captured at spawn time from /nodes
+		+ "prompt text not null,"
+		+ "n_predict integer not null,"
+		+ "repetitions integer not null,"
+		+ "ttft_ms_median real,"                 // time-to-first-token median across reps
+		+ "tok_per_sec_median real,"             // tokens/sec median across reps
+		+ "total_ms_median real,"
+		+ "tokens_predicted_median integer,"
+		+ "output_excerpt text,"                 // first rep's output, first 500 chars
+		+ "status text not null,"                // queued|spawning|running|complete|error
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+
 	exec(db, "create table if not exists profiles ("
 		+ "name text primary key,"
 		+ "profile_json text not null,"
@@ -262,6 +410,25 @@ fn handle_register(req): object {
 		}
 	}
 
+	// Unmanaged-process ingest (slice C5). Replace-all-for-this-node
+	// so a process that died between heartbeats drops out automatically.
+	// Skipping silently when the field is absent keeps us compatible
+	// with older agents that haven't been rebuilt yet.
+	let unmanaged = payload?.unmanaged_processes;
+	if (unmanaged != null) {
+		exec(DB, "delete from node_unmanaged_procs where node_id = ?",
+			[node_id]);
+		for (u in unmanaged) {
+			exec(DB,
+				"insert into node_unmanaged_procs "
+				+ "(node_id, pid, process_name, vram_mb, gpu_index, "
+				+ " owner_uid, owner_name, observed_at) "
+				+ "values (?, ?, ?, ?, ?, ?, ?, ?)",
+				[node_id, u.pid, u.process_name, u.vram_mb,
+				 u?.gpu_index, u?.owner_uid, u?.owner_name, now]);
+		}
+	}
+
 	// Hardware time-series ingest. One row per metric per heartbeat;
 	// the dashboard renders sparklines from these. Prune > 1hr at the
 	// same time so the table stays bounded without a separate cron.
@@ -271,6 +438,13 @@ fn handle_register(req): object {
 			exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
 				+ "values (?, 'gpu_free_mb', ?, ?, ?)",
 				[node_id, "" + g.index, g.free_mb, now]);
+			// power.draw is per-GPU watts; null for cards without a
+			// power sensor (most consumer Apple GPUs, some old Teslas).
+			if (g?.power_draw_w != null) {
+				exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+					+ "values (?, 'gpu_power_w', ?, ?, ?)",
+					[node_id, "" + g.index, g.power_draw_w, now]);
+			}
 		}
 	}
 	if (hw?.ram_free_mb != null) {
@@ -370,9 +544,9 @@ fn handle_node_llama_cpp(req): object {
 	try {
 		let resp = null;
 		if (req.method == "GET") {
-			resp = get(target, null);
+			resp = cp_get(target);
 		} else {
-			resp = post_json(target, parse(req?.body ?? "{}"));
+			resp = cp_post_json(target, parse(req?.body ?? "{}"));
 		}
 		return { status: resp.status_code, body: resp.body };
 	} catch (e) {
@@ -690,7 +864,7 @@ let PORT_PROBE_MAX_ATTEMPTS = 50;
 // to dance forever past unprobeable ports).
 fn port_free_on_agent(agent_url: string, port: i32): bool {
 	try {
-		let resp = post_json(agent_url + "/port_check", { port: port });
+		let resp = cp_post_json(agent_url + "/port_check", { port: port });
 		if (resp.status_code >= 200 && resp.status_code < 300) {
 			let body = parse(resp.body);
 			return body?.available == true;
@@ -711,7 +885,7 @@ fn pick_port(agent_url: string, default_port: i32): i32 {
 	let agent_port = extract_port(agent_url);
 	if (agent_port > 0) { used["" + agent_port] = true; }
 	try {
-		let resp = get(agent_url + "/services", null);
+		let resp = cp_get(agent_url + "/services");
 		if (resp.status_code >= 200 && resp.status_code < 300) {
 			let services = parse(resp.body);
 			for (s in services) { used["" + s.port] = true; }
@@ -831,7 +1005,7 @@ fn handle_spawn_proxy(req): object {
 		tensor_split: tensor_split,
 	};
 	try {
-		let resp = post_json(agent_url + "/services", agent_payload);
+		let resp = cp_post_json(agent_url + "/services", agent_payload);
 		// Tag the placement decision into the response body so the client
 		// can see what CP picked. Only do this on success.
 		if (resp.status_code >= 200 && resp.status_code < 300) {
@@ -858,7 +1032,7 @@ fn handle_stop_proxy(req): object {
 		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
 	}
 	try {
-		let resp = post_json(agent_url + "/services/stop", { id: id });
+		let resp = cp_post_json(agent_url + "/services/stop", { id: id });
 		return { status: resp.status_code, body: resp.body };
 	} catch (e) {
 		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
@@ -872,7 +1046,7 @@ fn handle_list_services(req): object {
 	let merged = [];
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/services", null);
+			let resp = cp_get(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) {
@@ -919,7 +1093,7 @@ fn find_service_for_profile(profile_name: string) {
 	let agents = list_all_agents();
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/services", null);
+			let resp = cp_get(a.agent_url + "/services");
 			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
 			let entries = parse(resp.body);
 			for (e in entries) {
@@ -1051,7 +1225,7 @@ fn auto_spawn(profile_name: string) {
 
 	let spawn_resp = null;
 	try {
-		spawn_resp = post_json(pick.agent_url + "/services", agent_payload);
+		spawn_resp = cp_post_json(pick.agent_url + "/services", agent_payload);
 	} catch (e) {
 		return { error: { status: 502, body: stringify({
 			error: "auto-spawn: agent unreachable: " + e,
@@ -1192,9 +1366,33 @@ fn nodes_for_dashboard(): array {
 fn handle_ui_nodes(req): object {
 	let nodes = nodes_for_dashboard();
 	let samples = samples_for_dashboard(nodes);
-	let body = render_nodes(nodes, samples, STALE_NODE_SECONDS);
+	let unmanaged = unmanaged_by_node();
+	let body = render_nodes(nodes, samples, unmanaged, STALE_NODE_SECONDS);
 	return { status: 200, body: body,
 		headers: { "content-type": "text/html; charset=utf-8" } };
+}
+
+// Group rows of node_unmanaged_procs by (node_id, gpu_index) so the
+// renderer can drop the relevant entries under the matching GPU row
+// without filtering inline. Shape:
+//   { node_id → { gpu_index_str → [{pid, process_name, vram_mb, owner_name}, ...] } }
+fn unmanaged_by_node(): object {
+	let rows = query(DB,
+		"select node_id, pid, process_name, vram_mb, gpu_index, owner_name "
+		+ "from node_unmanaged_procs order by vram_mb desc", []);
+	let out = {};
+	for (r in rows) {
+		if (!out.has(r.node_id)) { out[r.node_id] = {}; }
+		let key = "" + (r?.gpu_index ?? -1);
+		if (!out[r.node_id].has(key)) { out[r.node_id][key] = []; }
+		out[r.node_id][key].push({
+			pid:          r.pid,
+			process_name: r.process_name,
+			vram_mb:      r.vram_mb,
+			owner_name:   r?.owner_name,
+		});
+	}
+	return out;
 }
 
 fn handle_ui_services(req): object {
@@ -1204,7 +1402,7 @@ fn handle_ui_services(req): object {
 	let merged = [];
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/services", null);
+			let resp = cp_get(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) {
@@ -1233,7 +1431,7 @@ fn aggregated_capabilities(): object {
 	let out = {};
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/capabilities", null);
+			let resp = cp_get(a.agent_url + "/capabilities");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				out[a.node_id] = parse(resp.body);
 			}
@@ -1443,7 +1641,7 @@ fn handle_distribute(req): object {
 	}
 
 	try {
-		let resp = post_json(target_url + "/models/pull", pull_body);
+		let resp = cp_post_json(target_url + "/models/pull", pull_body);
 		// Enrich the response with what we picked so the UI can show
 		// "pulling from {repo} via HF" or "pulling from schneewolf via peer".
 		if (resp.status_code >= 200 && resp.status_code < 300) {
@@ -1460,13 +1658,148 @@ fn handle_distribute(req): object {
 	}
 }
 
+// ── HuggingFace search + pull (v0.7+ slice C4) ───────────────────────
+//
+// CP-side proxies for the HF public API so the dashboard can let an
+// operator type a name → pick a repo → pick a quant file → pull it
+// onto a node. The agent already knows how to do `kind=huggingface`
+// downloads; this just resolves the (repo, file) pair from a search
+// query and brokers a single round-trip.
+//
+// All three endpoints take JSON bodies via POST rather than query
+// strings because the router does exact path matching and HF repo
+// IDs contain '/' which makes path-segment encoding awkward.
+
+let HF_API_BASE = "https://huggingface.co/api";
+
+fn handle_hf_search(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let q = payload?.q;
+	if (q == null || q == "") {
+		return { status: 400, body: stringify({ error: "q required" })};
+	}
+	// HF supports search + filter=gguf to narrow to GGUF-bearing repos.
+	// limit=20 is plenty for a UI picker.
+	let url = HF_API_BASE + "/models?search=" + q + "&filter=gguf&limit=20";
+	try {
+		let resp = get(url, []);
+		if (resp.status_code != 200) {
+			return { status: 502, body: stringify({
+				error: "HF search " + resp.status_code, body: resp.body }) };
+		}
+		let raw = parse(resp.body);
+		let slim = [];
+		for (m in raw) {
+			slim.push({
+				id:        m?.id,
+				downloads: m?.downloads ?? 0,
+				likes:     m?.likes ?? 0,
+				updated:   m?.lastModified,
+			});
+		}
+		return { status: 200, body: stringify(slim) };
+	} catch (e) {
+		return { status: 502, body: stringify({
+			error: "HF unreachable: " + e })};
+	}
+}
+
+fn handle_hf_files(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let repo = payload?.repo;
+	if (repo == null || repo == "") {
+		return { status: 400, body: stringify({ error: "repo required" })};
+	}
+	let url = HF_API_BASE + "/models/" + repo + "/tree/main?recursive=true";
+	try {
+		let resp = get(url, []);
+		if (resp.status_code != 200) {
+			return { status: 502, body: stringify({
+				error: "HF tree " + resp.status_code, body: resp.body }) };
+		}
+		let raw = parse(resp.body);
+		// Filter to .gguf files only; tag whether the file is sharded
+		// so the picker can warn (multi-part GGUFs need all parts +
+		// llama.cpp picks them up by base path).
+		let ggufs = [];
+		for (e in raw) {
+			if (e?.type == "file" && e?.path != null
+				&& e.path.ends_with(".gguf")) {
+				ggufs.push({
+					path: e.path,
+					size: e?.size ?? 0,
+					sharded: e.path.find("-of-") >= 0,
+				});
+			}
+		}
+		return { status: 200, body: stringify(ggufs) };
+	} catch (e) {
+		return { status: 502, body: stringify({
+			error: "HF unreachable: " + e })};
+	}
+}
+
+// Default alias for a freshly-pulled HF file: filename minus `.gguf`,
+// lowercased, dashes for underscores. Operator can override in the
+// pull body. Sharded files (`…-00001-of-00003.gguf`) lose the shard
+// suffix so all parts share an alias.
+fn default_alias_for_hf(file: string): string {
+	let base = file;
+	let slash = base.find("/");
+	while (slash >= 0) {
+		base = base.substr(slash + 1, base.length - slash - 1);
+		slash = base.find("/");
+	}
+	if (base.ends_with(".gguf")) {
+		base = base.substr(0, base.length - 5);
+	}
+	let shard = base.find("-00001-of-");
+	if (shard > 0) { base = base.substr(0, shard); }
+	return base.to_lower();
+}
+
+fn handle_pull_hf(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let repo = payload?.repo;
+	let file = payload?.file;
+	let target_node = payload?.target_node;
+	if (repo == null || file == null || target_node == null) {
+		return { status: 400, body: stringify({
+			error: "repo + file + target_node required" })};
+	}
+	let alias = payload?.alias;
+	if (alias == null || alias == "") { alias = default_alias_for_hf(file); }
+
+	let target_url = lookup_agent(target_node);
+	if (target_url == null) {
+		return { status: 404, body: stringify({
+			error: "no agent for target_node: " + target_node })};
+	}
+	let pull_body = { alias: alias,
+		source: { kind: "huggingface", repo: repo, file: file } };
+	try {
+		let resp = cp_post_json(target_url + "/models/pull", pull_body);
+		if (resp.status_code >= 200 && resp.status_code < 300) {
+			let body = parse(resp.body);
+			body["target_node"] = target_node;
+			body["alias"] = alias;
+			body["source"] = pull_body.source;
+			return { status: resp.status_code, body: stringify(body) };
+		}
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({
+			error: "target agent unreachable: " + e })};
+	}
+}
+
 // ── transfers aggregator ─────────────────────────────────────────────
 fn aggregated_transfers(): array {
 	let agents = list_all_agents();
 	let merged = [];
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/models/transfers", null);
+			let resp = cp_get(a.agent_url + "/models/transfers");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) {
@@ -1481,6 +1814,330 @@ fn aggregated_transfers(): array {
 
 fn handle_list_transfers(req): object {
 	return { status: 200, body: stringify(aggregated_transfers()) };
+}
+
+// ── bench ────────────────────────────────────────────────────────
+//
+// Operator-triggered benchmark. Pin-spawn a profile on a target
+// node, fire N timed completion requests, record aggregate stats,
+// stop the service. All async — POST returns 202 + bench_id, then
+// the operator polls /api/bench/{id} for progress.
+
+let BENCH_READY_TIMEOUT_SECONDS = 120;
+let BENCH_REQUEST_TIMEOUT_MS    = 120000;
+
+// Median of an array of numbers. Mutates input via sort. Empty array
+// → 0. We use median (not mean) because a single slow first request
+// — typical when the model is still warming up its sampler state —
+// shouldn't dominate the perceived per-token throughput number.
+fn median(xs: array): f64 {
+	if (xs.length == 0) { return 0.0; }
+	xs.sort();
+	let n: i32 = i32(xs.length);
+	let mid: i32 = n / 2;
+	if (n % 2 == 1) { return f64(xs[mid]); }
+	return (f64(xs[mid - 1]) + f64(xs[mid])) / 2.0;
+}
+
+fn fetch_node_build_hash(node_id: string) {
+	let rows = query(DB,
+		"select runtime_json from nodes where node_id = ?", [node_id]);
+	if (rows.length == 0 || rows[0]?.runtime_json == null) { return null; }
+	let rt = parse(rows[0].runtime_json);
+	return rt?.llama_server?.build_hash;
+}
+
+// The actual bench task. Runs detached on a worker thread.
+async fn bench_task(bench_id: string, target_node: string,
+                    profile_name: string, prompt: string,
+                    n_predict: i32, repetitions: i32): null {
+	// Fetch profile so we can do the spawn. fetch_profile is the
+	// same lookup the routing proxy uses; null = unknown profile.
+	let profile = fetch_profile_by_name(profile_name);
+	if (profile == null) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["unknown profile: " + profile_name, bench_id]);
+		return null;
+	}
+	let agent_url = lookup_agent(target_node);
+	if (agent_url == null) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["no agent for node: " + target_node, bench_id]);
+		return null;
+	}
+
+	// Resolve the model. Same priority as handle_spawn_proxy: alias
+	// → catalog row's path on this node, else profile.default_model.
+	let model_path = null;
+	let resolved_gpus = null;
+	let resolved_split = null;
+	if (profile?.model_alias != null) {
+		// Look up the alias on the TARGET node (placement is forced).
+		let rows = query(DB,
+			"select path from node_models where node_id = ? and alias = ?",
+			[target_node, profile.model_alias]);
+		if (rows.length > 0) { model_path = rows[0].path; }
+	}
+	if (model_path == null) { model_path = profile?.default_model; }
+	let mp = model_path;
+	if (mp == null) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["no model resolvable for profile " + profile_name + " on node " + target_node,
+			 bench_id]);
+		return null;
+	}
+
+	// For multi-GPU placement on this target, defer to pick_gpu_subset
+	// like the routing proxy does (operator can pin in a future flag,
+	// but for now bench picks intelligently).
+	let nodes = query(DB,
+		"select hardware_json from nodes where node_id = ?", [target_node]);
+	if (nodes.length > 0) {
+		let hw = parse(nodes[0].hardware_json);
+		let gpus = hw?.gpus ?? [];
+		let est = estimate_vram_from_ingredients_or_path(profile, mp, target_node);
+		let subset = pick_gpu_subset(gpus, est);
+		if (subset != null) {
+			resolved_gpus = subset.indices;
+			if (subset.indices.length > 1) { resolved_split = subset.tensor_split; }
+		}
+	}
+	if (resolved_gpus == null) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["bench: no GPU subset on " + target_node + " fits this profile",
+			 bench_id]);
+		return null;
+	}
+
+	// Capture build_hash NOW so the bench result is pinned to the
+	// exact build that ran it (operator might activate a different
+	// build mid-way — we want the recorded one).
+	let build_hash = fetch_node_build_hash(target_node);
+	db_exec(DB,
+		"update bench_runs set status='spawning', build_hash=? where id=?",
+		[build_hash, bench_id]);
+
+	let port = pick_port(agent_url, profile.default_port);
+	let agent_payload = {
+		profile_name: profile_name,
+		profile:      profile,
+		model:        mp,
+		port:         port,
+		gpus:         resolved_gpus,
+		tensor_split: resolved_split,
+	};
+
+	let spawn_resp = null;
+	try {
+		spawn_resp = cp_post_json(agent_url + "/services", agent_payload);
+	} catch (e) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["spawn failed: " + e, bench_id]);
+		return null;
+	}
+	if (spawn_resp.status_code < 200 || spawn_resp.status_code >= 300) {
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["spawn HTTP " + spawn_resp.status_code + ": " + spawn_resp.body, bench_id]);
+		return null;
+	}
+	let svc = parse(spawn_resp.body);
+	let svc_id = svc.id;
+	let host = extract_host(agent_url);
+
+	if (!wait_for_service_ready(host, port)) {
+		try { cp_post_json(agent_url + "/services/stop", { id: svc_id }); } catch (e) { }
+		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
+			["service didn't become ready in " + AUTOSPAWN_READY_TIMEOUT_SECONDS + "s", bench_id]);
+		return null;
+	}
+
+	db_exec(DB, "update bench_runs set status='running' where id=?", [bench_id]);
+
+	// Fire repetitions sequentially. Concurrent fire would inflate
+	// per-request latency through queueing on the single-slot
+	// llama-server we spawned (parallel_slots: 1 in the chat profile);
+	// sequential gives us realistic per-request numbers.
+	let llama_url = "http://" + host + ":" + port + "/completion";
+	let body_json = stringify({
+		prompt:    prompt,
+		n_predict: n_predict,
+		stream:    false,
+	});
+	let headers = ["Content-Type: application/json"];
+	let ttft_samples = [];
+	let total_samples = [];
+	let tokens_samples = [];
+	let toksec_samples = [];
+	let first_output = null;
+	let r = 0;
+	while (r < repetitions) {
+		let t0 = unix_ms();
+		let resp = null;
+		try {
+			resp = http_request_timeout("POST", llama_url, body_json, headers, BENCH_REQUEST_TIMEOUT_MS);
+		} catch (e) {
+			eprint("[bench " + bench_id + "] rep " + r + " failed: " + e);
+			r = r + 1;
+			continue;
+		}
+		let t_total = unix_ms() - t0;
+		if (resp.status_code < 200 || resp.status_code >= 300) {
+			eprint("[bench " + bench_id + "] rep " + r + " HTTP " + resp.status_code);
+			r = r + 1;
+			continue;
+		}
+		let body = parse(resp.body);
+		// llama-server's /completion response includes a `timings`
+		// block with per-token detail. Use it when available; falls
+		// back to wall-clock if not.
+		let timings = body?.timings;
+		let predicted_n = body?.tokens_predicted ?? 0;
+		let predicted_ms = (timings?.predicted_ms ?? f64(t_total));
+		let prompt_ms = timings?.prompt_ms ?? 0.0;
+		// TTFT ≈ time spent processing the prompt before the first
+		// output token. With stream:false we don't see real TTFT
+		// (the whole response arrives at once) — use prompt_ms as a
+		// proxy.
+		ttft_samples.push(i32(prompt_ms));
+		total_samples.push(t_total);
+		tokens_samples.push(predicted_n);
+		if (predicted_ms > 0.0 && predicted_n > 0) {
+			toksec_samples.push(f64(predicted_n) * 1000.0 / predicted_ms);
+		}
+		if (first_output == null) {
+			let content = body?.content ?? "";
+			if (content.length > 500) { content = content.substr(0, 500); }
+			first_output = content;
+		}
+		r = r + 1;
+	}
+
+	// Stop the service before recording — we want the row to be
+	// final state, not a "complete but service is still draining"
+	// confusion.
+	try { cp_post_json(agent_url + "/services/stop", { id: svc_id }); } catch (e) { }
+
+	let ttft_med    = median(ttft_samples);
+	let total_med   = median(total_samples);
+	let tokens_med  = median(tokens_samples);
+	let toksec_med  = 0.0;
+	if (toksec_samples.length > 0) {
+		toksec_med = median(toksec_samples);
+	}
+	let now = iso_now();
+	db_exec(DB,
+		"update bench_runs "
+		+ "set status='complete', ttft_ms_median=?, tok_per_sec_median=?, "
+		+ "total_ms_median=?, tokens_predicted_median=?, output_excerpt=?, "
+		+ "completed_at=? "
+		+ "where id=?",
+		[ttft_med, toksec_med, total_med, i32(tokens_med),
+		 (first_output ?? ""), now, bench_id]);
+	print("[bench] " + bench_id + " complete: median "
+		+ i32(toksec_med) + " tok/s on " + target_node);
+	return null;
+}
+
+// Compute an estimated VRAM number for this (profile, model) on this
+// node. Tries the catalog row's pre-extracted ingredients first; if
+// the alias isn't in this node's catalog (e.g. operator passed a
+// raw default_model path), falls back to a conservative 1.5x file
+// size estimate so we at least pick *some* GPU.
+fn estimate_vram_from_ingredients_or_path(profile, model_path, target_node: string): f64 {
+	let alias = profile?.model_alias;
+	if (alias != null) {
+		let rows = query(DB,
+			"select size_mb, architecture, n_layers, n_heads, n_kv_heads, embedding_length "
+			+ "from node_models where node_id = ? and alias = ?",
+			[target_node, alias]);
+		if (rows.length > 0) {
+			let est = estimate_vram_from_ingredients(rows[0],
+				i32(profile.context), profile.kv_type);
+			return est.total_mb;
+		}
+	}
+	return 1.5 * 8000.0;  // ~12 GB best-effort fallback
+}
+
+fn handle_create_bench(req): object {
+	let payload = null;
+	try { payload = parse(req.body); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	let target_node  = payload?.target_node;
+	let profile_name = payload?.profile_name;
+	let prompt       = payload?.prompt;
+	let n_predict    = payload?.n_predict ?? 100;
+	let repetitions  = payload?.repetitions ?? 3;
+	if (target_node == null || profile_name == null || prompt == null) {
+		return { status: 400, body: stringify({
+			error: "target_node, profile_name, prompt required",
+		})};
+	}
+	let r = query(DB, "select hex(randomblob(8)) as id", []);
+	let id = r[0].id;
+	let now = iso_now();
+	exec(DB,
+		"insert into bench_runs "
+		+ "(id, node_id, profile_name, prompt, n_predict, repetitions, status, started_at) "
+		+ "values (?, ?, ?, ?, ?, ?, 'queued', ?)",
+		[id, target_node, profile_name, prompt, n_predict, repetitions, now]);
+	let t = spawn(bench_task, id, target_node, profile_name, prompt, n_predict, repetitions);
+	detach(t);
+	return { status: 202, body: stringify({
+		bench_id: id, target_node: target_node, profile_name: profile_name,
+	})};
+}
+
+fn bench_row_to_obj(row): object {
+	return {
+		id:                       row.id,
+		node_id:                  row.node_id,
+		profile_name:             row.profile_name,
+		build_hash:               row?.build_hash,
+		prompt:                   row.prompt,
+		n_predict:                row.n_predict,
+		repetitions:              row.repetitions,
+		ttft_ms_median:           row?.ttft_ms_median,
+		tok_per_sec_median:       row?.tok_per_sec_median,
+		total_ms_median:          row?.total_ms_median,
+		tokens_predicted_median:  row?.tokens_predicted_median,
+		output_excerpt:           row?.output_excerpt,
+		status:                   row.status,
+		error:                    row?.error,
+		started_at:               row.started_at,
+		completed_at:             row?.completed_at,
+	};
+}
+
+fn handle_list_bench(req): object {
+	let rows = query(DB,
+		"select id, node_id, profile_name, build_hash, prompt, n_predict, "
+		+ "repetitions, ttft_ms_median, tok_per_sec_median, total_ms_median, "
+		+ "tokens_predicted_median, output_excerpt, status, error, "
+		+ "started_at, completed_at "
+		+ "from bench_runs order by started_at desc limit 100", []);
+	let out = [];
+	for (row in rows) { out.push(bench_row_to_obj(row)); }
+	return { status: 200, body: stringify(out) };
+}
+
+fn handle_get_bench(req): object {
+	let prefix = "/api/bench/";
+	let id = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (id.length == 0) {
+		return { status: 400, body: "{\"error\":\"bench id required\"}" };
+	}
+	let rows = query(DB,
+		"select id, node_id, profile_name, build_hash, prompt, n_predict, "
+		+ "repetitions, ttft_ms_median, tok_per_sec_median, total_ms_median, "
+		+ "tokens_predicted_median, output_excerpt, status, error, "
+		+ "started_at, completed_at "
+		+ "from bench_runs where id = ?", [id]);
+	if (rows.length == 0) {
+		return { status: 404, body: stringify({ error: "no such bench: " + id }) };
+	}
+	return { status: 200, body: stringify(bench_row_to_obj(rows[0])) };
 }
 
 // ── profile CRUD ─────────────────────────────────────────────────
@@ -1611,7 +2268,7 @@ fn handle_delete_profile(req): object {
 	let in_use = [];
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/services", null);
+			let resp = cp_get(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let services = parse(resp.body);
 				for (s in services) {
@@ -1673,11 +2330,13 @@ let SAMPLE_HISTORY_POINTS = 60;
 fn samples_for_dashboard(nodes_data): object {
 	let out = {};
 	for (n in nodes_data) {
-		let bundle = { gpu: {}, ram: [], disk: {} };
+		let bundle = { gpu: {}, gpu_power: {}, ram: [], disk: {} };
 		let gpus = n.hardware?.gpus ?? [];
 		for (g in gpus) {
 			bundle.gpu["" + g.index] = fetch_samples(n.node_id,
 				"gpu_free_mb", "" + g.index, SAMPLE_HISTORY_POINTS);
+			bundle.gpu_power["" + g.index] = fetch_samples(n.node_id,
+				"gpu_power_w", "" + g.index, SAMPLE_HISTORY_POINTS);
 		}
 		bundle.ram = fetch_samples(n.node_id, "ram_free_mb", null,
 			SAMPLE_HISTORY_POINTS);
@@ -1715,7 +2374,7 @@ fn compute_stats(): object {
 	let running = 0;
 	for (a in agents) {
 		try {
-			let resp = get(a.agent_url + "/services", null);
+			let resp = cp_get(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) { if (e?.alive == true) { running = running + 1; } }
@@ -1761,6 +2420,19 @@ fn handle_page_overview(req): object  { return html_response(OVERVIEW_HTML); }
 fn handle_page_catalog(req): object   { return html_response(PAGE_CATALOG); }
 fn handle_page_transfers(req): object { return html_response(PAGE_TRANSFERS); }
 fn handle_page_profiles(req): object  { return html_response(PAGE_PROFILES); }
+fn handle_page_bench(req): object     { return html_response(PAGE_BENCH); }
+
+// /ui/bench fragment — newest 100 bench rows.
+fn handle_ui_bench(req): object {
+	let rows = query(DB,
+		"select id, node_id, profile_name, build_hash, prompt, n_predict, "
+		+ "repetitions, ttft_ms_median, tok_per_sec_median, total_ms_median, "
+		+ "tokens_predicted_median, output_excerpt, status, error, "
+		+ "started_at, completed_at "
+		+ "from bench_runs order by started_at desc limit 100", []);
+	return { status: 200, body: render_bench(rows),
+		headers: { "content-type": "text/html; charset=utf-8" } };
+}
 
 fn handle_dashboard_css(req): object {
 	return { status: 200, body: SHELL_CSS,
@@ -1784,10 +2456,16 @@ fn main(): null {
 	DB = open_db(DB_PATH);
 	init_db(DB);
 	print("[cp] sqlite ready: " + DB_PATH);
+	init_auth();
 
+	// `public: true` flag opts a route OUT of the shared-secret check.
+	// Used for: dashboard HTML shell, static assets, /healthz, dashboard
+	// fragments + read-only JSON the dashboard JS hits (no operator
+	// cookie yet — slice 2 will lock these), and /v1/llama/* (consumer
+	// surface getting its own API tokens in slice 3).
 	let routes = [
 		{ method: "POST", path: "/register",      handler: handle_register },
-		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes },
+		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes,         public: true },
 		{ method: "PATCH", path: "/api/nodes/",   prefix: true, handler: handle_patch_node },
 		// Node-scoped llama_cpp proxies (since v0.7 C2). Method = *
 		// so GET (list installed) + POST (install/activate) hit the
@@ -1801,48 +2479,62 @@ fn main(): null {
 			}
 			return handle_node_llama_cpp(req);
 		} },
-		{ method: "GET",  path: "/healthz",       handler: handle_health },
+		{ method: "GET",  path: "/healthz",       handler: handle_health,             public: true },
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
 		// Dashboard shell + static assets (all baked into the binary)
-		{ method: "GET",  path: "/",                       handler: handle_page_overview },
-		{ method: "GET",  path: "/catalog",                handler: handle_page_catalog },
-		{ method: "GET",  path: "/transfers",              handler: handle_page_transfers },
-		{ method: "GET",  path: "/profiles",               handler: handle_page_profiles },
-		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css },
-		{ method: "GET",  path: "/assets/dashboard.js",    handler: handle_dashboard_js },
-		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo },
+		{ method: "GET",  path: "/",                       handler: handle_page_overview,    public: true },
+		{ method: "GET",  path: "/catalog",                handler: handle_page_catalog,     public: true },
+		{ method: "GET",  path: "/transfers",              handler: handle_page_transfers,   public: true },
+		{ method: "GET",  path: "/profiles",               handler: handle_page_profiles,    public: true },
+		{ method: "GET",  path: "/bench",                  handler: handle_page_bench,       public: true },
+		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css,    public: true },
+		{ method: "GET",  path: "/assets/dashboard.js",    handler: handle_dashboard_js,     public: true },
+		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo,             public: true },
 		// Dashboard live fragments + JSON profiles (the form needs structured data)
-		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes },
-		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services },
-		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles },
-		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities },
+		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes,         public: true },
+		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      public: true },
+		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      public: true },
+		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  public: true },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles
 		// at the URL roots. Spawn form's onProfileChange() fetch
 		// updated to match.
 		// Profiles CRUD lives under /api/profiles[/{name}] since v0.7
 		// (CP-owned storage, was baked into agent binaries before).
-		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2 },
+		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2, public: true },
 		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
-		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile },
+		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile,    public: true },
 		{ method: "PUT",  path: "/api/profiles/",   prefix: true, handler: handle_update_profile },
 		{ method: "DELETE", path: "/api/profiles/", prefix: true, handler: handle_delete_profile },
-		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog },
-		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog },
+		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog,     public: true },
+		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog,       public: true },
 		{ method: "POST", path: "/models/distribute", handler: handle_distribute },
-		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers },
-		{ method: "GET",  path: "/ui/transfers",    handler: handle_ui_transfers },
-		{ method: "GET",  path: "/ui/missing",      handler: handle_ui_missing },
-		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats },
+		// HF search + pull (slice C4) — operator types a name in the
+		// catalog page, picks a quant, kicks off a transfer to a node.
+		{ method: "POST", path: "/api/hf/search",   handler: handle_hf_search },
+		{ method: "POST", path: "/api/hf/files",    handler: handle_hf_files },
+		{ method: "POST", path: "/models/pull_hf",  handler: handle_pull_hf },
+		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   public: true },
+		// Bench (v0.7+ slice C3): operator-triggered benchmarks of
+		// (node × profile × build) combos. POST kicks off async,
+		// GETs read history.
+		{ method: "POST", path: "/api/bench",       handler: handle_create_bench },
+		{ method: "GET",  path: "/api/bench",       handler: handle_list_bench,       public: true },
+		{ method: "GET",  path: "/api/bench/",      prefix: true, handler: handle_get_bench,      public: true },
+		{ method: "GET",  path: "/ui/bench",        handler: handle_ui_bench,         public: true },
+		{ method: "GET",  path: "/ui/transfers",    handler: handle_ui_transfers,     public: true },
+		{ method: "GET",  path: "/ui/missing",      handler: handle_ui_missing,       public: true },
+		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats,         public: true },
 		// Inference routing — prefix-matches anything under /v1/llama/.
-		// method "*" means any HTTP method is forwarded.
+		// method "*" means any HTTP method is forwarded. Public for now;
+		// slice 3 protects with per-consumer API tokens.
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
-		  prefix: true },
+		  prefix: true, public: true },
 	];
 
-	serve(HOST, PORT, routes);
+	serve(HOST, PORT, routes, cp_auth_check);
 	close_db(DB);
 	return null;
 }

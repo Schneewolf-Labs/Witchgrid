@@ -155,7 +155,9 @@ export fn write_response(stream, resp): null {
 //
 // A route with method == "*" matches any method — used by the inference
 // proxy so /v1/llama/{profile}/{...} forwards GET, POST, etc. uniformly.
-export fn dispatch(req, routes): object {
+//
+// auth_check (optional): see cp/http_server.hml — same semantics here.
+export fn dispatch(req, routes, auth_check): object {
 	if (req == null) {
 		return { status: 400, body: "{\"error\":\"bad request\"}" };
 	}
@@ -164,6 +166,10 @@ export fn dispatch(req, routes): object {
 		if (route?.prefix == true) { continue; }
 		let method_match = (route.method == req.method) || (route.method == "*");
 		if (method_match && route.path == req.path) {
+			if (auth_check != null) {
+				let denied = auth_check(req, route);
+				if (denied != null) { return denied; }
+			}
 			try {
 				return route.handler(req);
 			} catch (e) {
@@ -177,6 +183,10 @@ export fn dispatch(req, routes): object {
 		if (route?.prefix != true) { continue; }
 		let method_match = (route.method == req.method) || (route.method == "*");
 		if (method_match && req.path.starts_with(route.path)) {
+			if (auth_check != null) {
+				let denied = auth_check(req, route);
+				if (denied != null) { return denied; }
+			}
 			try {
 				return route.handler(req);
 			} catch (e) {
@@ -202,10 +212,10 @@ export fn dispatch(req, routes): object {
 //     entries array is single-instruction; readers see either the
 //     before or after, never a torn list
 //   - PROFILES + LLM caps: read-only after boot, no contention
-async fn handle_connection(stream, routes): null {
+async fn handle_connection(stream, routes, auth_check): null {
 	try {
 		let req = parse_request(stream);
-		let resp = dispatch(req, routes);
+		let resp = dispatch(req, routes, auth_check);
 		write_response(stream, resp);
 	} catch (e) {
 		eprint("[server] " + e);
@@ -214,8 +224,9 @@ async fn handle_connection(stream, routes): null {
 	return null;
 }
 
-// Serve forever on host:port. routes is array of { method, path, handler }.
-export fn serve(host: string, port: i32, routes): null {
+// Serve forever on host:port. routes is array of { method, path, handler,
+// public? }. auth_check is optional — see dispatch() docs.
+export fn serve(host: string, port: i32, routes, auth_check): null {
 	let listener = TcpListener(host, port);
 	print("[http] listening on " + host + ":" + port);
 	loop {
@@ -223,7 +234,7 @@ export fn serve(host: string, port: i32, routes): null {
 		// Detach so we don't accumulate join handles. If the handler
 		// throws past its own try/catch (shouldn't, dispatch wraps),
 		// the runtime swallows on the worker thread.
-		let t = spawn(handle_connection, stream, routes);
+		let t = spawn(handle_connection, stream, routes, auth_check);
 		detach(t);
 	}
 	return null;

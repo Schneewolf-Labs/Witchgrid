@@ -17,13 +17,14 @@
 
 // Re-export the static assets so cp.hml can hand them to the asset routes
 // without importing them itself. Single import surface for the dashboard.
-import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML,
+import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML, BENCH_HTML,
          STYLES_CSS, DASHBOARD_JS, LOGO_SVG } from "./embedded_assets";
 // Page shells — one per route. Topbar is duplicated across them.
 export let OVERVIEW_HTML  = INDEX_HTML;
 export let PAGE_CATALOG   = CATALOG_HTML;
 export let PAGE_TRANSFERS = TRANSFERS_HTML;
 export let PAGE_PROFILES  = PROFILES_HTML;
+export let PAGE_BENCH     = BENCH_HTML;
 // Shared static assets
 export let SHELL_CSS = STYLES_CSS;
 export let SHELL_JS  = DASHBOARD_JS;
@@ -172,7 +173,7 @@ export fn render_stats(stats): string {
 //
 // Each item gets the same shape: [label] [bar] [free/total] + 30-min
 // sparkline beneath. Same color tokens for everything.
-export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string {
+export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
 	}
@@ -187,6 +188,7 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 		if (stale) { last_class = " class=\"stale\""; }
 
 		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
+		let unmanaged = unmanaged_by_node?[n.node_id] ?? {};
 		let hw = n.hardware ?? {};
 
 		// state badge — colored by meaning. active = green, draining =
@@ -259,6 +261,49 @@ export fn render_nodes(nodes_data, samples_by_node, stale_seconds: i32): string 
 					+ " / " + fmt_mb(g.total_mb) + "</span>"
 				+ "</div>"
 				+ render_sparkline(series, g.total_mb, kind);
+
+			// Unmanaged GPU processes on this GPU index. Each emitted
+			// as an amber sub-row so it's obvious that vram is held by
+			// something witchgrid didn't spawn.
+			let umlist = unmanaged?["" + g.index] ?? [];
+			for (u in umlist) {
+				let owner = u?.owner_name ?? "?";
+				let pname = u?.process_name ?? "?";
+				html = html + "<div class=\"hw-row hw-row-sub hw-row-warn\">"
+					+ "<span class=\"hw-name\">↳ unmanaged</span>"
+					+ "<span class=\"hw-fill\">"
+						+ "<code>" + esc(pname) + "</code>"
+						+ " <span class=\"meta\">pid " + u.pid + " · " + esc(owner) + "</span>"
+					+ "</span>"
+					+ "<span class=\"gpu-mem\">" + fmt_mb(u.vram_mb) + "</span>"
+					+ "</div>";
+			}
+
+			// Power draw sub-row (NVIDIA only — Apple Metal exposes no
+			// power sensor without sudo, so g.power_draw_w is null and
+			// the row is skipped). Bar fills toward power.limit (typically
+			// the card's TDP).
+			if (g?.power_draw_w != null && g?.power_limit_w != null
+				&& g.power_limit_w > 0.0) {
+				let pwr_pct = (g.power_draw_w / g.power_limit_w) * 100.0;
+				if (pwr_pct > 100.0) { pwr_pct = 100.0; }
+				// Power bar uses the inverted scale for color: more power
+				// drawn = warmer, since "free" doesn't apply here. Reuse
+				// util_class against (limit - draw) / limit so we get the
+				// same green/amber/red palette.
+				let headroom = i32(g.power_limit_w - g.power_draw_w);
+				let limit_i = i32(g.power_limit_w);
+				let pwr_kind = util_class(headroom, limit_i);
+				let pwr_series = bundle?.gpu_power?["" + g.index] ?? [];
+				html = html + "<div class=\"hw-row hw-row-sub\">"
+					+ "<span class=\"hw-name\">↳ power</span>"
+					+ "<div class=\"gpu-bar\"><div class=\"bar-" + pwr_kind
+						+ "\" style=\"width: " + pwr_pct + "%;\"></div></div>"
+					+ "<span class=\"gpu-mem\">" + i32(g.power_draw_w)
+						+ " / " + i32(g.power_limit_w) + " W</span>"
+					+ "</div>"
+					+ render_sparkline(pwr_series, limit_i, pwr_kind);
+			}
 		}
 
 		// Disks
@@ -667,6 +712,71 @@ export fn render_profiles(profiles_data): string {
 			+ "<td><code>" + p.default_port + "</code></td>"
 			+ "<td>" + model_cell + "</td>"
 			+ "<td class=\"row-actions\">" + actions + "</td>"
+			+ "</tr>\n";
+	}
+	html = html + "</tbody></table>";
+	return html;
+}
+
+// ── /ui/bench fragment ───────────────────────────────────────────────
+//
+// rows: list of bench_runs ordered newest first. Each row carries
+// {id, node_id, profile_name, build_hash, n_predict, repetitions,
+//  ttft_ms_median, tok_per_sec_median, total_ms_median,
+//  tokens_predicted_median, status, error, started_at, completed_at,
+//  output_excerpt}.
+export fn render_bench(rows): string {
+	if (rows.length == 0) {
+		return "<p class=\"empty\">No bench runs yet. Submit one above.</p>";
+	}
+	let html = "<table>\n"
+		+ "<thead><tr>"
+		+ "<th>node</th><th>profile</th><th>build</th>"
+		+ "<th>n×rep</th><th>ttft</th><th>tok/s</th>"
+		+ "<th>total</th><th>status</th><th>started</th>"
+		+ "</tr></thead>\n<tbody>\n";
+	for (r in rows) {
+		let status_class = "";
+		if (r.status == "complete") { status_class = "alive-yes"; }
+		else if (r.status == "error") { status_class = "alive-no"; }
+		let status_html = "<span class=\"" + status_class + "\">"
+			+ esc(r.status) + "</span>";
+		if (r.status == "error" && r?.error != null) {
+			status_html = status_html
+				+ "<br><span class=\"meta\">"
+				+ esc(r.error.substr(0, 200)) + "</span>";
+		}
+		let ttft = "<span class=\"empty\">—</span>";
+		if (r?.ttft_ms_median != null) {
+			ttft = "<code>" + i32(r.ttft_ms_median) + " ms</code>";
+		}
+		let tps = "<span class=\"empty\">—</span>";
+		if (r?.tok_per_sec_median != null) {
+			let centi: i32 = i32(r.tok_per_sec_median * 100.0);
+			let whole: i32 = centi / 100;
+			let frac:  i32 = centi - whole * 100;
+			let frac_str = "" + frac;
+			if (frac < 10) { frac_str = "0" + frac; }
+			tps = "<code>" + whole + "." + frac_str + " t/s</code>";
+		}
+		let total = "<span class=\"empty\">—</span>";
+		if (r?.total_ms_median != null) {
+			total = "<code>" + i32(r.total_ms_median) + " ms</code>";
+		}
+		let build = "<span class=\"empty\">—</span>";
+		if (r?.build_hash != null) {
+			build = "<code>" + esc(r.build_hash) + "</code>";
+		}
+		html = html + "<tr>"
+			+ "<td><strong>" + esc(r.node_id) + "</strong></td>"
+			+ "<td><code>" + esc(r.profile_name) + "</code></td>"
+			+ "<td>" + build + "</td>"
+			+ "<td><code>" + r.n_predict + "×" + r.repetitions + "</code></td>"
+			+ "<td>" + ttft + "</td>"
+			+ "<td>" + tps + "</td>"
+			+ "<td>" + total + "</td>"
+			+ "<td>" + status_html + "</td>"
+			+ "<td><span class=\"meta\">" + esc(r.started_at) + "</span></td>"
 			+ "</tr>\n";
 	}
 	html = html + "</tbody></table>";

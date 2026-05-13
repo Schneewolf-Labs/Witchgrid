@@ -307,6 +307,13 @@ code {
   font-size: 0.78rem;
 }
 .hw-row-cpu { grid-template-columns: 280px 1fr; }
+/* Sub-row (e.g. GPU power under a GPU's vram row) — slight left
+ * indent + dimmer label so the visual hierarchy is obvious. */
+.hw-row-sub .hw-name { padding-left: 1.25rem; color: var(--fg-dim); }
+/* Amber warn variant — used for "unmanaged" GPU process rows so the
+ * operator notices vram contention from outside witchgrid. */
+.hw-row-warn .hw-name { color: var(--warn); }
+.hw-row-warn .hw-fill code { color: var(--warn); }
 .hw-name { color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .hw-name code { font-size: 0.85em; padding: 0; background: transparent; border: none; }
 .hw-fill { color: var(--fg-1); }
@@ -454,6 +461,11 @@ tr.hw-detail details summary:hover { color: var(--accent); }
 .row-action-danger:hover { background: var(--err-soft); border-color: var(--err); color: var(--err); }
 .row-actions { white-space: nowrap; text-align: right; }
 
+/* HF picker — highlights the currently-selected repo row so the
+ * file-list table below has obvious context. */
+tr.row-selected { background: var(--bg-3); }
+tr.row-selected td { border-color: var(--accent); }
+
 /* ─── modal (profile editor) ──────────────────────────────────── */
 
 [x-cloak] { display: none !important; }
@@ -463,7 +475,7 @@ tr.hw-detail details summary:hover { color: var(--accent); }
   inset: 0;
   background: rgba(10, 10, 14, 0.7);
   backdrop-filter: blur(2px);
-  display: flex !important;
+  display: flex;
   align-items: flex-start;
   justify-content: center;
   padding: 4rem 1rem 2rem;

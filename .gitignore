@@ -13,3 +13,21 @@ venv/
 .DS_Store
 build/
 dist/
+
+# CP / agent runtime sqlite written next to the binary at root when
+# someone runs `./witchgrid-cp` or `./witchgrid-agent` from the repo
+# directly (sub-dir runs are already covered by cp/.gitignore + agent/.gitignore).
+witchgrid.db
+witchgrid-agent.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Compiled witchgrid binaries (shipped via release artifacts only;
+# source-of-truth is the .hml files).
+witchgrid-agent
+witchgrid-cp
+
+# Local agent logs from manual launches.
+witchgrid-agent.log
+witchgrid-cp.log

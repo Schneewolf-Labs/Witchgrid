@@ -31,6 +31,7 @@
         <a href="/catalog">catalog</a>
         <a href="/transfers">transfers</a>
         <a href="/profiles">profiles</a>
+        <a href="/bench">bench</a>
       </nav>
       <button class="theme-toggle" @click="toggle()" :title="theme === 'dark' ? 'switch to light' : 'switch to dark'">
         <span x-text="theme === 'dark' ? '☀' : '☾'"></span>
@@ -49,11 +50,168 @@
       <div hx-get="/ui/missing" hx-trigger="load, every 30s">loading…</div>
     </section>
 
+    <section x-data="hfPull()">
+      <h2>Pull from HuggingFace</h2>
+      <p class="meta" style="margin: 0 0 0.75rem 0">
+        Search HF for a GGUF, pick a quant, send it to a node. Files land
+        in the agent's canonical model dir and the catalog rescans
+        automatically once the transfer completes.
+      </p>
+
+      <form class="spawn" @submit.prevent="search()">
+        <div style="grid-column: 1 / -1">
+          <label for="hfq">search</label>
+          <input id="hfq" type="text" x-model="q" placeholder="e.g. hemlock-apothecary-7b">
+        </div>
+        <button type="submit" :disabled="searching" x-text="searching ? '…' : 'search'"></button>
+        <p class="msg err" x-show="err" x-text="err"></p>
+      </form>
+
+      <div x-show="repos.length > 0" style="margin-top:1rem">
+        <table>
+          <thead><tr><th>repo</th><th>downloads</th><th>likes</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="r in repos" :key="r.id">
+              <tr :class="r.id === selectedRepo ? 'row-selected' : ''">
+                <td><code x-text="r.id"></code></td>
+                <td><span class="meta" x-text="r.downloads.toLocaleString()"></span></td>
+                <td><span class="meta" x-text="r.likes"></span></td>
+                <td><button type="button" class="row-action"
+                            @click="loadFiles(r.id)"
+                            :disabled="loadingFiles"
+                            x-text="r.id === selectedRepo ? 'selected' : 'list files'"></button></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <div x-show="files.length > 0" style="margin-top:1rem">
+        <h3 style="margin:0 0 0.5rem 0">files in <code x-text="selectedRepo"></code></h3>
+        <table>
+          <thead><tr><th>file</th><th>size</th><th>alias</th><th>node</th><th></th></tr></thead>
+          <tbody>
+            <template x-for="f in files" :key="f.path">
+              <tr>
+                <td>
+                  <code x-text="f.path"></code>
+                  <span x-show="f.sharded" class="badge badge-scan" style="margin-left:0.4rem">sharded</span>
+                </td>
+                <td><span class="meta" x-text="formatSize(f.size)"></span></td>
+                <td><code class="meta" x-text="aliasFor(f.path)"></code></td>
+                <td>
+                  <select x-model="targets[f.path]" style="font-family:ui-monospace,monospace; font-size:0.8rem">
+                    <option value="">target…</option>
+                    <template x-for="n in nodes" :key="n.node_id">
+                      <option :value="n.node_id" x-text="n.node_id"></option>
+                    </template>
+                  </select>
+                </td>
+                <td>
+                  <button type="button" class="row-action"
+                          @click="pull(f)"
+                          :disabled="!targets[f.path] || pullingPath === f.path"
+                          x-text="pullingPath === f.path ? '…' : 'pull'"></button>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+        <p class="msg" :class="pullMsg.startsWith('error') ? 'err' : 'ok'" x-show="pullMsg" x-text="pullMsg" style="margin-top:0.5rem"></p>
+        <p class="meta" style="margin-top:0.5rem">Once started, watch progress on <a href="/transfers">/transfers</a>.</p>
+      </div>
+    </section>
+
     <section>
       <h2>Catalog</h2>
       <p class="meta" style="margin: 0 0 0.5rem 0">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time. Use the per-row picker to copy a model to another node.</p>
       <div hx-get="/ui/catalog" hx-trigger="load, every 10s">loading…</div>
     </section>
   </main>
+
+  <script>
+    function hfPull() {
+      return {
+        q: '',
+        repos: [], files: [], nodes: [], targets: {},
+        selectedRepo: '',
+        searching: false, loadingFiles: false,
+        pullingPath: '', pullMsg: '', err: '',
+        async init() {
+          try {
+            const r = await fetch('/nodes');
+            this.nodes = (await r.json()).filter(n => (n.state || 'active') !== 'disabled');
+          } catch (e) { /* nodes optional for search */ }
+        },
+        async search() {
+          if (!this.q.trim()) return;
+          this.searching = true; this.err = ''; this.repos = []; this.files = []; this.selectedRepo = '';
+          try {
+            const r = await fetch('/api/hf/search', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ q: this.q.trim() }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.err = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else if (d.length === 0) { this.err = 'no GGUF repos matched'; }
+            else { this.repos = d; }
+          } catch (e) { this.err = 'error: ' + e; }
+          this.searching = false;
+        },
+        async loadFiles(repoId) {
+          this.loadingFiles = true; this.selectedRepo = repoId; this.files = []; this.pullMsg = '';
+          try {
+            const r = await fetch('/api/hf/files', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ repo: repoId }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.err = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else if (d.length === 0) { this.err = 'no .gguf files in repo (?)'; }
+            else { this.files = d; this.err = ''; }
+          } catch (e) { this.err = 'error: ' + e; }
+          this.loadingFiles = false;
+        },
+        async pull(f) {
+          const target = this.targets[f.path];
+          if (!target) { this.pullMsg = 'error: pick a target node'; return; }
+          this.pullingPath = f.path; this.pullMsg = '';
+          try {
+            const r = await fetch('/models/pull_hf', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                repo: this.selectedRepo,
+                file: f.path,
+                target_node: target,
+                alias: this.aliasFor(f.path),
+              }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.pullMsg = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else      { this.pullMsg = 'queued ' + d.alias + ' → ' + target + ' (transfer ' + d.transfer_id + ')'; }
+          } catch (e) { this.pullMsg = 'error: ' + e; }
+          this.pullingPath = '';
+        },
+        aliasFor(path) {
+          let base = path.split('/').pop().replace(/\.gguf$/i, '');
+          const shard = base.indexOf('-00001-of-');
+          if (shard > 0) base = base.substring(0, shard);
+          return base.toLowerCase();
+        },
+        formatSize(bytes) {
+          if (bytes >= 1073741824) {
+            return (bytes / 1073741824).toFixed(2) + ' GB';
+          }
+          if (bytes >= 1048576) {
+            return Math.round(bytes / 1048576) + ' MB';
+          }
+          return Math.round(bytes / 1024) + ' KB';
+        },
+      };
+    }
+  </script>
 </body>
 </html>
