@@ -73,14 +73,27 @@ export let INDEX_HTML = "<!doctype html>
           <input id=\"mdl\" type=\"text\" x-model=\"model\" placeholder=\"/path/to/model.gguf or leave blank for catalog\">
         </div>
         <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'spawn'\"></button>
-        <details>
-          <summary>advanced (pin placement)</summary>
-          <div>
-            <input type=\"text\" x-model=\"node_id\" placeholder=\"node_id (auto)\">
-            <input type=\"text\" x-model=\"gpus\" placeholder=\"gpus, e.g. 0,2 (auto)\">
-            <input type=\"number\" x-model=\"port\" placeholder=\"port (auto)\">
-          </div>
-        </details>
+
+        <!-- Pin placement: visible by default since you almost always
+             want it during bring-up. Auto = leave empty. -->
+        <div>
+          <label for=\"sp-node\">node <span class=\"meta\">(blank = auto)</span></label>
+          <select id=\"sp-node\" x-model=\"node_id\">
+            <option value=\"\">— auto —</option>
+            <template x-for=\"n in nodes\" :key=\"n.node_id\">
+              <option :value=\"n.node_id\" x-text=\"n.node_id + ' · ' + n.role + (n.state === 'active' ? '' : ' (' + n.state + ')')\"></option>
+            </template>
+          </select>
+        </div>
+        <div>
+          <label for=\"sp-gpus\">gpus <span class=\"meta\">(comma-separated, blank = auto)</span></label>
+          <input id=\"sp-gpus\" type=\"text\" x-model=\"gpus\" placeholder=\"e.g. 0,2\">
+        </div>
+        <div>
+          <label for=\"sp-port\">port <span class=\"meta\">(blank = auto)</span></label>
+          <input id=\"sp-port\" type=\"number\" x-model=\"port\" placeholder=\"e.g. 18080\">
+        </div>
+
         <p class=\"msg\" :class=\"isError ? 'err' : 'ok'\" x-show=\"message\" x-text=\"message\"></p>
       </form>
     </section>
@@ -1557,9 +1570,9 @@ function themeToggle() {
 function spawnForm() {
   return {
     profiles: {},
+    nodes: [],
     profileName: '',
     model: '',
-    advanced: false,
     node_id: '',
     port: '',
     gpus: '',
@@ -1569,12 +1582,14 @@ function spawnForm() {
 
     async init() {
       try {
-        // /api/profiles since v0.6 — the human-facing /profiles page
-        // owns the URL root now.
-        const r = await fetch('/api/profiles');
-        this.profiles = await r.json();
+        // Profiles + nodes both fetched up front; pin-placement dropdown
+        // needs the node list to be useful, and we want the spawn form
+        // ready as soon as the page paints.
+        const [pr, nr] = await Promise.all([fetch('/api/profiles'), fetch('/nodes')]);
+        this.profiles = await pr.json();
+        this.nodes = (await nr.json()).filter(n => (n.state || 'active') !== 'disabled');
       } catch (e) {
-        this.message = 'could not load profiles: ' + e;
+        this.message = 'could not load form data: ' + e;
         this.isError = true;
       }
     },

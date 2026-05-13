@@ -25,9 +25,9 @@ function themeToggle() {
 function spawnForm() {
   return {
     profiles: {},
+    nodes: [],
     profileName: '',
     model: '',
-    advanced: false,
     node_id: '',
     port: '',
     gpus: '',
@@ -37,12 +37,14 @@ function spawnForm() {
 
     async init() {
       try {
-        // /api/profiles since v0.6 — the human-facing /profiles page
-        // owns the URL root now.
-        const r = await fetch('/api/profiles');
-        this.profiles = await r.json();
+        // Profiles + nodes both fetched up front; pin-placement dropdown
+        // needs the node list to be useful, and we want the spawn form
+        // ready as soon as the page paints.
+        const [pr, nr] = await Promise.all([fetch('/api/profiles'), fetch('/nodes')]);
+        this.profiles = await pr.json();
+        this.nodes = (await nr.json()).filter(n => (n.state || 'active') !== 'disabled');
       } catch (e) {
-        this.message = 'could not load profiles: ' + e;
+        this.message = 'could not load form data: ' + e;
         this.isError = true;
       }
     },
