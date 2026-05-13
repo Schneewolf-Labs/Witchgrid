@@ -1793,6 +1793,85 @@ fn handle_pull_hf(req): object {
 	}
 }
 
+// ── placement preview ───────────────────────────────────────────────
+//
+// POST /api/placement_preview { profile_name } → preview of where an
+// auto-spawn for this profile WOULD land right now (without spawning).
+// Drives the spawn form's "would land on schneewolf GPU 2..." hint.
+// Returns one of:
+//   { ok: true,  node_id, gpu_indices, est_mb, free_mb_on_picked_gpus, model_path }
+//   { ok: false, reason }   -- placement declined; reason is operator-readable
+fn handle_placement_preview(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let profile_name = payload?.profile_name;
+	if (profile_name == null || profile_name == "") {
+		return { status: 400, body: stringify({ error: "profile_name required" }) };
+	}
+	let profile = fetch_profile(profile_name);
+	if (profile == null) {
+		return { status: 404, body: stringify({
+			ok: false, reason: "no profile named " + profile_name }) };
+	}
+
+	// Alias path — same logic as auto_spawn() takes. Only previews the
+	// alias case; default_model fallback would need pick_placement which
+	// stats the file from CP's box and isn't meaningful as a preview.
+	let alias = profile?.model_alias;
+	if (alias == null) {
+		return { status: 200, body: stringify({
+			ok: false,
+			reason: "profile has no model_alias; placement preview only "
+				+ "covers the catalog path. Spawn will fall back to "
+				+ "default_model resolution.",
+		})};
+	}
+	let pick = pick_placement_via_alias(alias, profile);
+	if (pick == null) {
+		// Why no fit? Either no node has the alias, or no GPU has room.
+		let candidates = nodes_with_alias(alias);
+		if (candidates.length == 0) {
+			return { status: 200, body: stringify({
+				ok: false,
+				reason: "alias '" + alias + "' is not on any node's disk. "
+					+ "Pull it via the catalog page first.",
+			})};
+		}
+		// Have the alias, missing VRAM. Estimate the need.
+		let est = estimate_vram_from_ingredients(candidates[0],
+			i32(profile.context), profile.kv_type);
+		return { status: 200, body: stringify({
+			ok: false,
+			reason: "no node has free VRAM to fit the model + KV cache "
+				+ "(~" + i32(est.total_mb) + " MB needed)",
+			est_mb: est.total_mb,
+		})};
+	}
+
+	// Compute free_mb on the picked GPUs so the dashboard can show
+	// the headroom that'd remain after the spawn.
+	let nodes = query(DB,
+		"select hardware_json from nodes where node_id = ?", [pick.node_id]);
+	let free_total: i64 = 0;
+	if (nodes.length > 0) {
+		let hw = parse(nodes[0].hardware_json);
+		let gpus = hw?.gpus ?? [];
+		for (g in gpus) {
+			for (idx in pick.gpu_indices) {
+				if (g.index == idx) { free_total = free_total + g.free_mb; }
+			}
+		}
+	}
+
+	return { status: 200, body: stringify({
+		ok:                    true,
+		node_id:               pick.node_id,
+		gpu_indices:           pick.gpu_indices,
+		est_mb:                pick.est_mb,
+		free_mb_on_picked_gpus: free_total,
+		model_path:            pick.model_path,
+	})};
+}
+
 // ── transfers aggregator ─────────────────────────────────────────────
 fn aggregated_transfers(): array {
 	let agents = list_all_agents();
@@ -2516,6 +2595,7 @@ fn main(): null {
 		{ method: "POST", path: "/api/hf/search",   handler: handle_hf_search },
 		{ method: "POST", path: "/api/hf/files",    handler: handle_hf_files },
 		{ method: "POST", path: "/models/pull_hf",  handler: handle_pull_hf },
+		{ method: "POST", path: "/api/placement_preview", handler: handle_placement_preview, public: true },
 		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   public: true },
 		// Bench (v0.7+ slice C3): operator-triggered benchmarks of
 		// (node × profile × build) combos. POST kicks off async,

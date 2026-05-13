@@ -51,7 +51,7 @@ function spawnForm() {
 
     onProfileChange() {
       const p = this.profiles[this.profileName];
-      if (!p) { this.model = ''; return; }
+      if (!p) { this.model = ''; this.preview = ''; return; }
       if (p.model_alias) {
         this.model = '';
       } else if (p.default_model) {
@@ -59,6 +59,29 @@ function spawnForm() {
       } else {
         this.model = '';
       }
+      this.refreshPreview();
+    },
+    preview: '',
+    async refreshPreview() {
+      this.preview = '…';
+      try {
+        const r = await fetch('/api/placement_preview', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ profile_name: this.profileName }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          const gpuCsv = (d.gpu_indices || []).join(',');
+          const fmtMb = (mb) => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
+          const headroom = (d.free_mb_on_picked_gpus || 0) - (d.est_mb || 0);
+          this.preview = '→ would land on ' + d.node_id + ' GPU ' + gpuCsv
+            + ' · ~' + fmtMb(d.est_mb) + ' needed of ' + fmtMb(d.free_mb_on_picked_gpus) + ' free'
+            + (headroom > 0 ? ' (' + fmtMb(headroom) + ' headroom)' : '');
+        } else {
+          this.preview = '⚠ ' + (d.reason || 'no fit');
+        }
+      } catch (e) { this.preview = ''; }
     },
 
     async submit() {
