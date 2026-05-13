@@ -174,6 +174,44 @@ function profileEditor() {
       // Listen for synthetic events fired by the in-table buttons.
       window.addEventListener('witchgrid:edit-profile', (e) => this.openFor(e.detail.name));
       window.addEventListener('witchgrid:new-profile',  ()  => this.openNew());
+      // Auto-open prefilled from a ?prefill_alias=... query string —
+      // used by the catalog page's "create profile for <alias>" CTA
+      // after a successful HF pull. We pop the query off the URL so a
+      // refresh doesn't re-open the modal.
+      const params = new URLSearchParams(window.location.search);
+      const alias = params.get('prefill_alias');
+      if (alias) {
+        this.openPrefilled({
+          alias,
+          hf_repo: params.get('prefill_hf_repo') || '',
+          hf_file: params.get('prefill_hf_file') || '',
+        });
+        history.replaceState({}, '', window.location.pathname);
+      }
+    },
+
+    async openPrefilled({ alias, hf_repo, hf_file }) {
+      this.reset();
+      this.isNew = true;
+      this.open = true;
+      // Default the profile name to the alias with quant suffix
+      // dropped — operator can edit before save. Sensible defaults
+      // for context + kv_type match the chat-mahou template.
+      this.name = alias.replace(/\.q\d.*$/, '').replace(/[^a-z0-9-]/g, '-');
+      this.model_alias = alias;
+      this.hf_repo = hf_repo;
+      this.hf_file = hf_file;
+      this.context = 8192;
+      this.kv_type = 'q4_0';
+      this.intentRows = [
+        { k: 'context',         v: '8192' },
+        { k: 'kv_cache_k',      v: 'q4_0' },
+        { k: 'kv_cache_v',      v: 'q4_0' },
+        { k: 'gpu_layers',      v: '99' },
+        { k: 'flash_attention', v: 'true' },
+        { k: 'parallel_slots',  v: '1' },
+      ];
+      await this.loadCatalog();
     },
 
     async loadCatalog() {

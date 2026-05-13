@@ -118,6 +118,11 @@
           </tbody>
         </table>
         <p class="msg" :class="pullMsg.startsWith('error') ? 'err' : 'ok'" x-show="pullMsg" x-text="pullMsg" style="margin-top:0.5rem"></p>
+        <p x-show="lastPulled" style="margin-top:0.5rem">
+          <a :href="profileCtaUrl()" class="row-action" style="text-decoration:none; display:inline-block">
+            + create profile for <code x-text="lastPulled?.alias"></code>
+          </a>
+        </p>
         <p class="meta" style="margin-top:0.5rem">Once started, watch progress on <a href="/transfers">/transfers</a>.</p>
       </div>
     </section>
@@ -174,10 +179,12 @@
           } catch (e) { this.err = 'error: ' + e; }
           this.loadingFiles = false;
         },
+        lastPulled: null,
         async pull(f) {
           const target = this.targets[f.path];
           if (!target) { this.pullMsg = 'error: pick a target node'; return; }
           this.pullingPath = f.path; this.pullMsg = '';
+          const alias = this.aliasFor(f.path);
           try {
             const r = await fetch('/models/pull_hf', {
               method: 'POST',
@@ -186,14 +193,34 @@
                 repo: this.selectedRepo,
                 file: f.path,
                 target_node: target,
-                alias: this.aliasFor(f.path),
+                alias: alias,
               }),
             });
             const d = await r.json();
-            if (!r.ok) { this.pullMsg = 'error: ' + (d.error || 'HTTP ' + r.status); }
-            else      { this.pullMsg = 'queued ' + d.alias + ' → ' + target + ' (transfer ' + d.transfer_id + ')'; }
+            if (!r.ok) {
+              this.pullMsg = 'error: ' + (d.error || 'HTTP ' + r.status);
+            } else {
+              this.pullMsg = 'queued ' + d.alias + ' → ' + target + ' (transfer ' + d.transfer_id + ')';
+              // Stash pull info so the CTA can pre-fill the profile
+              // editor once the operator clicks through. We don't wait
+              // for the transfer to complete — the editor doesn't need
+              // the model on disk to save a profile that names the alias.
+              this.lastPulled = { alias, repo: this.selectedRepo, file: f.path };
+            }
           } catch (e) { this.pullMsg = 'error: ' + e; }
           this.pullingPath = '';
+        },
+        // Build the URL that opens /profiles with the editor pre-filled
+        // for the just-pulled alias + HF source. The profiles page picks
+        // up the query string on load via its prefill handler.
+        profileCtaUrl() {
+          if (!this.lastPulled) return '#';
+          const q = new URLSearchParams({
+            prefill_alias: this.lastPulled.alias,
+            prefill_hf_repo: this.lastPulled.repo,
+            prefill_hf_file: this.lastPulled.file,
+          });
+          return '/profiles?' + q.toString();
         },
         aliasFor(path) {
           let base = path.split('/').pop().replace(/\.gguf$/i, '');
