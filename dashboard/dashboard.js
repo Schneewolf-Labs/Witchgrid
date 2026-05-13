@@ -104,6 +104,27 @@ function spawnForm() {
 // htmx-swap-on-event would be cleaner but we'd need a custom event
 // dispatch which adds a moving part for one form).
 
+// Known witchgrid-level intents. Source of truth is agent/intent.hml's
+// build_intents(); keep this list in sync when adding new entries.
+// Each row describes the editor UX for that key:
+//   kind: 'number' | 'kv_quant' | 'tri_bool' | 'text'
+//   help: shown inline under the field, mirrors INTENTS[k].help server-side
+const KNOWN_INTENTS = [
+  { k: 'context',         kind: 'number',   help: 'Prompt+generation context window. Maps to -c / --ctx-size N.' },
+  { k: 'kv_cache_k',      kind: 'kv_quant', help: 'Quantization for the K side of the KV cache.' },
+  { k: 'kv_cache_v',      kind: 'kv_quant', help: 'Quantization for the V side of the KV cache.' },
+  { k: 'parallel_slots',  kind: 'number',   help: 'Parallel decode slots. Set 1 for RP/chat models.' },
+  { k: 'gpu_layers',      kind: 'number',   help: 'Layers to offload to GPU. 99 = all (llama.cpp clamps to model depth).' },
+  { k: 'flash_attention', kind: 'tri_bool', help: 'FlashAttention. true → on, false → off, auto → llama.cpp decides.' },
+  { k: 'host',            kind: 'text',     help: 'Bind address. Spawner overrides; here for completeness.' },
+  { k: 'port',            kind: 'number',   help: 'Bind port. Spawner overrides per-service.' },
+];
+const KV_QUANT_OPTIONS = ['f16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'];
+const KNOWN_INTENT_KEYS = KNOWN_INTENTS.map(i => i.k);
+function intentSpec(k) {
+  return KNOWN_INTENTS.find(i => i.k === k) || { k, kind: 'text', help: '' };
+}
+
 function profileEditor() {
   return {
     open: false,
@@ -115,10 +136,12 @@ function profileEditor() {
     kv_type: 'f16',
     model_alias: '',
     default_model: '',
+    useRawPath: false,        // toggle catalog-dropdown vs raw default_model text
     hf_repo: '',
     hf_file: '',
     extra_flags: '',
     intentRows: [{ k: '', v: '' }],
+    catalog: [],              // [{alias, size_mb, architecture, on_nodes:[...]}]
     error: '',
     busy: false,
 
@@ -128,23 +151,55 @@ function profileEditor() {
       window.addEventListener('witchgrid:new-profile',  ()  => this.openNew());
     },
 
-    addIntent()        { this.intentRows.push({ k: '', v: '' }); },
+    async loadCatalog() {
+      try {
+        const r = await fetch('/api/catalog');
+        if (r.ok) this.catalog = await r.json();
+      } catch (e) { /* dropdown will be empty; raw-path toggle still works */ }
+    },
+
+    intentSpec,                      // expose to template
+    kvQuants: KV_QUANT_OPTIONS,
+    knownIntentKeys: KNOWN_INTENT_KEYS,
+
+    addIntent()        {
+      // Default to the first known key that's not already used, so adding
+      // a row gives the operator a useful starting point.
+      const used = new Set(this.intentRows.map(r => r.k));
+      const next = KNOWN_INTENT_KEYS.find(k => !used.has(k)) || '';
+      this.intentRows.push({ k: next, v: this.defaultIntentValue(next) });
+    },
     removeIntent(i)    { this.intentRows.splice(i, 1); if (this.intentRows.length === 0) this.intentRows.push({k:'',v:''}); },
+    defaultIntentValue(k) {
+      const s = intentSpec(k);
+      if (s.kind === 'kv_quant') return 'f16';
+      if (s.kind === 'tri_bool') return 'true';
+      if (s.kind === 'number')   return '';
+      return '';
+    },
+    onIntentKeyChange(i, newKey) {
+      // Reset value to the new key's default when the operator switches
+      // keys so the input shape matches what they see in the dropdown.
+      this.intentRows[i].k = newKey;
+      this.intentRows[i].v = this.defaultIntentValue(newKey);
+    },
 
     reset() {
       this.name = ''; this.binary = 'llama-server';
       this.default_port = 18080; this.context = 4096; this.kv_type = 'f16';
       this.model_alias = ''; this.default_model = '';
+      this.useRawPath = false;
       this.hf_repo = ''; this.hf_file = '';
       this.extra_flags = '';
       this.intentRows = [{ k: '', v: '' }];
       this.error = '';
     },
 
-    openNew() {
+    async openNew() {
       this.reset();
       this.isNew = true;
       this.open = true;
+      this.loadCatalog();
     },
 
     async openFor(name) {
@@ -152,6 +207,7 @@ function profileEditor() {
       this.isNew = false;
       this.open = true;
       this.busy = true;
+      this.loadCatalog();
       try {
         const r = await fetch('/api/profiles/' + encodeURIComponent(name));
         if (!r.ok) { this.error = 'load failed: HTTP ' + r.status; this.busy = false; return; }
@@ -163,6 +219,9 @@ function profileEditor() {
         this.kv_type = p.kv_type || 'f16';
         this.model_alias = p.model_alias || '';
         this.default_model = p.default_model || '';
+        // Pre-open the raw-path toggle when the profile already uses
+        // default_model without an alias — operator clearly wanted raw.
+        this.useRawPath = !this.model_alias && !!this.default_model;
         if (p.hf_source) {
           this.hf_repo = p.hf_source.repo || '';
           this.hf_file = p.hf_source.file || '';
@@ -199,8 +258,14 @@ function profileEditor() {
         context: parseInt(this.context, 10),
         kv_type: this.kv_type,
       };
-      if (this.model_alias)   profile.model_alias = this.model_alias;
-      if (this.default_model) profile.default_model = this.default_model;
+      // useRawPath gates which model field saves: catalog picker → model_alias,
+      // raw textbox → default_model. We never save both — that hides bugs
+      // where the operator thinks they switched but stale state lingers.
+      if (this.useRawPath) {
+        if (this.default_model) profile.default_model = this.default_model;
+      } else {
+        if (this.model_alias) profile.model_alias = this.model_alias;
+      }
       if (this.hf_repo && this.hf_file) {
         profile.hf_source = { repo: this.hf_repo, file: this.hf_file };
       }
@@ -376,6 +441,28 @@ async function deleteProfile(name) {
     return;
   }
   window.location.reload();
+}
+
+// Stop a running service. Confirm → POST /services/stop → reload.
+// Used by the per-row stop button in the services table.
+async function stopService(id, profile, node) {
+  if (!confirm('Stop ' + profile + ' on ' + node + '?')) return;
+  const r = await fetch('/services/stop', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, node_id: node }),
+  });
+  if (!r.ok && r.status !== 204) {
+    const d = await r.json().catch(() => ({}));
+    alert('Stop failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  // Trigger an immediate refresh of the services panel rather than
+  // waiting for the next 5s htmx poll. Falls back to a full reload
+  // if the panel isn't on this page.
+  const panel = document.querySelector('[hx-get="/ui/services"]');
+  if (panel && window.htmx) { window.htmx.trigger(panel, 'load'); }
+  else { window.location.reload(); }
 }
 
 function editProfile(name) {

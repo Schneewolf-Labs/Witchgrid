@@ -528,18 +528,40 @@ export let PROFILES_HTML = "<!doctype html>
             </div>
             <div>
               <label>kv type</label>
-              <input type=\"text\" x-model=\"kv_type\" placeholder=\"q4_0 / q8_0 / f16\">
+              <select x-model=\"kv_type\">
+                <template x-for=\"q in kvQuants\" :key=\"q\">
+                  <option :value=\"q\" x-text=\"q\"></option>
+                </template>
+              </select>
             </div>
             <div class=\"full\">
-              <label>model alias <span class=\"meta\">(catalog lookup; preferred)</span></label>
-              <input type=\"text\" x-model=\"model_alias\" placeholder=\"mahou-1.5-mistral-nemo-12b.q5_k_m\">
-            </div>
-            <div class=\"full\">
-              <label>default model <span class=\"meta\">(legacy fallback path)</span></label>
-              <input type=\"text\" x-model=\"default_model\" placeholder=\"/path/to/model.gguf\">
+              <label>
+                model
+                <span class=\"meta\" x-show=\"!useRawPath\">(catalog alias — preferred)</span>
+                <span class=\"meta\" x-show=\"useRawPath\">(raw default_model path — fallback)</span>
+              </label>
+              <div x-show=\"!useRawPath\">
+                <select x-model=\"model_alias\" style=\"width:100%\">
+                  <option value=\"\">— pick from catalog —</option>
+                  <template x-for=\"m in catalog\" :key=\"m.alias\">
+                    <option :value=\"m.alias\"
+                            x-text=\"m.alias + ' · ' + (m.size_mb >= 1024 ? (m.size_mb/1024).toFixed(1) + ' GB' : m.size_mb + ' MB') + ' · ' + (m.architecture || '?') + ' · on ' + m.on_nodes.length + ' node' + (m.on_nodes.length === 1 ? '' : 's')\">
+                    </option>
+                  </template>
+                </select>
+                <p class=\"meta\" style=\"margin:0.25rem 0 0 0\">
+                  <a href=\"#\" @click.prevent=\"useRawPath = true\">use raw path instead →</a>
+                </p>
+              </div>
+              <div x-show=\"useRawPath\">
+                <input type=\"text\" x-model=\"default_model\" placeholder=\"/path/to/model.gguf\" style=\"width:100%\">
+                <p class=\"meta\" style=\"margin:0.25rem 0 0 0\">
+                  <a href=\"#\" @click.prevent=\"useRawPath = false; default_model = ''\">← back to catalog picker</a>
+                </p>
+              </div>
             </div>
             <div>
-              <label>HF repo</label>
+              <label>HF repo <span class=\"meta\">(fallback pull source)</span></label>
               <input type=\"text\" x-model=\"hf_repo\" placeholder=\"org/repo-name\">
             </div>
             <div>
@@ -549,10 +571,38 @@ export let PROFILES_HTML = "<!doctype html>
             <div class=\"full\">
               <label>intent <span class=\"meta\">(witchgrid-normalized → llama-server flags)</span></label>
               <template x-for=\"(row, i) in intentRows\" :key=\"i\">
-                <div class=\"intent-row\">
-                  <input type=\"text\" x-model=\"row.k\" placeholder=\"key (e.g. flash_attention)\">
-                  <input type=\"text\" x-model=\"row.v\" placeholder=\"value (true / 131072 / q4_0)\">
-                  <button type=\"button\" class=\"row-action row-action-danger\" @click=\"removeIntent(i)\">×</button>
+                <div>
+                  <div class=\"intent-row\">
+                    <select :value=\"row.k\" @change=\"onIntentKeyChange(i, $event.target.value)\">
+                      <option value=\"\">— pick intent —</option>
+                      <template x-for=\"k in knownIntentKeys\" :key=\"k\">
+                        <option :value=\"k\" x-text=\"k\"></option>
+                      </template>
+                      <option value=\"__custom__\" x-show=\"row.k && !knownIntentKeys.includes(row.k)\" x-text=\"row.k + ' (custom)'\"></option>
+                    </select>
+                    <template x-if=\"intentSpec(row.k).kind === 'kv_quant'\">
+                      <select x-model=\"row.v\">
+                        <template x-for=\"q in kvQuants\" :key=\"q\">
+                          <option :value=\"q\" x-text=\"q\"></option>
+                        </template>
+                      </select>
+                    </template>
+                    <template x-if=\"intentSpec(row.k).kind === 'tri_bool'\">
+                      <select x-model=\"row.v\">
+                        <option value=\"true\">true (on)</option>
+                        <option value=\"false\">false (off)</option>
+                        <option value=\"auto\">auto</option>
+                      </select>
+                    </template>
+                    <template x-if=\"intentSpec(row.k).kind === 'number'\">
+                      <input type=\"number\" x-model=\"row.v\" placeholder=\"e.g. 131072\">
+                    </template>
+                    <template x-if=\"intentSpec(row.k).kind === 'text'\">
+                      <input type=\"text\" x-model=\"row.v\" placeholder=\"value\">
+                    </template>
+                    <button type=\"button\" class=\"row-action row-action-danger\" @click=\"removeIntent(i)\">×</button>
+                  </div>
+                  <p class=\"meta\" x-show=\"row.k && intentSpec(row.k).help\" x-text=\"intentSpec(row.k).help\" style=\"margin:0.15rem 0 0.4rem 0\"></p>
                 </div>
               </template>
               <button type=\"button\" class=\"row-action\" @click=\"addIntent()\" style=\"margin-top:0.25rem\">+ intent</button>
@@ -1256,11 +1306,13 @@ tr.row-selected td { border-color: var(--accent); }
 
 .intent-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 32px;
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, 1.2fr) 32px;
   gap: 0.4rem;
-  margin-bottom: 0.3rem;
+  margin-bottom: 0.15rem;
+  align-items: center;
 }
-.intent-row input { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
+.intent-row input,
+.intent-row select { font-size: 0.78rem; padding: 0.3rem 0.5rem; margin: 0; }
 .intent-row .row-action-danger { padding: 0.2rem; text-align: center; }
 
 /* ─── spawn form ────────────────────────────────────────────────── */
@@ -1329,6 +1381,106 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
 [hx-get] { transition: opacity 150ms; }
 .htmx-swapping { opacity: 0; }
 .htmx-settling { opacity: 1; }
+
+/* ─── responsive (≤768px) ────────────────────────────────────────────
+ *
+ * Mobile layout. Three big shifts vs. desktop:
+ *
+ * 1. Topbar stacks (brand row, then nav, then theme toggle) so the
+ *    nav links don't wrap into a useless cluster.
+ * 2. Spawn form goes single-column — the 220px label column squeezes
+ *    inputs to nothing on a phone.
+ * 3. Tables get horizontal scroll wrappers + tighter padding. The
+ *    nodes table's hw-row grid (280/1fr/130) collapses into a 2-line
+ *    card per item: name on top, bar + value on the row below.
+ *    Sparklines drop to a shorter height since they're just trend.
+ *
+ * Pico's own responsive resets handle font-size/line-height; we only
+ * touch the witchgrid-specific selectors. */
+
+@media (max-width: 768px) {
+  main { padding: 0.5rem; }
+
+  /* Topbar — vertical stack, brand + theme toggle stay paired */
+  .topbar {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+  .brand h1 { font-size: 1.1rem; margin: 0; }
+  .brand img { width: 28px; height: 28px; }
+  .page-nav {
+    order: 3;
+    flex: 1 1 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+  .page-nav a { flex-shrink: 0; padding: 0.35rem 0.7rem; }
+
+  /* Stats tiles — already use auto-fit, but tighten gaps */
+  .stats { gap: 0.5rem; }
+  .stat { padding: 0.6rem 0.75rem; }
+  .stat-label { font-size: 0.62rem; }
+  .stat-value { font-size: 1.1rem; }
+
+  /* Spawn form: single column. The \"advanced\" details inside also
+   * stack since they share the same grid. */
+  form.spawn {
+    grid-template-columns: 1fr;
+    padding: 0.75rem;
+    gap: 0.5rem;
+  }
+  form.spawn details > div { grid-template-columns: 1fr; }
+  /* Trim long help text in labels — full description still readable
+   * via tooltip / focus, but doesn't push the input off-screen */
+  form.spawn label .meta { display: none; }
+
+  /* All tables: tighter padding + smaller font + allow horizontal
+   * scroll as a last resort if a row genuinely doesn't fit */
+  table { font-size: 0.78rem; display: block; overflow-x: auto; }
+  table th, table td { padding: 0.4rem 0.55rem; }
+  table thead { position: sticky; top: 0; z-index: 1; }
+
+  /* Hardware rows on the nodes table — stack vertically: name on
+   * one line, then bar + value on the next. Saves the entire 280px
+   * left column from squeezing the bar to nothing. */
+  .hw-row, .gpu-row {
+    grid-template-columns: 1fr 100px;
+    grid-template-areas:
+      \"name name\"
+      \"bar  value\";
+    gap: 0.25rem 0.5rem;
+    font-size: 0.72rem;
+  }
+  .hw-row .hw-name, .gpu-row .gpu-name { grid-area: name; white-space: normal; }
+  .hw-row .gpu-bar { grid-area: bar; }
+  .hw-row .gpu-mem { grid-area: value; }
+  .hw-row-cpu { grid-template-columns: 1fr; grid-template-areas: \"name\" \"bar\"; }
+  .hw-row-cpu .hw-fill { grid-area: bar; text-align: left; }
+  /* Sub-rows stay indented but tighter */
+  .hw-row-sub .hw-name { padding-left: 0.6rem; }
+
+  /* Sparklines — shorter on mobile, less visual real estate hog */
+  .spark { height: 16px; }
+
+  /* Modal — full-width on phones, tighter padding */
+  .modal-backdrop { padding: 1rem 0.5rem; align-items: flex-start; }
+  .modal-card { padding: 1rem; max-width: 100%; }
+  .modal-card h3 { font-size: 0.95rem; }
+  .form-grid { grid-template-columns: 1fr !important; }
+}
+
+/* Very narrow phones (≤420px) — strip down further */
+@media (max-width: 420px) {
+  .page-nav { font-size: 0.78rem; }
+  .stats { grid-template-columns: 1fr 1fr; }
+  table { font-size: 0.74rem; }
+  .hw-row { grid-template-columns: 1fr 88px; font-size: 0.68rem; }
+  .gpu-mem { font-size: 0.7rem; }
+}
 ";
 
 export let DASHBOARD_JS = "// Witchgrid dashboard JS — Alpine.js components + small UX glue.
@@ -1437,6 +1589,27 @@ function spawnForm() {
 // htmx-swap-on-event would be cleaner but we'd need a custom event
 // dispatch which adds a moving part for one form).
 
+// Known witchgrid-level intents. Source of truth is agent/intent.hml's
+// build_intents(); keep this list in sync when adding new entries.
+// Each row describes the editor UX for that key:
+//   kind: 'number' | 'kv_quant' | 'tri_bool' | 'text'
+//   help: shown inline under the field, mirrors INTENTS[k].help server-side
+const KNOWN_INTENTS = [
+  { k: 'context',         kind: 'number',   help: 'Prompt+generation context window. Maps to -c / --ctx-size N.' },
+  { k: 'kv_cache_k',      kind: 'kv_quant', help: 'Quantization for the K side of the KV cache.' },
+  { k: 'kv_cache_v',      kind: 'kv_quant', help: 'Quantization for the V side of the KV cache.' },
+  { k: 'parallel_slots',  kind: 'number',   help: 'Parallel decode slots. Set 1 for RP/chat models.' },
+  { k: 'gpu_layers',      kind: 'number',   help: 'Layers to offload to GPU. 99 = all (llama.cpp clamps to model depth).' },
+  { k: 'flash_attention', kind: 'tri_bool', help: 'FlashAttention. true → on, false → off, auto → llama.cpp decides.' },
+  { k: 'host',            kind: 'text',     help: 'Bind address. Spawner overrides; here for completeness.' },
+  { k: 'port',            kind: 'number',   help: 'Bind port. Spawner overrides per-service.' },
+];
+const KV_QUANT_OPTIONS = ['f16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'];
+const KNOWN_INTENT_KEYS = KNOWN_INTENTS.map(i => i.k);
+function intentSpec(k) {
+  return KNOWN_INTENTS.find(i => i.k === k) || { k, kind: 'text', help: '' };
+}
+
 function profileEditor() {
   return {
     open: false,
@@ -1448,10 +1621,12 @@ function profileEditor() {
     kv_type: 'f16',
     model_alias: '',
     default_model: '',
+    useRawPath: false,        // toggle catalog-dropdown vs raw default_model text
     hf_repo: '',
     hf_file: '',
     extra_flags: '',
     intentRows: [{ k: '', v: '' }],
+    catalog: [],              // [{alias, size_mb, architecture, on_nodes:[...]}]
     error: '',
     busy: false,
 
@@ -1461,23 +1636,55 @@ function profileEditor() {
       window.addEventListener('witchgrid:new-profile',  ()  => this.openNew());
     },
 
-    addIntent()        { this.intentRows.push({ k: '', v: '' }); },
+    async loadCatalog() {
+      try {
+        const r = await fetch('/api/catalog');
+        if (r.ok) this.catalog = await r.json();
+      } catch (e) { /* dropdown will be empty; raw-path toggle still works */ }
+    },
+
+    intentSpec,                      // expose to template
+    kvQuants: KV_QUANT_OPTIONS,
+    knownIntentKeys: KNOWN_INTENT_KEYS,
+
+    addIntent()        {
+      // Default to the first known key that's not already used, so adding
+      // a row gives the operator a useful starting point.
+      const used = new Set(this.intentRows.map(r => r.k));
+      const next = KNOWN_INTENT_KEYS.find(k => !used.has(k)) || '';
+      this.intentRows.push({ k: next, v: this.defaultIntentValue(next) });
+    },
     removeIntent(i)    { this.intentRows.splice(i, 1); if (this.intentRows.length === 0) this.intentRows.push({k:'',v:''}); },
+    defaultIntentValue(k) {
+      const s = intentSpec(k);
+      if (s.kind === 'kv_quant') return 'f16';
+      if (s.kind === 'tri_bool') return 'true';
+      if (s.kind === 'number')   return '';
+      return '';
+    },
+    onIntentKeyChange(i, newKey) {
+      // Reset value to the new key's default when the operator switches
+      // keys so the input shape matches what they see in the dropdown.
+      this.intentRows[i].k = newKey;
+      this.intentRows[i].v = this.defaultIntentValue(newKey);
+    },
 
     reset() {
       this.name = ''; this.binary = 'llama-server';
       this.default_port = 18080; this.context = 4096; this.kv_type = 'f16';
       this.model_alias = ''; this.default_model = '';
+      this.useRawPath = false;
       this.hf_repo = ''; this.hf_file = '';
       this.extra_flags = '';
       this.intentRows = [{ k: '', v: '' }];
       this.error = '';
     },
 
-    openNew() {
+    async openNew() {
       this.reset();
       this.isNew = true;
       this.open = true;
+      this.loadCatalog();
     },
 
     async openFor(name) {
@@ -1485,6 +1692,7 @@ function profileEditor() {
       this.isNew = false;
       this.open = true;
       this.busy = true;
+      this.loadCatalog();
       try {
         const r = await fetch('/api/profiles/' + encodeURIComponent(name));
         if (!r.ok) { this.error = 'load failed: HTTP ' + r.status; this.busy = false; return; }
@@ -1496,6 +1704,9 @@ function profileEditor() {
         this.kv_type = p.kv_type || 'f16';
         this.model_alias = p.model_alias || '';
         this.default_model = p.default_model || '';
+        // Pre-open the raw-path toggle when the profile already uses
+        // default_model without an alias — operator clearly wanted raw.
+        this.useRawPath = !this.model_alias && !!this.default_model;
         if (p.hf_source) {
           this.hf_repo = p.hf_source.repo || '';
           this.hf_file = p.hf_source.file || '';
@@ -1532,8 +1743,14 @@ function profileEditor() {
         context: parseInt(this.context, 10),
         kv_type: this.kv_type,
       };
-      if (this.model_alias)   profile.model_alias = this.model_alias;
-      if (this.default_model) profile.default_model = this.default_model;
+      // useRawPath gates which model field saves: catalog picker → model_alias,
+      // raw textbox → default_model. We never save both — that hides bugs
+      // where the operator thinks they switched but stale state lingers.
+      if (this.useRawPath) {
+        if (this.default_model) profile.default_model = this.default_model;
+      } else {
+        if (this.model_alias) profile.model_alias = this.model_alias;
+      }
       if (this.hf_repo && this.hf_file) {
         profile.hf_source = { repo: this.hf_repo, file: this.hf_file };
       }
@@ -1709,6 +1926,28 @@ async function deleteProfile(name) {
     return;
   }
   window.location.reload();
+}
+
+// Stop a running service. Confirm → POST /services/stop → reload.
+// Used by the per-row stop button in the services table.
+async function stopService(id, profile, node) {
+  if (!confirm('Stop ' + profile + ' on ' + node + '?')) return;
+  const r = await fetch('/services/stop', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, node_id: node }),
+  });
+  if (!r.ok && r.status !== 204) {
+    const d = await r.json().catch(() => ({}));
+    alert('Stop failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  // Trigger an immediate refresh of the services panel rather than
+  // waiting for the next 5s htmx poll. Falls back to a full reload
+  // if the panel isn't on this page.
+  const panel = document.querySelector('[hx-get=\"/ui/services\"]');
+  if (panel && window.htmx) { window.htmx.trigger(panel, 'load'); }
+  else { window.location.reload(); }
 }
 
 function editProfile(name) {

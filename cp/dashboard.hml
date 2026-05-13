@@ -571,15 +571,11 @@ export fn render_services(services_data): string {
 			let tail = parts[parts.length - 1];
 			if (tail.length > 0) { model = tail; }
 		}
-		// Stop button: plain fetch() onclick rather than htmx so we don't
-		// need the json-enc extension loaded. Auto-refresh picks up the
-		// row removal on the next 5s tick.
-		let stop_js = "if(confirm('Stop " + esc(s.profile) + " on "
-			+ esc(s.node_id) + "?'))"
-			+ "fetch('/services/stop',{method:'POST',"
-			+ "headers:{'content-type':'application/json'},"
-			+ "body:JSON.stringify({id:'" + esc(s.id) + "',"
-				+ "node_id:'" + esc(s.node_id) + "'})})";
+		// Stop button delegates to the global stopService() helper in
+		// dashboard.js so the click → confirm → fetch → in-place panel
+		// refresh stays consistent with the profile delete pattern.
+		let stop_js = "stopService('" + esc(s.id) + "','"
+			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(s.profile) + "</strong></td>"
 			+ "<td>" + esc(s.node_id) + "</td>"
@@ -587,7 +583,8 @@ export fn render_services(services_data): string {
 			+ "<td class=\"" + alive_class + "\">" + alive_text + "</td>"
 			+ "<td><code>" + esc(model) + "</code></td>"
 			+ "<td class=\"id\">" + esc(s.id.substr(0, 8)) + "…</td>"
-			+ "<td><button class=\"secondary stop-btn\""
+			+ "<td class=\"row-actions\">"
+				+ "<button class=\"row-action row-action-danger\""
 				+ " onclick=\"" + stop_js + "\""
 				+ ">stop</button></td>"
 			+ "</tr>\n";
