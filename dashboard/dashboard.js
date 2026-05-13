@@ -443,6 +443,54 @@ async function deleteProfile(name) {
   window.location.reload();
 }
 
+// Inline test-prompt panel (Overview page). Lets the operator send
+// a single completion request through the routing layer without
+// leaving the dashboard — closes the loop on "spawn → verify it
+// answers → stop". Skipped streaming: we want the timings block
+// from the response which the server only returns on stream:false.
+function testPrompt() {
+  return {
+    profiles: {},
+    profile: '',
+    prompt: '<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nWrite a haiku about a thunderstorm.<|im_end|>\n<|im_start|>assistant\n',
+    n_predict: 100,
+    busy: false,
+    error: '',
+    result: null,
+    elapsedMs: 0,
+    async init() {
+      try {
+        const r = await fetch('/api/profiles');
+        if (r.ok) this.profiles = await r.json();
+      } catch (e) { /* dropdown will be empty; user can refresh */ }
+    },
+    async send() {
+      if (!this.profile) { this.error = 'pick a profile'; return; }
+      this.busy = true; this.error = ''; this.result = null;
+      const t0 = performance.now();
+      try {
+        const r = await fetch('/v1/llama/' + encodeURIComponent(this.profile) + '/completion', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            prompt: this.prompt,
+            n_predict: parseInt(this.n_predict, 10),
+            stream: false,
+          }),
+        });
+        this.elapsedMs = Math.round(performance.now() - t0);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.error = 'HTTP ' + r.status + ': ' + (d.error || JSON.stringify(d).substring(0, 200));
+        } else {
+          this.result = d;
+        }
+      } catch (e) { this.error = String(e); }
+      this.busy = false;
+    },
+  };
+}
+
 // Stop a running service. Confirm → POST /services/stop → reload.
 // Used by the per-row stop button in the services table.
 async function stopService(id, profile, node) {
