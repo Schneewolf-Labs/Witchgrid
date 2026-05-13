@@ -56,6 +56,7 @@ import { probe } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
+import { init_llama_cpp_schema, make_handlers as make_llama_cpp_handlers, current_binary_path, detect_flavor } from "./llama_cpp";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -130,7 +131,7 @@ fn register_with_cp(cp_url: string, payload): null {
 // tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
                         agent_url: string, canonical_dir: string,
-                        extra_dirs, models_ref, runtime, interval_seconds: i32): null {
+                        extra_dirs, models_ref, runtime_ref, interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
 		let hw = probe(canonical_dir, extra_dirs);
@@ -142,7 +143,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				hardware:  hw,
 				agent_url: agent_url,
 				models:    models_ref.entries,
-				runtime:   runtime,
+				runtime:   runtime_ref.value,
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -231,18 +232,37 @@ fn main(): null {
 		+ hw.gpus.length + " GPU(s), "
 		+ hw.disks.length + " disk path(s)");
 
-	// Probe llama-server build/version so CP can show "this node is on
-	// b8635" and the operator can decide who needs an upgrade. null
-	// when the binary isn't installed (CPU-only nodes that don't host
-	// llama-server are valid; placement just won't pick them).
-	let runtime = {};
-	let lv = probe_version("llama-server");
-	if (lv != null) {
-		runtime["llama_server"] = lv;
-		print("[agent] llama-server build " + lv.version
-			+ " (" + (lv?.build_hash ?? "?") + ")");
+	// Probe llama-server build/version + capabilities. Both are wrapped
+	// in holder objects so the llama_cpp/activate handler can re-run
+	// these against a freshly-installed binary without restarting the
+	// agent — closures capture the holder by reference.
+	//
+	// current_binary_path() resolves to ~/.witchgrid/llama-server/current/
+	// when there's a Witchgrid-managed install, falls back to bare
+	// "llama-server" (PATH lookup) otherwise.
+	let runtime_ref = { value: {} };
+	let caps_ref    = { llama_server: {} };
+	let do_rescan_caps = fn(): null {
+		let bin = current_binary_path();
+		try { caps_ref.llama_server = introspect(bin); } catch (e) {
+			eprint("[agent] introspect " + bin + " failed: " + e);
+			caps_ref.llama_server = {};
+		}
+		let lv = probe_version(bin);
+		let rt = {};
+		if (lv != null) {
+			rt["llama_server"] = lv;
+			print("[agent] llama-server build " + lv.version
+				+ " (" + (lv?.build_hash ?? "?") + ") at " + bin);
+		}
+		runtime_ref.value = rt;
+		return null;
+	};
+	do_rescan_caps();
+	if (caps_ref.llama_server.keys().length == 0) {
+		print("[agent] llama-server not installed; capabilities empty (spawn will reject until installed)");
 	} else {
-		print("[agent] llama-server not installed or --version failed");
+		print("[agent] llama-server: " + caps_ref.llama_server.keys().length + " flags");
 	}
 
 	// Scan the catalog before first /register so CP gets the model list
@@ -267,18 +287,19 @@ fn main(): null {
 		hardware:  hw,
 		agent_url: agent_url,
 		models:    models_ref.entries,
-		runtime:   runtime,
+		runtime:   runtime_ref.value,
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               canonical_dir, extra_dirs, models_ref, runtime, HEARTBEAT_SECONDS);
+	               canonical_dir, extra_dirs, models_ref, runtime_ref, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
 	let db = open_db(DB_PATH);
 	init_services_schema(db);
 	init_transfers_schema(db);
+	init_llama_cpp_schema(db);
 	let reaped = reap_zombie_services(db);
 	if (reaped > 0) {
 		print("[agent] reaped " + reaped + " zombie service rows from prior run");
@@ -299,14 +320,11 @@ fn main(): null {
 	}
 
 	// Capabilities lookup closure — services.hml uses this to resolve
-	// each profile's intent map at spawn time. Captured-by-reference
-	// so a future on-demand reintrospect (post-llama.cpp-upgrade)
-	// would just need to mutate the table.
-	let caps_by_binary = { "llama-server": llama_caps };
+	// each profile's intent map at spawn time. Reads through caps_ref
+	// so a llama_cpp/activate hot-swap is reflected immediately
+	// without restarting the agent.
 	fn capabilities_for(binary_name) {
-		if (caps_by_binary.has(binary_name)) {
-			return caps_by_binary[binary_name];
-		}
+		if (binary_name == "llama-server") { return caps_ref.llama_server; }
 		return {};
 	}
 
@@ -321,10 +339,23 @@ fn main(): null {
 	let pull = make_pull_handler(db, canonical_dir, do_rescan,
 		extract_url_host(agent_url));
 
+	// llama.cpp install handlers — activate triggers do_rescan_caps
+	// so a fresh build is reflected in /capabilities + the next
+	// heartbeat's runtime field without restarting the agent.
+	let lcpp = make_llama_cpp_handlers(db, do_rescan_caps);
+
+	// Resolve a binary name to its on-disk path. Since v0.7 C2 the
+	// llama_cpp module owns the install layer; current_binary_path()
+	// reads through ~/.witchgrid/llama-server/current/ when set.
+	fn binary_path_for(binary_name) {
+		if (binary_name == "llama-server") { return current_binary_path(); }
+		return binary_name;
+	}
+
 	// Pass our own listen port as reserved so spawn_service refuses to
 	// land an llama-server there (the OS would let two binds compete and
 	// our future restart would lose).
-	let svc = make_handlers(db, [port], capabilities_for);
+	let svc = make_handlers(db, [port], capabilities_for, binary_path_for);
 	let routes = [
 		{ method: "POST", path: "/services",      handler: svc.create },
 		{ method: "GET",  path: "/services",      handler: svc.list },
@@ -333,7 +364,7 @@ fn main(): null {
 		// stub returns 410; route left out so 404 is the response.
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
 			return { status: 200, body: stringify({
-				"llama-server": llama_caps,
+				"llama-server": caps_ref.llama_server,
 			})};
 		} },
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
@@ -381,6 +412,19 @@ fn main(): null {
 		{ method: "POST", path: "/models/pull",   handler: pull },
 		{ method: "GET",  path: "/models/transfers", handler: fn(req): object {
 			return { status: 200, body: stringify(list_transfers(db)) };
+		} },
+		// llama.cpp lifecycle (v0.7 C2): install a build from GitHub
+		// releases, list installed builds, activate one as `current`.
+		// Spawn uses current_binary_path() which honors the symlink.
+		{ method: "POST", path: "/llama_cpp/install",  handler: lcpp.install },
+		{ method: "GET",  path: "/llama_cpp/installed", handler: lcpp.list },
+		{ method: "POST", path: "/llama_cpp/activate", handler: lcpp.activate },
+		// Convenience: report the auto-detected flavor for this host so
+		// the dashboard can pre-fill the install form.
+		{ method: "GET",  path: "/llama_cpp/flavor",   handler: fn(req): object {
+			return { status: 200, body: stringify({
+				flavor: detect_flavor(probe(canonical_dir, extra_dirs).role),
+			})};
 		} },
 		{ method: "POST", path: "/port_check",    handler: fn(req): object {
 			// CP calls this to OS-truth-check candidate ports before

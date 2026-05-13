@@ -257,15 +257,49 @@ function nodeEditor() {
     state: 'active',
     error: '',
     busy: false,
+    // llama.cpp install panel
+    installs: [],            // {tag, path, is_current, has_binary}
+    currentPath: '',
+    detectedFlavor: '',
+    installTag: '',
+    installFlavor: '',
+    installBusy: false,
+    installMsg: '',
+
     init() {
-      window.addEventListener('witchgrid:edit-node', (e) => {
+      window.addEventListener('witchgrid:edit-node', async (e) => {
         this.node_id = e.detail.node_id;
         this.state = e.detail.state || 'active';
         this.error = '';
+        this.installMsg = '';
         this.open = true;
+        await this.refreshInstalls();
       });
     },
+
     cancel() { this.open = false; },
+
+    async refreshInstalls() {
+      try {
+        const [r1, r2] = await Promise.all([
+          fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/installed'),
+          fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/flavor'),
+        ]);
+        if (r1.ok) {
+          const d = await r1.json();
+          this.installs = d.installed || [];
+          this.currentPath = d.current_path || '';
+        }
+        if (r2.ok) {
+          const d = await r2.json();
+          this.detectedFlavor = d.flavor || '';
+          if (!this.installFlavor) this.installFlavor = this.detectedFlavor || '';
+        }
+      } catch (e) {
+        this.error = 'load failed: ' + e;
+      }
+    },
+
     async save() {
       this.busy = true; this.error = '';
       try {
@@ -285,6 +319,44 @@ function nodeEditor() {
         this.error = 'save failed: ' + e;
       }
       this.busy = false;
+    },
+
+    async installNew() {
+      if (!this.installTag) { this.installMsg = 'tag required (e.g. b9124)'; return; }
+      if (!this.installFlavor) { this.installMsg = 'flavor required'; return; }
+      this.installBusy = true; this.installMsg = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/install', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tag: this.installTag, flavor: this.installFlavor }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.installMsg = 'error: ' + (d.error || ('HTTP ' + r.status)); }
+        else      { this.installMsg = 'queued ' + d.install_id + ' (poll Installed list to see progress)'; }
+        await this.refreshInstalls();
+      } catch (e) {
+        this.installMsg = 'install failed: ' + e;
+      }
+      this.installBusy = false;
+    },
+
+    async activate(tag) {
+      this.installBusy = true; this.installMsg = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/activate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tag }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.installMsg = 'error: ' + (d.error || ('HTTP ' + r.status)); }
+        else      { this.installMsg = 'active: ' + (d.current_path || tag); }
+        await this.refreshInstalls();
+      } catch (e) {
+        this.installMsg = 'activate failed: ' + e;
+      }
+      this.installBusy = false;
     },
   };
 }

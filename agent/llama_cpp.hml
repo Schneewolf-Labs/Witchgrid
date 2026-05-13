@@ -1,0 +1,356 @@
+// llama_cpp.hml — manage llama.cpp installs on this node.
+//
+// Fetches prebuilt release tarballs from github.com/ggerganov/llama.cpp/releases
+// and extracts them into a per-build directory under
+// ~/.witchgrid/llama-server/<tag>/. The agent points at the active
+// build via a `current` symlink. spawn_service uses current_binary_path()
+// instead of the bare PATH `llama-server`, so flipping the symlink
+// hot-swaps the binary new spawns will use.
+//
+// Flavor matrix (only what GitHub releases ship pre-built):
+//   - macos-arm64           Apple Silicon (Metal in-binary)
+//   - ubuntu-vulkan-x64     Linux NVIDIA / AMD via Vulkan; cross-vendor
+//                           but slower than native CUDA (which the
+//                           release matrix doesn't ship — operators
+//                           on CUDA-capable boxes who want native
+//                           perf still build llama.cpp themselves
+//                           and put it on PATH; that's the fallback)
+//   - ubuntu-x64            Linux CPU-only
+//
+// Layout per install:
+//   ~/.witchgrid/llama-server/
+//     b9124/
+//       build/bin/llama-server        ← actual binary
+//       build/bin/libggml*.so         ← runtime libs ($ORIGIN rpath)
+//       ... other release contents ...
+//     b9100/
+//       build/bin/...
+//     current -> b9124                 ← active install
+//
+// current_binary_path() returns the resolved binary; if no install
+// exists yet (fresh agent, operator still using system llama-server),
+// it returns plain "llama-server" and the OS PATH lookup wins.
+
+import { exec_argv } from "@stdlib/process";
+import { stringify, parse } from "@stdlib/json";
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { homedir, platform, arch } from "@stdlib/os";
+import { exists, is_dir, file_stat, list_dir, make_dirs, remove_file, rename } from "@stdlib/fs";
+import { get_binary } from "@stdlib/http";
+
+// Where installs live. Per-build subdirs + a `current` symlink.
+fn install_root(): string {
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/llama-server"; }
+	return h + "/.witchgrid/llama-server";
+}
+
+// Compose the GitHub-releases asset URL for a (tag, flavor) pair.
+// Tag is like "b9124"; flavor is one of the matrix above.
+fn asset_url(tag: string, flavor: string): string {
+	return "https://github.com/ggerganov/llama.cpp/releases/download/"
+		+ tag + "/llama-" + tag + "-bin-" + flavor + ".tar.gz";
+}
+
+// Auto-detect the right flavor for THIS host. Probe role + OS:
+//   gpu + darwin/arm64 → macos-arm64
+//   gpu + linux        → ubuntu-vulkan-x64  (works on NVIDIA + AMD)
+//   cpu + darwin/arm64 → macos-arm64        (still has Metal, fine)
+//   cpu + linux        → ubuntu-x64
+// Returns null when we can't pick — operator must specify explicitly.
+export fn detect_flavor(role: string): string {
+	let p = platform();
+	let a = arch();
+	if (p == "darwin" && a == "arm64") { return "macos-arm64"; }
+	if (p == "linux" && a == "x86_64") {
+		if (role == "gpu") { return "ubuntu-vulkan-x64"; }
+		return "ubuntu-x64";
+	}
+	return null;
+}
+
+// Find the llama-server binary inside an extracted install dir.
+// llama.cpp's release tarballs use a few different layouts:
+//   <root>/llama-server                    (flat — rare)
+//   <root>/build/bin/llama-server          (older Linux builds)
+//   <root>/llama-bNNNN/llama-server        (current Linux + Mac)
+//   <root>/llama-bNNNN/build/bin/llama-server   (some hybrids)
+// Try in order, return the first one that exists. Returns null if
+// nothing's found (caller treats as "install incomplete").
+fn find_binary_in(dir: string) {
+	let candidates = [
+		dir + "/llama-server",
+		dir + "/build/bin/llama-server",
+	];
+	// Also probe direct children matching llama-bNNNN/.
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) { entries = []; }
+	for (name in entries) {
+		if (name.starts_with("llama-")) {
+			candidates.push(dir + "/" + name + "/llama-server");
+			candidates.push(dir + "/" + name + "/build/bin/llama-server");
+		}
+	}
+	for (c in candidates) {
+		if (exists(c)) { return c; }
+	}
+	return null;
+}
+
+// Resolve the active llama-server binary. When `current` symlink
+// exists + points somewhere with a binary inside, return that path.
+// Otherwise fall back to bare "llama-server" (PATH lookup).
+//
+// The symlink approach lets us atomic-swap to a new build without
+// disturbing in-flight services (those have already exec'd the old
+// binary's pid; OS keeps the inode alive even if the symlink moves).
+export fn current_binary_path(): string {
+	let root = install_root();
+	let cur = root + "/current";
+	if (!exists(cur)) { return "llama-server"; }
+	let bin = find_binary_in(cur);
+	if (bin != null) { return bin; }
+	return "llama-server";
+}
+
+// Schema for tracking install jobs (mirrors model_transfers shape).
+// Distinct table because the lifecycle is slightly different — no
+// peer-pull mode, source is always GitHub releases.
+export fn init_llama_cpp_schema(db): null {
+	db_exec(db, "create table if not exists llama_cpp_installs ("
+		+ "id text primary key,"
+		+ "tag text not null,"
+		+ "flavor text not null,"
+		+ "source_url text not null,"
+		+ "target_dir text not null,"
+		+ "status text not null,"             // queued|downloading|extracting|complete|error
+		+ "bytes_downloaded integer default 0,"
+		+ "bytes_total integer default 0,"
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+	return null;
+}
+
+fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(8)) as id", []);
+	return r[0].id;
+}
+
+fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+// List installed builds. Returns [{tag, path, is_current, has_binary}].
+// is_current is true for the build the `current` symlink points at.
+export fn list_installed(): array {
+	let root = install_root();
+	if (!exists(root)) { return []; }
+	let entries = null;
+	try { entries = list_dir(root); } catch (e) { return []; }
+
+	// Resolve current target by reading what the symlink itself looks
+	// like. Hemlock doesn't expose readlink, so we infer from existence.
+	// Approximation: if current exists, we'll mark whichever build's
+	// binary path equals current's binary path as current.
+	let cur_bin = current_binary_path();
+
+	let out = [];
+	for (name in entries) {
+		if (name == "." || name == ".." || name == "current") { continue; }
+		let path = root + "/" + name;
+		// Skip non-directories (stray .tar.gz files left from a
+		// failed install, etc.). list_installed should reflect actual
+		// installs, not download cruft.
+		let is_d = false;
+		try { is_d = is_dir(path); } catch (e) { }
+		if (!is_d) { continue; }
+		let resolved = find_binary_in(path);
+		out.push({
+			tag:        name,
+			path:       path,
+			binary:     resolved,
+			is_current: (resolved != null && cur_bin == resolved),
+			has_binary: resolved != null,
+		});
+	}
+	return out;
+}
+
+// Background install task — download tarball via download_streaming,
+// extract via `tar -xzf`, ensure the binary exists at the expected
+// path. Updates status as it progresses.
+async fn install_task(db, transfer_id: string, tag: string, flavor: string,
+                      url: string, target_dir: string): null {
+	let tarball = target_dir + ".tar.gz";
+
+	db_exec(db, "update llama_cpp_installs set status='downloading' where id=?",
+		[transfer_id]);
+	// Shell out to curl for the download. Hemlock's @stdlib/http
+	// get_binary doesn't follow the GitHub → CDN redirect chain
+	// reliably for these release tarballs (returns status 0 / empty
+	// body); curl handles it cleanly and is universally available
+	// on Linux + macOS. Tarballs are 8-100MB so writing to disk
+	// directly via -o keeps memory bounded.
+	let r = null;
+	try {
+		r = exec_argv(["curl", "-fsSL", "-o", tarball, url]);
+	} catch (e) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["curl exec failed (install curl?): " + e, transfer_id]);
+		return null;
+	}
+	if (r.exit_code != 0) {
+		let tail = (r?.stderr ?? r?.output ?? "");
+		if (tail.length > 256) { tail = tail.substr(tail.length - 256, 256); }
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["curl exit " + r.exit_code + ": " + tail, transfer_id]);
+		return null;
+	}
+
+	db_exec(db, "update llama_cpp_installs set status='extracting' where id=?",
+		[transfer_id]);
+	// mkdir -p target_dir, then `tar -xzf tarball -C target_dir`.
+	try { make_dirs(target_dir); } catch (e) { }
+	let tr = null;
+	try {
+		tr = exec_argv(["tar", "-xzf", tarball, "-C", target_dir]);
+	} catch (e) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["tar exec failed (install tar?): " + e, transfer_id]);
+		return null;
+	}
+	if (tr.exit_code != 0) {
+		let tail = (tr?.stderr ?? tr?.output ?? "");
+		if (tail.length > 512) { tail = tail.substr(tail.length - 512, 512); }
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["tar exit " + tr.exit_code + ": " + tail, transfer_id]);
+		return null;
+	}
+
+	// Sanity: the binary should now exist somewhere recognizable.
+	let bin = find_binary_in(target_dir);
+	if (bin == null) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["extracted tarball but no llama-server binary found under "
+				+ target_dir + " (tried flat, build/bin, and llama-*/ layouts)",
+			 transfer_id]);
+		return null;
+	}
+	// Cleanup tarball — saved space, the binary's extracted.
+	try { remove_file(tarball); } catch (e) { }
+
+	let stat = null;
+	try { stat = file_stat(bin); } catch (e) { }
+	let now = iso_now(db);
+	db_exec(db,
+		"update llama_cpp_installs "
+		+ "set status='complete', bytes_total=?, completed_at=? "
+		+ "where id=?",
+		[(stat == null ? 0 : stat.size), now, transfer_id]);
+	print("[llama_cpp] " + transfer_id + " complete: " + tag + "/" + flavor);
+	return null;
+}
+
+// Activate — point `current` at <tag>'s install. Returns the new
+// resolved binary path on success, throws otherwise. Caller is
+// responsible for re-running capability introspection + version
+// probe after activate (so CP sees the new build version).
+export fn activate(tag: string): string {
+	let root = install_root();
+	let target = root + "/" + tag;
+	if (!exists(target)) {
+		throw "no install for tag '" + tag + "' at " + target;
+	}
+	if (find_binary_in(target) == null) {
+		throw "install dir exists but no llama-server binary inside " + target;
+	}
+	let cur = root + "/current";
+	// `ln -sfn` overwrites an existing symlink atomically (the -n
+	// keeps it from following an existing link and creating one
+	// inside it — common gotcha when current already points at a
+	// directory).
+	let r = exec_argv(["ln", "-sfn", target, cur]);
+	if (r.exit_code != 0) {
+		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
+	}
+	return current_binary_path();
+}
+
+// HTTP handlers. install + activate need access to the rescan
+// callback so the agent can re-introspect capabilities after a flip.
+export fn make_handlers(db, rescan_caps_after): object {
+	let do_install = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		let flavor = payload?.flavor;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required (e.g. b9124)\"}" };
+		}
+		if (flavor == null) {
+			return { status: 400, body: "{\"error\":\"flavor required (use detect_flavor result or specify)\"}" };
+		}
+		let root = install_root();
+		try { make_dirs(root); } catch (e) { }
+		let target_dir = root + "/" + tag;
+		let url = asset_url(tag, flavor);
+		let id = new_id(db);
+		let now = iso_now(db);
+		db_exec(db,
+			"insert into llama_cpp_installs "
+			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
+			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
+			[id, tag, flavor, url, target_dir, now]);
+		let t = spawn(install_task, db, id, tag, flavor, url, target_dir);
+		detach(t);
+		return { status: 202, body: stringify({
+			install_id: id, tag: tag, flavor: flavor, target_dir: target_dir,
+		})};
+	};
+
+	let do_list = fn(req): object {
+		let installs = query(db,
+			"select id, tag, flavor, status, bytes_total, error, started_at, completed_at "
+			+ "from llama_cpp_installs "
+			+ "where status in ('queued','downloading','extracting') "
+			+ "   or started_at > datetime('now','-1 hour') "
+			+ "order by started_at desc",
+			[]);
+		return { status: 200, body: stringify({
+			installed:    list_installed(),
+			recent_jobs:  installs,
+			current_path: current_binary_path(),
+		})};
+	};
+
+	let do_activate = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required\"}" };
+		}
+		let new_path = null;
+		try { new_path = activate(tag); } catch (e) {
+			return { status: 400, body: stringify({ error: "" + e }) };
+		}
+		// Re-introspect capabilities + re-probe version against the
+		// new binary so subsequent spawns + the next heartbeat see
+		// the right data.
+		try { rescan_caps_after(); } catch (e) {
+			eprint("[llama_cpp] post-activate rescan failed: " + e);
+		}
+		return { status: 200, body: stringify({
+			tag: tag, current_path: new_path,
+		})};
+	};
+
+	return { install: do_install, list: do_list, activate: do_activate };
+}

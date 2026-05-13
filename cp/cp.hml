@@ -334,6 +334,52 @@ fn handle_list_nodes(req): object {
 //
 // Disabled / draining nodes still serve catalog blobs + accept stop
 // commands. The state only gates NEW spawn placement.
+// ── llama_cpp proxies ────────────────────────────────────────────
+//
+// CP owns no state for llama_cpp installs — each agent does. These
+// handlers forward to the chosen agent's /llama_cpp/* endpoints so
+// the dashboard can drive them through one URL space (no need for
+// the browser to know each agent's bind address).
+//
+// URL: /api/nodes/{node_id}/llama_cpp/{install,installed,activate}
+
+fn parse_node_lcpp_path(path: string) {
+	// path = "/api/nodes/<node_id>/llama_cpp/<action>"
+	let prefix = "/api/nodes/";
+	if (!path.starts_with(prefix)) { return null; }
+	let rest = path.substr(prefix.length, path.length - prefix.length);
+	let slash = rest.find("/");
+	if (slash < 0) { return null; }
+	let node_id = rest.substr(0, slash);
+	let after = rest.substr(slash + 1, rest.length - slash - 1);
+	if (!after.starts_with("llama_cpp/")) { return null; }
+	let action = after.substr(10, after.length - 10);
+	return { node_id: node_id, action: action };
+}
+
+fn handle_node_llama_cpp(req): object {
+	let parsed = parse_node_lcpp_path(req.path);
+	if (parsed == null) {
+		return { status: 404, body: "{\"error\":\"expected /api/nodes/{id}/llama_cpp/{action}\"}" };
+	}
+	let agent_url = lookup_agent(parsed.node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + parsed.node_id }) };
+	}
+	let target = agent_url + "/llama_cpp/" + parsed.action;
+	try {
+		let resp = null;
+		if (req.method == "GET") {
+			resp = get(target, null);
+		} else {
+			resp = post_json(target, parse(req?.body ?? "{}"));
+		}
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
 fn handle_patch_node(req): object {
 	let prefix = "/api/nodes/";
 	let node_id = req.path.substr(prefix.length, req.path.length - prefix.length);
@@ -1743,6 +1789,18 @@ fn main(): null {
 		{ method: "POST", path: "/register",      handler: handle_register },
 		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes },
 		{ method: "PATCH", path: "/api/nodes/",   prefix: true, handler: handle_patch_node },
+		// Node-scoped llama_cpp proxies (since v0.7 C2). Method = *
+		// so GET (list installed) + POST (install/activate) hit the
+		// same handler which dispatches by action segment.
+		{ method: "*",     path: "/api/nodes/",   prefix: true, handler: fn(req): object {
+			// Only forward if URL contains /llama_cpp/; otherwise let
+			// the request fall through to other prefix routes (none
+			// currently, but keeps the door open).
+			if (req.path.find("/llama_cpp/") < 0) {
+				return { status: 404, body: "{\"error\":\"not found\"}" };
+			}
+			return handle_node_llama_cpp(req);
+		} },
 		{ method: "GET",  path: "/healthz",       handler: handle_health },
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },

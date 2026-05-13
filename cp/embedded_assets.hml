@@ -89,8 +89,9 @@ export let INDEX_HTML = "<!doctype html>
 
       <!-- ── Node editor modal ─────────────────────────────────── -->
       <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"cancel()\" style=\"display:none\">
-        <div class=\"modal-card\" @click.stop style=\"max-width:480px\">
+        <div class=\"modal-card\" @click.stop style=\"max-width:560px\">
           <h3 style=\"margin:0 0 0.75rem 0\">edit <span x-text=\"node_id\"></span></h3>
+
           <div class=\"form-grid\">
             <div class=\"full\">
               <label>state</label>
@@ -113,10 +114,50 @@ export let INDEX_HTML = "<!doctype html>
               </div>
             </div>
           </div>
+
           <p class=\"msg err\" x-show=\"error\" x-text=\"error\" style=\"margin-top:0.75rem\"></p>
           <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem\">
             <button type=\"button\" class=\"row-action\" @click=\"cancel()\" :disabled=\"busy\">cancel</button>
-            <button type=\"button\" @click=\"save()\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save'\"></button>
+            <button type=\"button\" @click=\"save()\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save state'\"></button>
+          </div>
+
+          <hr style=\"margin:1.25rem 0; border:none; border-top:1px solid var(--border-soft)\">
+
+          <h3 style=\"margin:0 0 0.5rem 0\">llama.cpp</h3>
+          <p class=\"meta\" style=\"margin:0 0 0.75rem 0\">
+            current: <code x-text=\"currentPath || '—'\"></code>
+          </p>
+
+          <div x-show=\"installs.length > 0\" style=\"margin-bottom:1rem\">
+            <label style=\"display:block; font-family:ui-monospace,monospace; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.06em; color:var(--fg-dim); margin-bottom:0.25rem\">installed</label>
+            <template x-for=\"inst in installs\" :key=\"inst.tag\">
+              <div class=\"state-radio\" style=\"grid-template-columns: auto 1fr auto; padding:0.4rem 0.6rem\">
+                <strong x-text=\"inst.tag\"></strong>
+                <span>
+                  <span x-show=\"inst.is_current\" class=\"badge badge-canonical\">current</span>
+                  <span x-show=\"!inst.has_binary\" class=\"badge badge-scan\">no binary</span>
+                </span>
+                <button type=\"button\" class=\"row-action\" x-show=\"!inst.is_current && inst.has_binary\"
+                        @click=\"activate(inst.tag)\" :disabled=\"installBusy\">activate</button>
+              </div>
+            </template>
+          </div>
+
+          <div class=\"form-grid\">
+            <div>
+              <label>install tag <span class=\"meta\">(e.g. b9124)</span></label>
+              <input type=\"text\" x-model=\"installTag\" placeholder=\"b9124\">
+            </div>
+            <div>
+              <label>flavor <span class=\"meta\" x-show=\"detectedFlavor\">(detected: <span x-text=\"detectedFlavor\"></span>)</span></label>
+              <input type=\"text\" x-model=\"installFlavor\" placeholder=\"ubuntu-x64 / macos-arm64 / ubuntu-vulkan-x64\">
+            </div>
+          </div>
+
+          <p class=\"msg\" :class=\"installMsg.startsWith('error') ? 'err' : 'ok'\" x-show=\"installMsg\" x-text=\"installMsg\" style=\"margin-top:0.75rem\"></p>
+
+          <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem\">
+            <button type=\"button\" @click=\"installNew()\" :disabled=\"installBusy\" x-text=\"installBusy ? '…' : 'install build'\"></button>
           </div>
         </div>
       </div>
@@ -1232,15 +1273,49 @@ function nodeEditor() {
     state: 'active',
     error: '',
     busy: false,
+    // llama.cpp install panel
+    installs: [],            // {tag, path, is_current, has_binary}
+    currentPath: '',
+    detectedFlavor: '',
+    installTag: '',
+    installFlavor: '',
+    installBusy: false,
+    installMsg: '',
+
     init() {
-      window.addEventListener('witchgrid:edit-node', (e) => {
+      window.addEventListener('witchgrid:edit-node', async (e) => {
         this.node_id = e.detail.node_id;
         this.state = e.detail.state || 'active';
         this.error = '';
+        this.installMsg = '';
         this.open = true;
+        await this.refreshInstalls();
       });
     },
+
     cancel() { this.open = false; },
+
+    async refreshInstalls() {
+      try {
+        const [r1, r2] = await Promise.all([
+          fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/installed'),
+          fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/flavor'),
+        ]);
+        if (r1.ok) {
+          const d = await r1.json();
+          this.installs = d.installed || [];
+          this.currentPath = d.current_path || '';
+        }
+        if (r2.ok) {
+          const d = await r2.json();
+          this.detectedFlavor = d.flavor || '';
+          if (!this.installFlavor) this.installFlavor = this.detectedFlavor || '';
+        }
+      } catch (e) {
+        this.error = 'load failed: ' + e;
+      }
+    },
+
     async save() {
       this.busy = true; this.error = '';
       try {
@@ -1260,6 +1335,44 @@ function nodeEditor() {
         this.error = 'save failed: ' + e;
       }
       this.busy = false;
+    },
+
+    async installNew() {
+      if (!this.installTag) { this.installMsg = 'tag required (e.g. b9124)'; return; }
+      if (!this.installFlavor) { this.installMsg = 'flavor required'; return; }
+      this.installBusy = true; this.installMsg = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/install', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tag: this.installTag, flavor: this.installFlavor }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.installMsg = 'error: ' + (d.error || ('HTTP ' + r.status)); }
+        else      { this.installMsg = 'queued ' + d.install_id + ' (poll Installed list to see progress)'; }
+        await this.refreshInstalls();
+      } catch (e) {
+        this.installMsg = 'install failed: ' + e;
+      }
+      this.installBusy = false;
+    },
+
+    async activate(tag) {
+      this.installBusy = true; this.installMsg = '';
+      try {
+        const r = await fetch('/api/nodes/' + encodeURIComponent(this.node_id) + '/llama_cpp/activate', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ tag }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.installMsg = 'error: ' + (d.error || ('HTTP ' + r.status)); }
+        else      { this.installMsg = 'active: ' + (d.current_path || tag); }
+        await this.refreshInstalls();
+      } catch (e) {
+        this.installMsg = 'activate failed: ' + e;
+      }
+      this.installBusy = false;
     },
   };
 }

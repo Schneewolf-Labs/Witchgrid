@@ -154,7 +154,7 @@ let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
 // ── core: spawn ───────────────────────────────────────────────────────
 
-export fn spawn_service(db, profile_name: string, prof, model_path: string, port: i32, gpus, tensor_split, capabilities): object {
+export fn spawn_service(db, profile_name: string, prof, model_path: string, port: i32, gpus, tensor_split, capabilities, binary_path: string): object {
 	if (prof == null) {
 		throw "spawn_service called without a profile object — "
 			+ "v0.7+ requires CP to inline the profile in the spawn payload";
@@ -163,11 +163,16 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// Build full argv: binary + intent-derived flags + extras + spawner-set
 	// model/port/host. capabilities is the parsed --help map for prof.binary
 	// — passed in rather than re-introspected per spawn.
+	//
+	// binary_path is the resolved on-disk binary (or bare name for PATH
+	// lookup) provided by agent.hml's caller — comes from
+	// llama_cpp.current_binary_path() since v0.7 C2 so a Witchgrid-
+	// managed install is honored.
 	if (capabilities == null || capabilities.keys().length == 0) {
 		throw "agent has no parsed capabilities for " + prof.binary
 			+ " (introspection may have failed at boot — check agent log)";
 	}
-	let argv = [prof.binary];
+	let argv = [binary_path];
 	let derived = render_argv(prof.intent, prof?.extra_flags ?? [], capabilities);
 	for (a in derived) { argv.push(a); }
 	argv.push("-m"); argv.push(model_path);
@@ -328,7 +333,7 @@ export fn stop_service(db, id: string): bool {
 // can resolve its profile's intents against the right binary's --help
 // map. Passed as a closure so the agent can refresh on its own schedule
 // without us shipping a stale snapshot here.
-export fn make_handlers(db, reserved_ports, capabilities_for): object {
+export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): object {
 	return {
 		create: fn(req): object {
 			let payload = parse(req.body);
@@ -362,7 +367,8 @@ export fn make_handlers(db, reserved_ports, capabilities_for): object {
 			let tensor_split = payload?.tensor_split;
 			try {
 				let caps = capabilities_for(profile.binary);
-				let svc = spawn_service(db, profile_name, profile, model, port, gpus, tensor_split, caps);
+				let bin = binary_path_for(profile.binary);
+				let svc = spawn_service(db, profile_name, profile, model, port, gpus, tensor_split, caps, bin);
 				return { status: 201, body: stringify(svc) };
 			} catch (e) {
 				// 502 vs 400: a port-bind / missing-model / OOM error from
