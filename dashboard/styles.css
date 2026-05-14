@@ -528,11 +528,13 @@ tr.row-selected td { border-color: var(--accent); }
 
 .intent-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 32px;
+  grid-template-columns: minmax(140px, 1fr) minmax(120px, 1.2fr) 32px;
   gap: 0.4rem;
-  margin-bottom: 0.3rem;
+  margin-bottom: 0.15rem;
+  align-items: center;
 }
-.intent-row input { font-size: 0.78rem; padding: 0.3rem 0.5rem; }
+.intent-row input,
+.intent-row select { font-size: 0.78rem; padding: 0.3rem 0.5rem; margin: 0; }
 .intent-row .row-action-danger { padding: 0.2rem; text-align: center; }
 
 /* ─── spawn form ────────────────────────────────────────────────── */
@@ -597,7 +599,138 @@ button[type="submit"] {
 }
 button[type="submit"]:hover { background: var(--brand); border-color: var(--brand); }
 
+/* ─── deploy flow steps ─────────────────────────────────────────── */
+.deploy-step {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 0.75rem;
+  transition: opacity 150ms;
+}
+.deploy-step-locked { opacity: 0.45; pointer-events: none; }
+.deploy-step-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+.deploy-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px; height: 22px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.deploy-step-body select { margin: 0; }
+
 /* HTMX swap fade-in */
 [hx-get] { transition: opacity 150ms; }
 .htmx-swapping { opacity: 0; }
 .htmx-settling { opacity: 1; }
+
+/* ─── responsive (≤768px) ────────────────────────────────────────────
+ *
+ * Mobile layout. Three big shifts vs. desktop:
+ *
+ * 1. Topbar stacks (brand row, then nav, then theme toggle) so the
+ *    nav links don't wrap into a useless cluster.
+ * 2. Spawn form goes single-column — the 220px label column squeezes
+ *    inputs to nothing on a phone.
+ * 3. Tables get horizontal scroll wrappers + tighter padding. The
+ *    nodes table's hw-row grid (280/1fr/130) collapses into a 2-line
+ *    card per item: name on top, bar + value on the row below.
+ *    Sparklines drop to a shorter height since they're just trend.
+ *
+ * Pico's own responsive resets handle font-size/line-height; we only
+ * touch the witchgrid-specific selectors. */
+
+@media (max-width: 768px) {
+  main { padding: 0.5rem; }
+
+  /* Topbar — vertical stack, brand + theme toggle stay paired */
+  .topbar {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+  .brand h1 { font-size: 1.1rem; margin: 0; }
+  .brand img { width: 28px; height: 28px; }
+  .page-nav {
+    order: 3;
+    flex: 1 1 100%;
+    justify-content: flex-start;
+    overflow-x: auto;
+    flex-wrap: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+  .page-nav a { flex-shrink: 0; padding: 0.35rem 0.7rem; }
+
+  /* Stats tiles — already use auto-fit, but tighten gaps */
+  .stats { gap: 0.5rem; }
+  .stat { padding: 0.6rem 0.75rem; }
+  .stat-label { font-size: 0.62rem; }
+  .stat-value { font-size: 1.1rem; }
+
+  /* Spawn form: single column. The "advanced" details inside also
+   * stack since they share the same grid. */
+  form.spawn {
+    grid-template-columns: 1fr;
+    padding: 0.75rem;
+    gap: 0.5rem;
+  }
+  form.spawn details > div { grid-template-columns: 1fr; }
+  /* Trim long help text in labels — full description still readable
+   * via tooltip / focus, but doesn't push the input off-screen */
+  form.spawn label .meta { display: none; }
+
+  /* All tables: tighter padding + smaller font + allow horizontal
+   * scroll as a last resort if a row genuinely doesn't fit */
+  table { font-size: 0.78rem; display: block; overflow-x: auto; }
+  table th, table td { padding: 0.4rem 0.55rem; }
+  table thead { position: sticky; top: 0; z-index: 1; }
+
+  /* Hardware rows on the nodes table — stack vertically: name on
+   * one line, then bar + value on the next. Saves the entire 280px
+   * left column from squeezing the bar to nothing. */
+  .hw-row, .gpu-row {
+    grid-template-columns: 1fr 100px;
+    grid-template-areas:
+      "name name"
+      "bar  value";
+    gap: 0.25rem 0.5rem;
+    font-size: 0.72rem;
+  }
+  .hw-row .hw-name, .gpu-row .gpu-name { grid-area: name; white-space: normal; }
+  .hw-row .gpu-bar { grid-area: bar; }
+  .hw-row .gpu-mem { grid-area: value; }
+  .hw-row-cpu { grid-template-columns: 1fr; grid-template-areas: "name" "bar"; }
+  .hw-row-cpu .hw-fill { grid-area: bar; text-align: left; }
+  /* Sub-rows stay indented but tighter */
+  .hw-row-sub .hw-name { padding-left: 0.6rem; }
+
+  /* Sparklines — shorter on mobile, less visual real estate hog */
+  .spark { height: 16px; }
+
+  /* Modal — full-width on phones, tighter padding */
+  .modal-backdrop { padding: 1rem 0.5rem; align-items: flex-start; }
+  .modal-card { padding: 1rem; max-width: 100%; }
+  .modal-card h3 { font-size: 0.95rem; }
+  .form-grid { grid-template-columns: 1fr !important; }
+}
+
+/* Very narrow phones (≤420px) — strip down further */
+@media (max-width: 420px) {
+  .page-nav { font-size: 0.78rem; }
+  .stats { grid-template-columns: 1fr 1fr; }
+  table { font-size: 0.74rem; }
+  .hw-row { grid-template-columns: 1fr 88px; font-size: 0.68rem; }
+  .gpu-mem { font-size: 0.7rem; }
+}

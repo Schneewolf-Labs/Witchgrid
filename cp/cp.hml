@@ -38,7 +38,7 @@ import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
-         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH,
+         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
@@ -2536,6 +2536,7 @@ fn handle_page_catalog(req): object   { return html_response(PAGE_CATALOG); }
 fn handle_page_transfers(req): object { return html_response(PAGE_TRANSFERS); }
 fn handle_page_profiles(req): object  { return html_response(PAGE_PROFILES); }
 fn handle_page_bench(req): object     { return html_response(PAGE_BENCH); }
+fn handle_page_deploy(req): object    { return html_response(PAGE_DEPLOY); }
 
 // /ui/bench fragment — newest 100 bench rows.
 fn handle_ui_bench(req): object {
@@ -2605,6 +2606,7 @@ fn main(): null {
 		{ method: "GET",  path: "/transfers",              handler: handle_page_transfers,   public: true },
 		{ method: "GET",  path: "/profiles",               handler: handle_page_profiles,    public: true },
 		{ method: "GET",  path: "/bench",                  handler: handle_page_bench,       public: true },
+		{ method: "GET",  path: "/deploy",                 handler: handle_page_deploy,      public: true },
 		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css,    public: true },
 		{ method: "GET",  path: "/assets/dashboard.js",    handler: handle_dashboard_js,     public: true },
 		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo,             public: true },

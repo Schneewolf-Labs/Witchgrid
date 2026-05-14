@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>witchgrid — deploy</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('witchgrid-theme'); } catch (e) {}
+      if (t !== 'light' && t !== 'dark') { t = 'dark'; }
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.3/dist/cdn.min.js"></script>
+  <script src="/assets/dashboard.js"></script>
+</head>
+<body>
+  <main x-data="themeToggle()">
+    <div class="topbar">
+      <div class="brand">
+        <img src="/assets/logo.svg" alt="witchgrid">
+        <h1>witchgrid<span class="cursor">_</span></h1>
+      </div>
+      <nav class="page-nav">
+        <a href="/">overview</a>
+        <a href="/catalog">catalog</a>
+        <a href="/transfers">transfers</a>
+        <a href="/profiles">profiles</a>
+        <a href="/bench">bench</a>
+        <a href="/deploy">deploy</a>
+      </nav>
+      <button class="theme-toggle" @click="toggle()" :title="theme === 'dark' ? 'switch to light' : 'switch to dark'">
+        <span x-text="theme === 'dark' ? '☀' : '☾'"></span>
+      </button>
+    </div>
+
+    <div hx-get="/ui/stats" hx-trigger="load, every 5s" class="stats-wrap">
+      <div class="stats">
+        <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>
+      </div>
+    </div>
+
+    <section x-data="deployFlow()">
+      <h2>Deploy</h2>
+      <p class="meta" style="margin: 0 0 0.75rem 0">
+        Linear flow: pick a model → pick a node → pick a profile → spawn.
+        Each step filters the next so you can't pick combinations that won't work.
+      </p>
+
+      <!-- Step 1: model -->
+      <div class="deploy-step">
+        <div class="deploy-step-head">
+          <span class="deploy-num">1</span>
+          <strong>model</strong>
+          <span class="meta" x-show="alias">→ <code x-text="alias"></code></span>
+        </div>
+        <div class="deploy-step-body">
+          <select x-model="alias" @change="onAliasChange()" required>
+            <option value="">— pick from catalog —</option>
+            <template x-for="m in catalog" :key="m.alias">
+              <option :value="m.alias"
+                      x-text="m.alias + ' · ' + (m.size_mb >= 1024 ? (m.size_mb/1024).toFixed(1) + ' GB' : m.size_mb + ' MB') + ' · on ' + m.on_nodes.length + ' node' + (m.on_nodes.length === 1 ? '' : 's')">
+              </option>
+            </template>
+          </select>
+          <p class="meta" style="margin-top:0.25rem">
+            Not in the catalog yet? <a href="/catalog">pull from HuggingFace →</a>
+          </p>
+        </div>
+      </div>
+
+      <!-- Step 2: node -->
+      <div class="deploy-step" :class="alias ? '' : 'deploy-step-locked'">
+        <div class="deploy-step-head">
+          <span class="deploy-num">2</span>
+          <strong>node</strong>
+          <span class="meta" x-show="node">→ <code x-text="node"></code></span>
+        </div>
+        <div class="deploy-step-body" x-show="alias">
+          <select x-model="node" @change="onNodeChange()">
+            <option value="">— auto (let CP pick) —</option>
+            <template x-for="n in nodesForAlias()" :key="n.node_id">
+              <option :value="n.node_id" x-text="n.node_id + ' · ' + n.role + ' · ' + n.label"></option>
+            </template>
+          </select>
+          <p class="meta" x-show="alias && nodesForAlias().length === 0" style="margin-top:0.25rem; color: var(--warn)">
+            ⚠ no node has <code x-text="alias"></code> on disk.
+            <a href="/catalog">pull it →</a>
+          </p>
+        </div>
+      </div>
+
+      <!-- Step 3: profile -->
+      <div class="deploy-step" :class="alias ? '' : 'deploy-step-locked'">
+        <div class="deploy-step-head">
+          <span class="deploy-num">3</span>
+          <strong>profile</strong>
+          <span class="meta" x-show="profile">→ <code x-text="profile"></code></span>
+        </div>
+        <div class="deploy-step-body" x-show="alias">
+          <select x-model="profile" @change="refreshPreview()">
+            <option value="">— select —</option>
+            <template x-for="p in profilesForAlias()" :key="p">
+              <option :value="p" x-text="p"></option>
+            </template>
+          </select>
+          <p class="meta" style="margin-top:0.25rem">
+            <span x-show="profilesForAlias().length === 0">
+              No profile names <code x-text="alias"></code>.
+            </span>
+            <a :href="profileCreateUrl()">+ create one for this model →</a>
+          </p>
+        </div>
+      </div>
+
+      <!-- Step 4: spawn -->
+      <div class="deploy-step" :class="(profile ? '' : 'deploy-step-locked')">
+        <div class="deploy-step-head">
+          <span class="deploy-num">4</span>
+          <strong>spawn</strong>
+        </div>
+        <div class="deploy-step-body" x-show="profile">
+          <p class="meta" x-show="preview" x-text="preview" style="margin: 0 0 0.5rem 0"></p>
+          <button type="button" @click="spawn()" :disabled="busy || !profile" x-text="busy ? '…' : 'spawn'"></button>
+          <p class="msg" :class="msgError ? 'err' : 'ok'" x-show="msg" x-text="msg" style="margin-top:0.5rem"></p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Services</h2>
+      <p class="meta" style="margin: 0 0 0.5rem 0">Live services across the fleet — refreshes every 5s.</p>
+      <div hx-get="/ui/services" hx-trigger="load, every 5s">loading…</div>
+    </section>
+  </main>
+
+  <script>
+    function deployFlow() {
+      return {
+        catalog: [],
+        nodes: [],
+        profiles: {},
+        alias: '',
+        node: '',
+        profile: '',
+        preview: '',
+        busy: false,
+        msg: '',
+        msgError: false,
+        async init() {
+          try {
+            const [c, n, p] = await Promise.all([
+              fetch('/api/catalog').then(r => r.json()),
+              fetch('/nodes').then(r => r.json()),
+              fetch('/api/profiles').then(r => r.json()),
+            ]);
+            this.catalog = c;
+            this.nodes = n.filter(x => (x.state || 'active') !== 'disabled');
+            this.profiles = p;
+          } catch (e) { this.msg = 'load failed: ' + e; this.msgError = true; }
+        },
+        // Nodes that have the chosen alias on disk, annotated with
+        // free-vram so the operator can eyeball headroom before pinning.
+        nodesForAlias() {
+          if (!this.alias) return [];
+          const m = this.catalog.find(c => c.alias === this.alias);
+          if (!m) return [];
+          const have = new Set(m.on_nodes.map(o => o.node_id));
+          return this.nodes.filter(n => have.has(n.node_id)).map(n => {
+            const totalFree = (n.hardware?.gpus || []).reduce((s, g) => s + (g.free_mb || 0), 0);
+            return { ...n, label: totalFree >= 1024 ? (totalFree / 1024).toFixed(1) + ' GB free' : totalFree + ' MB free' };
+          });
+        },
+        // Profiles that name the chosen alias via model_alias.
+        profilesForAlias() {
+          if (!this.alias) return [];
+          return Object.entries(this.profiles)
+            .filter(([_, p]) => p.model_alias === this.alias)
+            .map(([name]) => name);
+        },
+        profileCreateUrl() {
+          if (!this.alias) return '/profiles';
+          const q = new URLSearchParams({ prefill_alias: this.alias });
+          return '/profiles?' + q.toString();
+        },
+        onAliasChange() {
+          this.profile = '';
+          this.node = '';
+          this.preview = '';
+          this.msg = '';
+        },
+        onNodeChange() { this.refreshPreview(); },
+        async refreshPreview() {
+          if (!this.profile) { this.preview = ''; return; }
+          this.preview = '…';
+          try {
+            const r = await fetch('/api/placement_preview', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ profile_name: this.profile }),
+            });
+            const d = await r.json();
+            const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
+            if (d.ok) {
+              const headroom = (d.free_mb_on_picked_gpus || 0) - (d.est_mb || 0);
+              this.preview = '→ auto-placement: ' + d.node_id + ' GPU ' + (d.gpu_indices||[]).join(',')
+                + ' · ~' + fmt(d.est_mb) + ' needed of ' + fmt(d.free_mb_on_picked_gpus) + ' free'
+                + (headroom > 0 ? ' (' + fmt(headroom) + ' headroom)' : '');
+            } else {
+              this.preview = '⚠ ' + (d.reason || 'no fit');
+            }
+          } catch (e) { this.preview = ''; }
+        },
+        async spawn() {
+          this.busy = true; this.msg = ''; this.msgError = false;
+          const body = { profile: this.profile };
+          if (this.node) body.node_id = this.node;
+          try {
+            const r = await fetch('/services', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            const d = await r.json();
+            if (!r.ok) {
+              this.msgError = true;
+              this.msg = d.error || ('HTTP ' + r.status);
+            } else {
+              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + ' — see Services below';
+              const panel = document.querySelector('[hx-get="/ui/services"]');
+              if (panel && window.htmx) window.htmx.trigger(panel, 'load');
+            }
+          } catch (e) {
+            this.msgError = true;
+            this.msg = 'request failed: ' + e;
+          }
+          this.busy = false;
+        },
+      };
+    }
+  </script>
+</body>
+</html>

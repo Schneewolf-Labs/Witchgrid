@@ -17,7 +17,7 @@
 
 // Re-export the static assets so cp.hml can hand them to the asset routes
 // without importing them itself. Single import surface for the dashboard.
-import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML, BENCH_HTML,
+import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML, BENCH_HTML, DEPLOY_HTML,
          STYLES_CSS, DASHBOARD_JS, LOGO_SVG } from "./embedded_assets";
 // Page shells — one per route. Topbar is duplicated across them.
 export let OVERVIEW_HTML  = INDEX_HTML;
@@ -25,6 +25,7 @@ export let PAGE_CATALOG   = CATALOG_HTML;
 export let PAGE_TRANSFERS = TRANSFERS_HTML;
 export let PAGE_PROFILES  = PROFILES_HTML;
 export let PAGE_BENCH     = BENCH_HTML;
+export let PAGE_DEPLOY    = DEPLOY_HTML;
 // Shared static assets
 export let SHELL_CSS = STYLES_CSS;
 export let SHELL_JS  = DASHBOARD_JS;
