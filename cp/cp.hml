@@ -268,6 +268,37 @@ fn init_db(db): null {
 		+ ")", []);
 
 	seed_default_profiles(db);
+	reap_stale_bench_runs(db);
+	return null;
+}
+
+// Bench reaper. Anything left in 'running' for >10 min is almost
+// certainly the victim of a CP restart (or an agent that vanished
+// mid-bench), not an actively-progressing run. Mark it errored so
+// the dashboard doesn't show phantom in-flight rows. Cosmetic but
+// closes the "is this still going or did CP eat it?" question.
+//
+// Threshold: 10 min covers the longest realistic bench (e.g. 10
+// repetitions × 30s/each + spawn overhead) with headroom. Real
+// in-flight runs that briefly exceed it get marked errored on
+// restart but their output_excerpt + medians stay populated if the
+// task did get partway — operator can rerun.
+fn reap_stale_bench_runs(db): null {
+	let r = query(db,
+		"select count(*) as n from bench_runs "
+		+ "where status = 'running' "
+		+ "and started_at < datetime('now', '-10 minutes')", []);
+	let stale = r[0].n;
+	if (stale > 0) {
+		exec(db,
+			"update bench_runs "
+			+ "set status = 'error', "
+			+ "    error = 'crashed mid-run during CP restart', "
+			+ "    completed_at = datetime('now') "
+			+ "where status = 'running' "
+			+ "and started_at < datetime('now', '-10 minutes')", []);
+		print("[cp] reaped " + stale + " stale bench_runs row(s)");
+	}
 	return null;
 }
 
