@@ -770,6 +770,13 @@ fn pick_placement_via_alias(alias: string, profile) {
 	let candidates = nodes_with_alias(alias);
 	if (candidates.length == 0) { return null; }
 
+	// CPU-only intent: gpu_layers=0 means llama-server runs entirely on
+	// CPU (no offload). Skip the GPU-fit search and just take the first
+	// active candidate — RAM is plentiful and we don't track per-process
+	// RAM accounting today. Returned with empty gpu_indices so the agent
+	// spawn doesn't set CUDA_VISIBLE_DEVICES or --tensor-split.
+	let cpu_only = (profile?.intent?.gpu_layers == 0);
+
 	for (cand in candidates) {
 		// Only consider nodes that have heartbeated recently and exposed
 		// an agent_url. Stale nodes shouldn't drive placement decisions.
@@ -788,6 +795,17 @@ fn pick_placement_via_alias(alias: string, profile) {
 		let est = estimate_vram_from_ingredients(cand,
 			i32(profile.context), profile.kv_type);
 		let needed_mb = est.total_mb;
+
+		if (cpu_only) {
+			return {
+				node_id:      cand.node_id,
+				agent_url:    n.agent_url,
+				gpu_indices:  [],
+				tensor_split: null,
+				est_mb:       needed_mb,
+				model_path:   cand.path,
+			};
+		}
 
 		let hw = parse(n.hardware_json);
 		let gpus = hw?.gpus ?? [];
@@ -1899,15 +1917,23 @@ fn handle_placement_preview(req): object {
 
 	// Compute free_mb on the picked GPUs so the dashboard can show
 	// the headroom that'd remain after the spawn.
+	// Aggregate either free vram on the picked GPUs (normal) or free
+	// RAM on the node (cpu_only profiles), so the preview hint shows
+	// the right capacity number for each placement mode.
 	let nodes = query(DB,
 		"select hardware_json from nodes where node_id = ?", [pick.node_id]);
 	let free_total: i64 = 0;
+	let cpu_only = (pick.gpu_indices.length == 0);
 	if (nodes.length > 0) {
 		let hw = parse(nodes[0].hardware_json);
-		let gpus = hw?.gpus ?? [];
-		for (g in gpus) {
-			for (idx in pick.gpu_indices) {
-				if (g.index == idx) { free_total = free_total + g.free_mb; }
+		if (cpu_only) {
+			free_total = i64(hw?.ram_free_mb ?? 0);
+		} else {
+			let gpus = hw?.gpus ?? [];
+			for (g in gpus) {
+				for (idx in pick.gpu_indices) {
+					if (g.index == idx) { free_total = free_total + g.free_mb; }
+				}
 			}
 		}
 	}
@@ -1916,6 +1942,7 @@ fn handle_placement_preview(req): object {
 		ok:                    true,
 		node_id:               pick.node_id,
 		gpu_indices:           pick.gpu_indices,
+		cpu_only:              cpu_only,
 		est_mb:                pick.est_mb,
 		free_mb_on_picked_gpus: free_total,
 		model_path:            pick.model_path,

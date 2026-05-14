@@ -72,11 +72,14 @@ function spawnForm() {
         });
         const d = await r.json();
         if (d.ok) {
-          const gpuCsv = (d.gpu_indices || []).join(',');
           const fmtMb = (mb) => mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
           const headroom = (d.free_mb_on_picked_gpus || 0) - (d.est_mb || 0);
-          this.preview = '→ would land on ' + d.node_id + ' GPU ' + gpuCsv
-            + ' · ~' + fmtMb(d.est_mb) + ' needed of ' + fmtMb(d.free_mb_on_picked_gpus) + ' free'
+          const where = d.cpu_only
+            ? d.node_id + ' (CPU)'
+            : d.node_id + ' GPU ' + (d.gpu_indices || []).join(',');
+          const capLabel = d.cpu_only ? 'RAM' : 'VRAM';
+          this.preview = '→ would land on ' + where
+            + ' · ~' + fmtMb(d.est_mb) + ' needed of ' + fmtMb(d.free_mb_on_picked_gpus) + ' free ' + capLabel
             + (headroom > 0 ? ' (' + fmtMb(headroom) + ' headroom)' : '');
         } else {
           this.preview = '⚠ ' + (d.reason || 'no fit');

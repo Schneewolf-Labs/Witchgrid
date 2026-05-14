@@ -208,8 +208,12 @@
             const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
             if (d.ok) {
               const headroom = (d.free_mb_on_picked_gpus || 0) - (d.est_mb || 0);
-              this.preview = '→ auto-placement: ' + d.node_id + ' GPU ' + (d.gpu_indices||[]).join(',')
-                + ' · ~' + fmt(d.est_mb) + ' needed of ' + fmt(d.free_mb_on_picked_gpus) + ' free'
+              const where = d.cpu_only
+                ? d.node_id + ' (CPU)'
+                : d.node_id + ' GPU ' + (d.gpu_indices||[]).join(',');
+              const capLabel = d.cpu_only ? 'RAM' : 'VRAM';
+              this.preview = '→ auto-placement: ' + where
+                + ' · ~' + fmt(d.est_mb) + ' needed of ' + fmt(d.free_mb_on_picked_gpus) + ' free ' + capLabel
                 + (headroom > 0 ? ' (' + fmt(headroom) + ' headroom)' : '');
             } else {
               this.preview = '⚠ ' + (d.reason || 'no fit');

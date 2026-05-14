@@ -232,7 +232,15 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// opt would *replace* the parent env (losing PATH/HOME/etc), so we
 	// mutate the parent env transiently instead — children inherit, then
 	// we restore. Safe because cp.hml is single-threaded.
-	let pinned = (gpus != null && gpus.length > 0);
+	//
+	// Three placement modes:
+	//   pinned (gpus.length > 0)              → CVD = "0,2"   pick GPUs
+	//   cpu_only (gpu_layers=0, gpus empty)   → CVD = ""      hide all GPUs
+	//                                                           so flash_attn
+	//                                                           can't grab one
+	//   neither (auto, no constraint)          → CVD untouched (child sees all)
+	let pinned   = (gpus != null && gpus.length > 0);
+	let cpu_only = (!pinned && prof?.intent?.gpu_layers == 0);
 	if (pinned) {
 		let csv = "";
 		let g = 0;
@@ -242,6 +250,8 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 			g = g + 1;
 		}
 		setenv("CUDA_VISIBLE_DEVICES", csv);
+	} else if (cpu_only) {
+		setenv("CUDA_VISIBLE_DEVICES", "");
 	}
 
 	let result = posix_spawn(argv, {
@@ -251,7 +261,7 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 		setsid: true,
 	});
 
-	if (pinned) {
+	if (pinned || cpu_only) {
 		unsetenv("CUDA_VISIBLE_DEVICES");
 	}
 	fd_close(log_fd);
