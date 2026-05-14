@@ -506,6 +506,48 @@ async function deleteProfile(name) {
   window.location.reload();
 }
 
+// Service log modal — opened by `logs` button in the services row.
+// Polls /services/log/{node}/{id} every 3s while open. Tail is text/plain;
+// we just dump it in a <pre>. 32KB cap on the agent side keeps payload
+// small enough that a 3s poll over LAN is unnoticeable.
+function serviceLogModal() {
+  return {
+    open: false,
+    profile: '', node: '', id: '', body: '', err: '', timer: null,
+    init() {
+      window.addEventListener('witchgrid:show-service-log', (e) => this.openFor(e.detail));
+    },
+    async openFor({ id, profile, node }) {
+      this.id = id; this.profile = profile; this.node = node;
+      this.body = ''; this.err = '';
+      this.open = true;
+      await this.refresh();
+      this.timer = setInterval(() => this.refresh(), 3000);
+    },
+    close() {
+      this.open = false;
+      if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    },
+    async refresh() {
+      try {
+        const r = await fetch('/services/log/' + encodeURIComponent(this.node) + '/' + encodeURIComponent(this.id));
+        if (!r.ok) { this.err = 'HTTP ' + r.status; return; }
+        this.body = await r.text();
+        this.err = '';
+        // Auto-scroll to bottom on the next paint.
+        this.$nextTick(() => {
+          const pre = document.querySelector('#service-log-body');
+          if (pre) pre.scrollTop = pre.scrollHeight;
+        });
+      } catch (e) { this.err = String(e); }
+    },
+  };
+}
+
+function showServiceLog(id, profile, node) {
+  window.dispatchEvent(new CustomEvent('witchgrid:show-service-log', { detail: { id, profile, node } }));
+}
+
 // Inline test-prompt panel (Overview page). Lets the operator send
 // a single completion request through the routing layer without
 // leaving the dashboard — closes the loop on "spawn → verify it

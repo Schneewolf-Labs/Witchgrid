@@ -170,9 +170,28 @@
       </div>
     </section>
 
-    <section>
+    <section x-data="serviceLogModal()">
       <h2>Services</h2>
       <div hx-get="/ui/services" hx-trigger="load, every 5s">loading…</div>
+
+      <!-- Service log modal — opens via showServiceLog() from the
+           rendered table's "logs" button. Polls every 3s while open. -->
+      <div class="modal-backdrop" x-show="open" x-cloak @click.self="close()" style="display:none">
+        <div class="modal-card" @click.stop style="max-width:900px">
+          <h3 style="margin:0 0 0.25rem 0">
+            <span x-text="profile"></span> · <span class="meta" x-text="node + ' · ' + id.slice(0,8) + '…'"></span>
+          </h3>
+          <p class="meta" style="margin: 0 0 0.5rem 0">
+            Last 32 KB of <code>/tmp/witchgrid-&lt;id&gt;.log</code> on <span x-text="node"></span>. Refreshes every 3s.
+          </p>
+          <p class="msg err" x-show="err" x-text="err"></p>
+          <pre id="service-log-body" style="background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.78rem; white-space:pre-wrap; word-break:break-word; max-height:60vh; overflow-y:auto" x-text="body || '(empty — service may not have written anything yet)'"></pre>
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem">
+            <button type="button" class="row-action" @click="refresh()">refresh</button>
+            <button type="button" @click="close()">close</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section x-data="testPrompt()">

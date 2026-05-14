@@ -182,9 +182,28 @@ export let INDEX_HTML = "<!doctype html>
       </div>
     </section>
 
-    <section>
+    <section x-data=\"serviceLogModal()\">
       <h2>Services</h2>
       <div hx-get=\"/ui/services\" hx-trigger=\"load, every 5s\">loading…</div>
+
+      <!-- Service log modal — opens via showServiceLog() from the
+           rendered table's \"logs\" button. Polls every 3s while open. -->
+      <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"close()\" style=\"display:none\">
+        <div class=\"modal-card\" @click.stop style=\"max-width:900px\">
+          <h3 style=\"margin:0 0 0.25rem 0\">
+            <span x-text=\"profile\"></span> · <span class=\"meta\" x-text=\"node + ' · ' + id.slice(0,8) + '…'\"></span>
+          </h3>
+          <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+            Last 32 KB of <code>/tmp/witchgrid-&lt;id&gt;.log</code> on <span x-text=\"node\"></span>. Refreshes every 3s.
+          </p>
+          <p class=\"msg err\" x-show=\"err\" x-text=\"err\"></p>
+          <pre id=\"service-log-body\" style=\"background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.78rem; white-space:pre-wrap; word-break:break-word; max-height:60vh; overflow-y:auto\" x-text=\"body || '(empty — service may not have written anything yet)'\"></pre>
+          <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem\">
+            <button type=\"button\" class=\"row-action\" @click=\"refresh()\">refresh</button>
+            <button type=\"button\" @click=\"close()\">close</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section x-data=\"testPrompt()\">
@@ -2080,6 +2099,48 @@ async function deleteProfile(name) {
     return;
   }
   window.location.reload();
+}
+
+// Service log modal — opened by `logs` button in the services row.
+// Polls /services/log/{node}/{id} every 3s while open. Tail is text/plain;
+// we just dump it in a <pre>. 32KB cap on the agent side keeps payload
+// small enough that a 3s poll over LAN is unnoticeable.
+function serviceLogModal() {
+  return {
+    open: false,
+    profile: '', node: '', id: '', body: '', err: '', timer: null,
+    init() {
+      window.addEventListener('witchgrid:show-service-log', (e) => this.openFor(e.detail));
+    },
+    async openFor({ id, profile, node }) {
+      this.id = id; this.profile = profile; this.node = node;
+      this.body = ''; this.err = '';
+      this.open = true;
+      await this.refresh();
+      this.timer = setInterval(() => this.refresh(), 3000);
+    },
+    close() {
+      this.open = false;
+      if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    },
+    async refresh() {
+      try {
+        const r = await fetch('/services/log/' + encodeURIComponent(this.node) + '/' + encodeURIComponent(this.id));
+        if (!r.ok) { this.err = 'HTTP ' + r.status; return; }
+        this.body = await r.text();
+        this.err = '';
+        // Auto-scroll to bottom on the next paint.
+        this.$nextTick(() => {
+          const pre = document.querySelector('#service-log-body');
+          if (pre) pre.scrollTop = pre.scrollHeight;
+        });
+      } catch (e) { this.err = String(e); }
+    },
+  };
+}
+
+function showServiceLog(id, profile, node) {
+  window.dispatchEvent(new CustomEvent('witchgrid:show-service-log', { detail: { id, profile, node } }));
 }
 
 // Inline test-prompt panel (Overview page). Lets the operator send

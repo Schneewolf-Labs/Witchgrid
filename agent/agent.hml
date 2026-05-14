@@ -455,6 +455,7 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: svc.create },
 		{ method: "GET",  path: "/services",      handler: svc.list },
 		{ method: "POST", path: "/services/stop", handler: svc.stop },
+		{ method: "GET",  path: "/services/log/", prefix: true, handler: svc.log },
 		// /profiles gone in v0.7 — profiles live on CP. The handler
 		// stub returns 410; route left out so 404 is the response.
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {

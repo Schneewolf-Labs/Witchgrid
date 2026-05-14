@@ -1872,6 +1872,31 @@ fn handle_placement_preview(req): object {
 	})};
 }
 
+// GET /services/log/{node_id}/{service_id} — proxy the agent's
+// /services/log/{id}, returns raw text. Dashboard pulls this into
+// a modal for tail-ing without SSH.
+fn handle_service_log(req): object {
+	let prefix = "/services/log/";
+	let rest = req.path.substr(prefix.length, req.path.length - prefix.length);
+	let slash = rest.find("/");
+	if (slash <= 0) {
+		return { status: 400, body: "{\"error\":\"expected /services/log/{node}/{id}\"}" };
+	}
+	let node_id = rest.substr(0, slash);
+	let id = rest.substr(slash + 1, rest.length - slash - 1);
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node: " + node_id }) };
+	}
+	try {
+		let resp = cp_get(agent_url + "/services/log/" + id);
+		return { status: resp.status_code, body: resp.body,
+			headers: { "content-type": "text/plain; charset=utf-8" } };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
 // ── transfers aggregator ─────────────────────────────────────────────
 fn aggregated_transfers(): array {
 	let agents = list_all_agents();
@@ -2562,6 +2587,7 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
+		{ method: "GET",  path: "/services/log/", prefix: true, handler: handle_service_log, public: true },
 		// Dashboard shell + static assets (all baked into the binary)
 		{ method: "GET",  path: "/",                       handler: handle_page_overview,    public: true },
 		{ method: "GET",  path: "/catalog",                handler: handle_page_catalog,     public: true },

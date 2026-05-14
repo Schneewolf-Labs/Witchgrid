@@ -576,6 +576,8 @@ export fn render_services(services_data): string {
 		// refresh stays consistent with the profile delete pattern.
 		let stop_js = "stopService('" + esc(s.id) + "','"
 			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
+		let log_js  = "showServiceLog('" + esc(s.id) + "','"
+			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(s.profile) + "</strong></td>"
 			+ "<td>" + esc(s.node_id) + "</td>"
@@ -584,6 +586,7 @@ export fn render_services(services_data): string {
 			+ "<td><code>" + esc(model) + "</code></td>"
 			+ "<td class=\"id\">" + esc(s.id.substr(0, 8)) + "…</td>"
 			+ "<td class=\"row-actions\">"
+				+ "<button class=\"row-action\" onclick=\"" + log_js + "\">logs</button> "
 				+ "<button class=\"row-action row-action-danger\""
 				+ " onclick=\"" + stop_js + "\""
 				+ ">stop</button></td>"

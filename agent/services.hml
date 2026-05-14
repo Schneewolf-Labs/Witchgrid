@@ -403,5 +403,24 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				error: "agent /profiles gone in v0.7 — see CP /api/profiles",
 			})};
 		},
+		// GET /services/log/{id} → tail of the per-service log file.
+		// 32KB cap so a single response doesn't dump multi-MB inference
+		// logs. Returns plain text (Content-Type: text/plain) so the
+		// dashboard can show it raw without JSON-decoding noise.
+		log: fn(req): object {
+			let prefix = "/services/log/";
+			let id = req.path.substr(prefix.length, req.path.length - prefix.length);
+			if (id == null || id.length == 0) {
+				return { status: 400, body: "{\"error\":\"id required\"}" };
+			}
+			let rows = query(db,
+				"select log_path from services where id = ?", [id]);
+			if (rows.length == 0) {
+				return { status: 404, body: "{\"error\":\"no such service\"}" };
+			}
+			let tail = read_log_tail(rows[0].log_path, 32768);
+			return { status: 200, body: tail,
+				headers: { "content-type": "text/plain; charset=utf-8" } };
+		},
 	};
 }
