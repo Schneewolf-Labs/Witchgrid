@@ -77,18 +77,40 @@
             </div>
             <div>
               <label>kv type</label>
-              <input type="text" x-model="kv_type" placeholder="q4_0 / q8_0 / f16">
+              <select x-model="kv_type">
+                <template x-for="q in kvQuants" :key="q">
+                  <option :value="q" x-text="q"></option>
+                </template>
+              </select>
             </div>
             <div class="full">
-              <label>model alias <span class="meta">(catalog lookup; preferred)</span></label>
-              <input type="text" x-model="model_alias" placeholder="mahou-1.5-mistral-nemo-12b.q5_k_m">
-            </div>
-            <div class="full">
-              <label>default model <span class="meta">(legacy fallback path)</span></label>
-              <input type="text" x-model="default_model" placeholder="/path/to/model.gguf">
+              <label>
+                model
+                <span class="meta" x-show="!useRawPath">(catalog alias — preferred)</span>
+                <span class="meta" x-show="useRawPath">(raw default_model path — fallback)</span>
+              </label>
+              <div x-show="!useRawPath">
+                <select x-model="model_alias" style="width:100%">
+                  <option value="">— pick from catalog —</option>
+                  <template x-for="m in catalog" :key="m.alias">
+                    <option :value="m.alias"
+                            x-text="m.alias + ' · ' + (m.size_mb >= 1024 ? (m.size_mb/1024).toFixed(1) + ' GB' : m.size_mb + ' MB') + ' · ' + (m.architecture || '?') + ' · on ' + m.on_nodes.length + ' node' + (m.on_nodes.length === 1 ? '' : 's')">
+                    </option>
+                  </template>
+                </select>
+                <p class="meta" style="margin:0.25rem 0 0 0">
+                  <a href="#" @click.prevent="useRawPath = true">use raw path instead →</a>
+                </p>
+              </div>
+              <div x-show="useRawPath">
+                <input type="text" x-model="default_model" placeholder="/path/to/model.gguf" style="width:100%">
+                <p class="meta" style="margin:0.25rem 0 0 0">
+                  <a href="#" @click.prevent="useRawPath = false; default_model = ''">← back to catalog picker</a>
+                </p>
+              </div>
             </div>
             <div>
-              <label>HF repo</label>
+              <label>HF repo <span class="meta">(fallback pull source)</span></label>
               <input type="text" x-model="hf_repo" placeholder="org/repo-name">
             </div>
             <div>
@@ -98,10 +120,43 @@
             <div class="full">
               <label>intent <span class="meta">(witchgrid-normalized → llama-server flags)</span></label>
               <template x-for="(row, i) in intentRows" :key="i">
-                <div class="intent-row">
-                  <input type="text" x-model="row.k" placeholder="key (e.g. flash_attention)">
-                  <input type="text" x-model="row.v" placeholder="value (true / 131072 / q4_0)">
-                  <button type="button" class="row-action row-action-danger" @click="removeIntent(i)">×</button>
+                <div>
+                  <div class="intent-row">
+                    <select :value="row.k" @change="onIntentKeyChange(i, $event.target.value)">
+                      <option value="">— pick intent —</option>
+                      <template x-for="k in knownIntentKeys" :key="k">
+                        <option :value="k" x-text="k"></option>
+                      </template>
+                      <option value="__custom__" x-show="row.k && !knownIntentKeys.includes(row.k)" x-text="row.k + ' (custom)'"></option>
+                    </select>
+                    <template x-if="intentSpec(row.k).kind === 'kv_quant'">
+                      <select x-model="row.v">
+                        <template x-for="q in kvQuants" :key="q">
+                          <option :value="q" x-text="q"></option>
+                        </template>
+                      </select>
+                    </template>
+                    <template x-if="intentSpec(row.k).kind === 'tri_bool'">
+                      <select x-model="row.v">
+                        <option value="true">true (on)</option>
+                        <option value="false">false (off)</option>
+                        <option value="auto">auto</option>
+                      </select>
+                    </template>
+                    <template x-if="intentSpec(row.k).kind === 'number'">
+                      <input type="number" x-model="row.v" placeholder="e.g. 131072">
+                    </template>
+                    <template x-if="intentSpec(row.k).kind === 'text'">
+                      <input type="text" x-model="row.v" placeholder="value">
+                    </template>
+                    <button type="button" class="row-action row-action-danger" @click="removeIntent(i)">×</button>
+                  </div>
+                  <p class="meta" x-show="row.k && intentSpec(row.k).help" x-text="intentSpec(row.k).help" style="margin:0.15rem 0 0.4rem 0"></p>
+                  <p class="meta" x-show="row.k && intentUnsupportedOn(row.k).length > 0"
+                     style="margin:0 0 0.4rem 0; color: var(--warn)">
+                    ⚠ flag missing from <code x-text="binary"></code> on:
+                    <span x-text="intentUnsupportedOn(row.k).join(', ')"></span>
+                  </p>
                 </div>
               </template>
               <button type="button" class="row-action" @click="addIntent()" style="margin-top:0.25rem">+ intent</button>

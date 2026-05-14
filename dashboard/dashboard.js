@@ -135,14 +135,14 @@ function spawnForm() {
 //   kind: 'number' | 'kv_quant' | 'tri_bool' | 'text'
 //   help: shown inline under the field, mirrors INTENTS[k].help server-side
 const KNOWN_INTENTS = [
-  { k: 'context',         kind: 'number',   help: 'Prompt+generation context window. Maps to -c / --ctx-size N.' },
-  { k: 'kv_cache_k',      kind: 'kv_quant', help: 'Quantization for the K side of the KV cache.' },
-  { k: 'kv_cache_v',      kind: 'kv_quant', help: 'Quantization for the V side of the KV cache.' },
-  { k: 'parallel_slots',  kind: 'number',   help: 'Parallel decode slots. Set 1 for RP/chat models.' },
-  { k: 'gpu_layers',      kind: 'number',   help: 'Layers to offload to GPU. 99 = all (llama.cpp clamps to model depth).' },
-  { k: 'flash_attention', kind: 'tri_bool', help: 'FlashAttention. true → on, false → off, auto → llama.cpp decides.' },
-  { k: 'host',            kind: 'text',     help: 'Bind address. Spawner overrides; here for completeness.' },
-  { k: 'port',            kind: 'number',   help: 'Bind port. Spawner overrides per-service.' },
+  { k: 'context',         flag: 'ctx-size',     kind: 'number',   help: 'Prompt+generation context window. Maps to -c / --ctx-size N.' },
+  { k: 'kv_cache_k',      flag: 'cache-type-k', kind: 'kv_quant', help: 'Quantization for the K side of the KV cache.' },
+  { k: 'kv_cache_v',      flag: 'cache-type-v', kind: 'kv_quant', help: 'Quantization for the V side of the KV cache.' },
+  { k: 'parallel_slots',  flag: 'parallel',     kind: 'number',   help: 'Parallel decode slots. Set 1 for RP/chat models.' },
+  { k: 'gpu_layers',      flag: 'gpu-layers',   kind: 'number',   help: 'Layers to offload to GPU. 99 = all (llama.cpp clamps to model depth).' },
+  { k: 'flash_attention', flag: 'flash-attn',   kind: 'tri_bool', help: 'FlashAttention. true → on, false → off, auto → llama.cpp decides.' },
+  { k: 'host',            flag: 'host',         kind: 'text',     help: 'Bind address. Spawner overrides; here for completeness.' },
+  { k: 'port',            flag: 'port',         kind: 'number',   help: 'Bind port. Spawner overrides per-service.' },
 ];
 const KV_QUANT_OPTIONS = ['f16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'];
 const KNOWN_INTENT_KEYS = KNOWN_INTENTS.map(i => i.k);
@@ -167,6 +167,7 @@ function profileEditor() {
     extra_flags: '',
     intentRows: [{ k: '', v: '' }],
     catalog: [],              // [{alias, size_mb, architecture, on_nodes:[...]}]
+    capabilities: {},         // { node_id → { binary → { flag → {...} } } }
     error: '',
     busy: false,
 
@@ -220,6 +221,26 @@ function profileEditor() {
         if (r.ok) this.catalog = await r.json();
       } catch (e) { /* dropdown will be empty; raw-path toggle still works */ }
     },
+    async loadCapabilities() {
+      try {
+        const r = await fetch('/api/capabilities');
+        if (r.ok) this.capabilities = await r.json();
+      } catch (e) { /* warnings will be silent if caps fetch fails */ }
+    },
+    // For an intent row, return the list of nodes whose `binary` doesn't
+    // expose the underlying flag. Empty array = supported everywhere.
+    intentUnsupportedOn(intentKey) {
+      const spec = KNOWN_INTENTS.find(i => i.k === intentKey);
+      if (!spec) return [];                  // unknown intent — agent will throw at spawn time
+      const flag = spec.flag;
+      const out = [];
+      for (const [nodeId, binMap] of Object.entries(this.capabilities)) {
+        const bin = binMap[this.binary];
+        if (!bin) continue;                  // node doesn't run this binary at all — skip
+        if (!(flag in bin)) out.push(nodeId);
+      }
+      return out;
+    },
 
     intentSpec,                      // expose to template
     kvQuants: KV_QUANT_OPTIONS,
@@ -263,6 +284,7 @@ function profileEditor() {
       this.isNew = true;
       this.open = true;
       this.loadCatalog();
+      this.loadCapabilities();
     },
 
     async openFor(name) {
@@ -271,6 +293,7 @@ function profileEditor() {
       this.open = true;
       this.busy = true;
       this.loadCatalog();
+      this.loadCapabilities();
       try {
         const r = await fetch('/api/profiles/' + encodeURIComponent(name));
         if (!r.ok) { this.error = 'load failed: HTTP ' + r.status; this.busy = false; return; }

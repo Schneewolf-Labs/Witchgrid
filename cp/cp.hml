@@ -1445,6 +1445,14 @@ fn handle_ui_capabilities(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
+// JSON variant of /ui/capabilities for the profile editor's
+// capability-aware warnings. Same aggregated shape, JSON instead of
+// rendered HTML. Public so the editor JS can fetch it freely.
+fn handle_list_capabilities(req): object {
+	return { status: 200, body: stringify(aggregated_capabilities()),
+		headers: { "content-type": "application/json" } };
+}
+
 // ── catalog ──────────────────────────────────────────────────────────
 // Aggregated GGUF catalog across every registered node. Each alias may
 // appear on multiple nodes; the operator (or placement) picks where to
@@ -2602,6 +2610,7 @@ fn main(): null {
 		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      public: true },
 		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      public: true },
 		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  public: true },
+		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, public: true },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles
 		// at the URL roots. Spawn form's onProfileChange() fetch
