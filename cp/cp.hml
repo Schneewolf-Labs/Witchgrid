@@ -134,6 +134,13 @@ fn cp_auth_check(req, route) {
 // POSTs add `_auth_token` to the body (Hemlock workaround); GETs
 // use the headers list (which Hemlock's libwebsockets wrapper does
 // pass through for GET).
+//
+// Both go through the explicit-timeout variants with a 60s budget.
+// Hemlock 2.4.0 dropped the default lws timeout to 5s — fine for
+// short ad-hoc calls, but spawning a 12B model needs 5-30s for the
+// agent's bind probe to return after CUDA init + safetensors load.
+let CP_AGENT_TIMEOUT_MS = 60000;
+
 fn cp_post_json(url: string, data) {
 	let secret = shared_secret();
 	let payload = data;
@@ -141,13 +148,13 @@ fn cp_post_json(url: string, data) {
 	let body = stringify(payload);
 	let h = ["Content-Type: application/json"];
 	if (secret != "") { h.push("Authorization: Bearer " + secret); }
-	return post(url, body, h);
+	return http_request_timeout("POST", url, body, h, CP_AGENT_TIMEOUT_MS);
 }
 fn cp_get(url: string) {
 	let h = [];
 	let secret = shared_secret();
 	if (secret != "") { h.push("Authorization: Bearer " + secret); }
-	return get(url, h);
+	return http_request_timeout("GET", url, "", h, CP_AGENT_TIMEOUT_MS);
 }
 
 // One global db handle — cp.hml is small enough to live with it.
@@ -1320,7 +1327,13 @@ fn handle_llama_proxy(req): object {
 	}
 
 	try {
-		let resp = http_request(req.method, target_url, req.body, headers);
+		// 10-minute budget matches the streaming path. Hemlock 2.4.0
+		// dropped the default lws timeout to 5s, which is fine for CP
+		// internal calls but kills long buffered generations (a
+		// 1000-token completion easily exceeds 30s on a 12B model).
+		// Use the explicit-timeout variant to opt back into the longer
+		// budget for inference forwarding only.
+		let resp = http_request_timeout(req.method, target_url, req.body, headers, 600000);
 		// Body might be JSON or text — pass through unchanged. Status from
 		// llama-server is the final word.
 		return { status: resp.status_code, body: resp.body };
