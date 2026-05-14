@@ -748,12 +748,106 @@ export let PROFILES_HTML = "<!doctype html>
       </div>
     </section>
 
+    <section x-data=\"aliasEditor()\">
+      <h2>Profile aliases</h2>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+        Public-facing names that resolve to a profile at routing time. Lets you rename internal profiles without breaking consumer URLs:
+        <code>POST /v1/llama/&lt;alias&gt;/completion</code> hits the alias's target.
+        Many aliases can point at one profile.
+      </p>
+
+      <form class=\"spawn\" @submit.prevent=\"add()\">
+        <div>
+          <label for=\"al-name\">alias name</label>
+          <input id=\"al-name\" type=\"text\" x-model=\"form.alias_name\" placeholder=\"flame-chat\" required>
+        </div>
+        <div>
+          <label for=\"al-target\">target profile</label>
+          <select id=\"al-target\" x-model=\"form.target_profile\" required>
+            <option value=\"\">— select —</option>
+            <template x-for=\"p in profileNames\" :key=\"p\">
+              <option :value=\"p\" x-text=\"p\"></option>
+            </template>
+          </select>
+        </div>
+        <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'add / update'\"></button>
+        <p class=\"msg\" :class=\"msgErr ? 'err' : 'ok'\" x-show=\"msg\" x-text=\"msg\"></p>
+      </form>
+
+      <table x-show=\"aliases.length > 0\" style=\"margin-top:1rem\">
+        <thead><tr><th>alias</th><th>→ target</th><th>updated</th><th></th></tr></thead>
+        <tbody>
+          <template x-for=\"a in aliases\" :key=\"a.alias_name\">
+            <tr>
+              <td><code x-text=\"a.alias_name\"></code></td>
+              <td><code x-text=\"a.target_profile\"></code></td>
+              <td><span class=\"meta\" x-text=\"a.updated_at\"></span></td>
+              <td class=\"row-actions\">
+                <button class=\"row-action row-action-danger\" @click=\"remove(a.alias_name)\">delete</button>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+      <p class=\"meta\" x-show=\"aliases.length === 0\" style=\"margin-top:0.5rem\">No aliases yet. Direct profile names always work; aliases are additive.</p>
+    </section>
+
     <section>
       <h2>Capabilities</h2>
       <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">What flags each agent's binaries actually support — refreshed when the agent restarts.</p>
       <div hx-get=\"/ui/capabilities\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
+
+  <script>
+    function aliasEditor() {
+      return {
+        aliases: [],
+        profileNames: [],
+        form: { alias_name: '', target_profile: '' },
+        busy: false, msg: '', msgErr: false,
+        async init() {
+          await this.refresh();
+          try {
+            const r = await fetch('/api/profiles');
+            this.profileNames = Object.keys(await r.json());
+          } catch (e) { /* dropdown stays empty */ }
+        },
+        async refresh() {
+          try {
+            const r = await fetch('/api/profile-aliases');
+            this.aliases = await r.json();
+          } catch (e) { this.msg = 'load failed: ' + e; this.msgErr = true; }
+        },
+        async add() {
+          this.busy = true; this.msg = ''; this.msgErr = false;
+          try {
+            const r = await fetch('/api/profile-aliases', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(this.form),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.msgErr = true; this.msg = d.error || ('HTTP ' + r.status); }
+            else {
+              this.msg = 'saved ' + d.alias_name + ' → ' + d.target_profile;
+              this.form.alias_name = '';
+              await this.refresh();
+            }
+          } catch (e) { this.msgErr = true; this.msg = String(e); }
+          this.busy = false;
+        },
+        async remove(alias) {
+          if (!confirm('Delete alias \"' + alias + '\"? Consumers hitting /v1/llama/' + alias + ' will start 503ing.')) return;
+          try {
+            const r = await fetch('/api/profile-aliases/' + encodeURIComponent(alias), { method: 'DELETE' });
+            if (!r.ok && r.status !== 204) { this.msgErr = true; this.msg = 'HTTP ' + r.status; }
+            await this.refresh();
+          } catch (e) { this.msgErr = true; this.msg = String(e); }
+        },
+      };
+    }
+  </script>
 </body>
 </html>
 ";

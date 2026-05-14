@@ -267,6 +267,20 @@ fn init_db(db): null {
 		+ "updated_at text not null"
 		+ ")", []);
 
+	// Profile aliases — public-facing names that resolve to a real
+	// profile. Lets operators rename profiles without breaking
+	// consumer URLs (e.g. FlameWorker pointing at
+	// /v1/llama/flame-chat/completion). The alias is the URL token,
+	// the target is the actual profiles.name. Many aliases can point
+	// at one profile; one alias points at one profile (it's not a
+	// fan-out / load-balancer).
+	exec(db, "create table if not exists profile_aliases ("
+		+ "alias_name text primary key,"
+		+ "target_profile text not null,"
+		+ "created_at text not null,"
+		+ "updated_at text not null"
+		+ ")", []);
+
 	// Runtime-tunable settings — config that an operator should be
 	// able to flip without restarting CP (or even SSHing). Single
 	// table, key/value, all values stored as strings; consumers
@@ -309,6 +323,83 @@ fn seed_default_settings(db): null {
 			[d.k, d.v, now]);
 	}
 	return null;
+}
+
+// ── profile aliases (consumer-facing name indirection) ─────────────
+//
+// Resolves a public-facing name to a real profile. If the name is
+// in profile_aliases, returns the target_profile. Otherwise returns
+// the name unchanged so direct profile names still work — aliases
+// are additive, never replace the "look up by literal name" path.
+
+fn resolve_profile_name(name: string): string {
+	let r = query(DB,
+		"select target_profile from profile_aliases where alias_name = ?",
+		[name]);
+	if (r.length == 0) { return name; }
+	return r[0].target_profile;
+}
+
+fn handle_list_profile_aliases(req): object {
+	let rows = query(DB,
+		"select alias_name, target_profile, created_at, updated_at "
+		+ "from profile_aliases order by alias_name", []);
+	let out = [];
+	for (r in rows) { out.push(r); }
+	return { status: 200, body: stringify(out) };
+}
+
+// PUT /api/profile-aliases — body { alias_name, target_profile }.
+// Upsert by alias_name. Validates that target_profile actually
+// exists; returns 422 otherwise so the operator catches typos
+// before consumers start hitting 503s.
+fn handle_upsert_profile_alias(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let alias = payload?.alias_name;
+	let target = payload?.target_profile;
+	if (alias == null || alias == "" || target == null || target == "") {
+		return { status: 400, body: stringify({
+			error: "alias_name + target_profile required" })};
+	}
+	let exists_p = query(DB, "select 1 from profiles where name = ?", [target]);
+	if (exists_p.length == 0) {
+		return { status: 422, body: stringify({
+			error: "no profile named '" + target + "' — alias must "
+				+ "point at an existing profile" })};
+	}
+	// Reject self-aliases (trivially confusing) and aliases that
+	// shadow an existing profile name (would never be hit since
+	// resolve_profile_name only fires when name is in the alias
+	// table — but easier to just refuse than explain later).
+	if (alias == target) {
+		return { status: 422, body: stringify({
+			error: "alias_name == target_profile is a no-op" })};
+	}
+	let exists_a = query(DB, "select 1 from profiles where name = ?", [alias]);
+	if (exists_a.length > 0) {
+		return { status: 422, body: stringify({
+			error: "alias '" + alias + "' shadows an existing profile name" })};
+	}
+	let now = iso_now();
+	exec(DB,
+		"insert into profile_aliases (alias_name, target_profile, created_at, updated_at) "
+		+ "values (?, ?, ?, ?) "
+		+ "on conflict(alias_name) do update set "
+		+ "target_profile=excluded.target_profile, "
+		+ "updated_at=excluded.updated_at",
+		[alias, target, now, now]);
+	return { status: 200, body: stringify({
+		alias_name: alias, target_profile: target })};
+}
+
+fn handle_delete_profile_alias(req): object {
+	let prefix = "/api/profile-aliases/";
+	let alias = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (alias.length == 0) {
+		return { status: 400, body: "{\"error\":\"alias name required\"}" };
+	}
+	exec(DB, "delete from profile_aliases where alias_name = ?", [alias]);
+	return { status: 204, body: "" };
 }
 
 // ── settings (cp_settings table) ────────────────────────────────────
@@ -1534,6 +1625,12 @@ fn handle_llama_proxy(req): object {
 	if (profile_name.length == 0) {
 		return { status: 400, body: "{\"error\":\"profile required: /v1/llama/{profile}/{path}\"}" };
 	}
+
+	// Resolve aliases so a public-facing URL like /v1/llama/flame-chat/...
+	// can map to an internal profile (e.g. chat-mahou). When no alias
+	// matches, returns the name unchanged so direct profile names
+	// continue to work without setup.
+	profile_name = resolve_profile_name(profile_name);
 
 	let target = find_service_for_profile(profile_name);
 	if (target == null) {
@@ -2919,6 +3016,9 @@ fn main(): null {
 		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
 		{ method: "GET",  path: "/api/settings",    handler: handle_list_settings,    public: true },
 		{ method: "PUT",  path: "/api/settings",    handler: handle_update_settings },
+		{ method: "GET",  path: "/api/profile-aliases",  handler: handle_list_profile_aliases,   public: true },
+		{ method: "PUT",  path: "/api/profile-aliases",  handler: handle_upsert_profile_alias },
+		{ method: "DELETE", path: "/api/profile-aliases/", prefix: true, handler: handle_delete_profile_alias },
 		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile,    public: true },
 		{ method: "PUT",  path: "/api/profiles/",   prefix: true, handler: handle_update_profile },
 		{ method: "DELETE", path: "/api/profiles/", prefix: true, handler: handle_delete_profile },
