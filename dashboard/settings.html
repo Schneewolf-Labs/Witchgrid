@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>witchgrid — settings</title>
+  <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
+  <script>
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('witchgrid-theme'); } catch (e) {}
+      if (t !== 'light' && t !== 'dark') { t = 'dark'; }
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.3/dist/cdn.min.js"></script>
+  <script src="/assets/dashboard.js"></script>
+</head>
+<body>
+  <main x-data="themeToggle()">
+    <div class="topbar">
+      <div class="brand">
+        <img src="/assets/logo.svg" alt="witchgrid">
+        <h1>witchgrid<span class="cursor">_</span></h1>
+      </div>
+      <nav class="page-nav">
+        <a href="/">overview</a>
+        <a href="/catalog">catalog</a>
+        <a href="/transfers">transfers</a>
+        <a href="/profiles">profiles</a>
+        <a href="/bench">bench</a>
+        <a href="/deploy">deploy</a>
+        <a href="/settings">settings</a>
+      </nav>
+      <button class="theme-toggle" @click="toggle()" :title="theme === 'dark' ? 'switch to light' : 'switch to dark'">
+        <span x-text="theme === 'dark' ? '☀' : '☾'"></span>
+      </button>
+    </div>
+
+    <section x-data="settingsPage()">
+      <h2>Settings</h2>
+      <p class="meta" style="margin: 0 0 0.75rem 0">
+        Runtime knobs. Changes take effect on the next interval boundary — no CP restart needed.
+      </p>
+
+      <h3 style="margin-top:1.25rem; font-size:1rem">sqlite auto-backup</h3>
+      <p class="meta" style="margin: 0 0 0.5rem 0">
+        Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
+        Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
+      </p>
+
+      <form class="spawn" @submit.prevent="save()">
+        <div>
+          <label for="bi">interval (minutes)</label>
+          <input id="bi" type="number" x-model="form.db_backup_interval_min" min="0" max="1440">
+        </div>
+        <div>
+          <label for="bd">backup dir</label>
+          <input id="bd" type="text" x-model="form.db_backup_dir" placeholder="./backups">
+        </div>
+        <div>
+          <label for="bk">keep last N</label>
+          <input id="bk" type="number" x-model="form.db_backup_keep" min="1" max="100">
+        </div>
+        <button type="submit" :disabled="busy" x-text="busy ? '…' : 'save'"></button>
+
+        <p class="msg" :class="msgErr ? 'err' : 'ok'" x-show="msg" x-text="msg"></p>
+
+        <div style="grid-column: 1 / -1; padding-top: 0.5rem; border-top: 1px solid var(--border-soft); font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--fg-dim)">
+          <div>last backup: <span x-text="lastAt || '—'"></span></div>
+          <div x-show="lastPath">last path:  <code x-text="lastPath"></code></div>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    function settingsPage() {
+      return {
+        form: { db_backup_interval_min: '0', db_backup_dir: './backups', db_backup_keep: '24' },
+        lastAt: '', lastPath: '',
+        busy: false, msg: '', msgErr: false,
+        async init() {
+          await this.refresh();
+        },
+        async refresh() {
+          try {
+            const r = await fetch('/api/settings');
+            const d = await r.json();
+            if (d.db_backup_interval_min) this.form.db_backup_interval_min = d.db_backup_interval_min.value;
+            if (d.db_backup_dir)          this.form.db_backup_dir          = d.db_backup_dir.value;
+            if (d.db_backup_keep)         this.form.db_backup_keep         = d.db_backup_keep.value;
+            this.lastAt   = d.db_backup_last_at ? d.db_backup_last_at.value : '';
+            this.lastPath = d.db_backup_last_path ? d.db_backup_last_path.value : '';
+          } catch (e) { this.msgErr = true; this.msg = 'load failed: ' + e; }
+        },
+        async save() {
+          this.busy = true; this.msg = ''; this.msgErr = false;
+          try {
+            const r = await fetch('/api/settings', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                db_backup_interval_min: String(parseInt(this.form.db_backup_interval_min, 10) || 0),
+                db_backup_dir:          this.form.db_backup_dir || './backups',
+                db_backup_keep:         String(parseInt(this.form.db_backup_keep, 10) || 24),
+              }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.msgErr = true; this.msg = d.error || ('HTTP ' + r.status); }
+            else      { this.msg = 'saved (' + (d.updated || []).join(', ') + '); next backup at the next interval boundary'; }
+          } catch (e) { this.msgErr = true; this.msg = 'save failed: ' + e; }
+          this.busy = false;
+        },
+      };
+    }
+  </script>
+</body>
+</html>

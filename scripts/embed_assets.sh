@@ -31,6 +31,7 @@ ASSETS = [
     ("PROFILES_HTML",  "dashboard/profiles.html"),    # /profiles
     ("BENCH_HTML",     "dashboard/bench.html"),       # /bench
     ("DEPLOY_HTML",    "dashboard/deploy.html"),      # /deploy
+    ("SETTINGS_HTML",  "dashboard/settings.html"),    # /settings
     # Shared assets
     ("STYLES_CSS",     "dashboard/styles.css"),
     ("DASHBOARD_JS",   "dashboard/dashboard.js"),

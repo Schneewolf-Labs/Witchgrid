@@ -32,13 +32,13 @@ import { open_db, exec, exec as db_exec, query, close_db } from "@stdlib/sqlite"
 import { parse, stringify } from "@stdlib/json";
 import { post_json, post, get, request as http_request, stream as http_stream, request_timeout as http_request_timeout } from "@stdlib/http";
 import { sleep, time_ms as unix_ms } from "@stdlib/time";
-import { exists } from "@stdlib/fs";
+import { exists, make_dirs, list_dir, remove_file } from "@stdlib/fs";
 import { getenv } from "@stdlib/env";
 import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
-         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY,
+         OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
@@ -267,8 +267,196 @@ fn init_db(db): null {
 		+ "updated_at text not null"
 		+ ")", []);
 
+	// Runtime-tunable settings — config that an operator should be
+	// able to flip without restarting CP (or even SSHing). Single
+	// table, key/value, all values stored as strings; consumers
+	// parse to the type they want.
+	exec(db, "create table if not exists cp_settings ("
+		+ "key text primary key,"
+		+ "value text not null,"
+		+ "updated_at text not null"
+		+ ")", []);
+
 	seed_default_profiles(db);
+	seed_default_settings(db);
 	reap_stale_bench_runs(db);
+	return null;
+}
+
+// Settings defaults. Insert-or-ignore so an operator's prior edits
+// survive a CP upgrade — only fills in keys that don't exist yet.
+fn seed_default_settings(db): null {
+	let now = iso_now();
+	let defaults = [
+		// 0 disables backups. Reasonable production value: 60 (hourly).
+		{ k: "db_backup_interval_min", v: "0" },
+		// Where backups land. Path is relative to CP's working dir
+		// (next to witchgrid.db) so it works without changes when
+		// the operator hasn't thought about storage layout.
+		{ k: "db_backup_dir",          v: "./backups" },
+		// How many .bak files to keep. Older ones get pruned after
+		// each new backup. Default 24 = one day at hourly cadence.
+		{ k: "db_backup_keep",         v: "24" },
+		// Stamped after each successful backup; surfaced in the
+		// dashboard so operators can see the loop is alive.
+		{ k: "db_backup_last_at",      v: "" },
+		{ k: "db_backup_last_path",    v: "" },
+	];
+	for (d in defaults) {
+		exec(db,
+			"insert or ignore into cp_settings (key, value, updated_at) "
+			+ "values (?, ?, ?)",
+			[d.k, d.v, now]);
+	}
+	return null;
+}
+
+// ── settings (cp_settings table) ────────────────────────────────────
+
+fn setting_get(key: string, default_value: string): string {
+	let r = query(DB, "select value from cp_settings where key = ?", [key]);
+	if (r.length == 0) { return default_value; }
+	return r[0].value;
+}
+
+fn setting_set(key: string, value: string): null {
+	exec(DB,
+		"insert into cp_settings (key, value, updated_at) values (?, ?, ?) "
+		+ "on conflict(key) do update set value=excluded.value, updated_at=excluded.updated_at",
+		[key, value, iso_now()]);
+	return null;
+}
+
+fn handle_list_settings(req): object {
+	let rows = query(DB, "select key, value, updated_at from cp_settings order by key", []);
+	let out = {};
+	for (r in rows) {
+		out[r.key] = { value: r.value, updated_at: r.updated_at };
+	}
+	return { status: 200, body: stringify(out),
+		headers: { "content-type": "application/json" } };
+}
+
+// PUT /api/settings — body is { key1: value1, key2: value2 }. All
+// values stored as strings; consumers parse to their own type.
+// Allowed keys gated by an explicit allowlist so the operator can't
+// accidentally set arbitrary keys (and to make removal safe later).
+let SETTING_KEYS_ALLOWED = ["db_backup_interval_min", "db_backup_dir", "db_backup_keep"];
+
+fn handle_update_settings(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let updated = [];
+	for (k in payload.keys()) {
+		let allowed = false;
+		for (a in SETTING_KEYS_ALLOWED) { if (a == k) { allowed = true; } }
+		if (!allowed) { continue; }
+		setting_set(k, "" + payload[k]);
+		updated.push(k);
+	}
+	return { status: 200, body: stringify({ updated: updated }) };
+}
+
+// ── sqlite auto-backup ──────────────────────────────────────────────
+//
+// Background task that VACUUMs CP's sqlite into a fresh .bak file
+// every db_backup_interval_min minutes. 0 disables the loop. Runs on
+// CP boot; reads settings each tick so live edits take effect on
+// the next interval boundary. Pruning keeps the most recent
+// db_backup_keep files; older ones get unlinked.
+//
+// VACUUM INTO is atomic from SQLite's POV — produces a clean copy
+// of the DB at a consistent point in time, no torn pages even if
+// CP is mid-write. The dest file must NOT exist (sqlite refuses to
+// overwrite), so each backup gets a unique unix-ms suffix.
+
+fn safe_dir_path(d: string): bool {
+	// Only allow paths made of alphanumerics, /, ., -, _ to keep
+	// SQL injection out of the VACUUM INTO statement (which can't
+	// be parameterized). Operator-controlled but operator-trusted —
+	// this is defence-in-depth, not a security boundary.
+	if (d.length == 0 || d.length > 256) { return false; }
+	let i = 0;
+	while (i < d.length) {
+		let c = d[i];
+		let ok = (c >= 'a' && c <= 'z')
+			|| (c >= 'A' && c <= 'Z')
+			|| (c >= '0' && c <= '9')
+			|| c == '/' || c == '.' || c == '-' || c == '_';
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+async fn db_backup_loop(): null {
+	loop {
+		// Read settings every tick so changes apply on the next
+		// boundary without bouncing CP.
+		let interval_str = setting_get("db_backup_interval_min", "0");
+		let interval_min: i32 = i32(interval_str);
+		if (interval_min < 1) {
+			// Disabled. Poll the setting once a minute so an
+			// operator flipping it on doesn't have to wait the
+			// previous interval to elapse.
+			sleep(60.0);
+			continue;
+		}
+
+		sleep(f64(interval_min) * 60.0);
+
+		let dir = setting_get("db_backup_dir", "./backups");
+		if (!safe_dir_path(dir)) {
+			eprint("[backup] refused: db_backup_dir contains unsafe chars: " + dir);
+			continue;
+		}
+		// Ensure the dir exists (mkdir -p style).
+		try { make_dirs(dir); } catch (e) {
+			eprint("[backup] mkdir " + dir + " failed: " + e);
+			continue;
+		}
+
+		let stamp_str = "" + unix_ms();
+		let dest = dir + "/witchgrid.db.bak." + stamp_str;
+		try {
+			exec(DB, "vacuum into '" + dest + "'", []);
+			print("[backup] wrote " + dest);
+			setting_set("db_backup_last_at", iso_now());
+			setting_set("db_backup_last_path", dest);
+		} catch (e) {
+			eprint("[backup] vacuum failed: " + e);
+			continue;
+		}
+
+		// Prune oldest beyond keep. Scan dir, filter to our prefix,
+		// sort by name (timestamp suffix sorts correctly), drop tail.
+		let keep_str = setting_get("db_backup_keep", "24");
+		let keep: i32 = i32(keep_str);
+		if (keep < 1) { keep = 1; }
+		try {
+			let entries = list_dir(dir);
+			let baks = [];
+			let prefix = "witchgrid.db.bak.";
+			for (e in entries) {
+				if (e.starts_with(prefix)) { baks.push(e); }
+			}
+			// Sort lexicographically — timestamps are zero-padded
+			// unix millis so newest = highest. After sort, oldest
+			// at index 0.
+			baks.sort();
+			let to_drop: i32 = baks.length - keep;
+			let i: i32 = 0;
+			while (i < to_drop) {
+				try { remove_file(dir + "/" + baks[i]); }
+				catch (e) { eprint("[backup] prune failed: " + e); }
+				i = i + 1;
+			}
+			if (to_drop > 0) {
+				print("[backup] pruned " + to_drop + " old backup(s)");
+			}
+		} catch (e) {
+			eprint("[backup] prune scan failed: " + e);
+		}
+	}
 	return null;
 }
 
@@ -2634,6 +2822,7 @@ fn handle_page_transfers(req): object { return html_response(PAGE_TRANSFERS); }
 fn handle_page_profiles(req): object  { return html_response(PAGE_PROFILES); }
 fn handle_page_bench(req): object     { return html_response(PAGE_BENCH); }
 fn handle_page_deploy(req): object    { return html_response(PAGE_DEPLOY); }
+fn handle_page_settings(req): object  { return html_response(PAGE_SETTINGS); }
 
 // /ui/bench fragment — newest 100 bench rows.
 fn handle_ui_bench(req): object {
@@ -2671,6 +2860,12 @@ fn main(): null {
 	print("[cp] sqlite ready: " + DB_PATH);
 	init_auth();
 
+	// Detached background task: sqlite auto-backup loop. No-op when
+	// db_backup_interval_min=0 (the default); flips on as soon as the
+	// operator sets a positive interval via PUT /api/settings.
+	let bk = spawn(db_backup_loop);
+	detach(bk);
+
 	// `public: true` flag opts a route OUT of the shared-secret check.
 	// Used for: dashboard HTML shell, static assets, /healthz, dashboard
 	// fragments + read-only JSON the dashboard JS hits (no operator
@@ -2704,6 +2899,7 @@ fn main(): null {
 		{ method: "GET",  path: "/profiles",               handler: handle_page_profiles,    public: true },
 		{ method: "GET",  path: "/bench",                  handler: handle_page_bench,       public: true },
 		{ method: "GET",  path: "/deploy",                 handler: handle_page_deploy,      public: true },
+		{ method: "GET",  path: "/settings",               handler: handle_page_settings,    public: true },
 		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css,    public: true },
 		{ method: "GET",  path: "/assets/dashboard.js",    handler: handle_dashboard_js,     public: true },
 		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo,             public: true },
@@ -2721,6 +2917,8 @@ fn main(): null {
 		// (CP-owned storage, was baked into agent binaries before).
 		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2, public: true },
 		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
+		{ method: "GET",  path: "/api/settings",    handler: handle_list_settings,    public: true },
+		{ method: "PUT",  path: "/api/settings",    handler: handle_update_settings },
 		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile,    public: true },
 		{ method: "PUT",  path: "/api/profiles/",   prefix: true, handler: handle_update_profile },
 		{ method: "DELETE", path: "/api/profiles/", prefix: true, handler: handle_delete_profile },
