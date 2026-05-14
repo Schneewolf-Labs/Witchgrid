@@ -23,6 +23,7 @@
 // add when needed.
 
 import { TcpListener } from "@stdlib/net";
+import { sleep } from "@stdlib/time";
 
 // Decode a buffer of UTF-8 bytes into a Hemlock string with proper
 // codepoints. The naive byte-as-rune approach we used before was wrong
@@ -231,13 +232,30 @@ async fn handle_connection(stream, routes, auth_check): null {
 
 // Serve forever on host:port. routes is array of { method, path, handler,
 // public? }. auth_check is optional — see dispatch() docs.
+//
+// accept() failures are caught and retried after a short backoff
+// rather than killed. Two motivating cases observed in the wild:
+//   - macOS: lws_create_context failing on SSL init can poison the
+//     process so that an unrelated TcpListener.accept() throws
+//     ECONNABORTED ("Software caused connection abort"). Without
+//     this catch the agent dies on the heartbeat task's first lws
+//     POST attempt.
+//   - Generic transient kernel issues (resource limits, TIME_WAIT
+//     buildup) shouldn't take the server down.
+// The 100ms backoff prevents a tight error loop from saturating CPU
+// when the underlying problem persists.
 export fn serve(host: string, port: i32, routes, auth_check): null {
 	let listener = TcpListener(host, port);
 	print("[http] listening on " + host + ":" + port);
 	loop {
-		let stream = listener.accept();
-		let t = spawn(handle_connection, stream, routes, auth_check);
-		detach(t);
+		try {
+			let stream = listener.accept();
+			let t = spawn(handle_connection, stream, routes, auth_check);
+			detach(t);
+		} catch (e) {
+			eprint("[http] accept failed: " + e + " (retrying)");
+			sleep(0.1);
+		}
 	}
 	return null;
 }
