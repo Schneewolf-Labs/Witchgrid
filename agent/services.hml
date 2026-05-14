@@ -253,24 +253,38 @@ fn is_our_uid(pid: i32, our_uid: i32): bool {
 // Read /proc/<pid>/cmdline, find the named arg, return its value
 // (the next argv element). Null when not found or unreadable.
 //
-// Hemlock 2.4.0 file.read() truncates at the first 0x00 byte (same
-// bug pattern as the pre-2.3.1 stream.read), so we can't slurp the
-// nul-separated cmdline directly. Shell out to `tr` to convert nuls
-// to newlines, then split. Fix once Hemlock gets file.read_binary().
+// cmdline is nul-separated argv. Use file.read_binary (Hemlock 2.4.1+)
+// to get the raw bytes intact, walk to find 0x00 boundaries, slice
+// out each segment as a string. The pre-2.4.1 workaround was a
+// `tr '\0' '\n'` shellout because file.read() truncated at the first
+// nul byte.
 fn read_arg_after(pid: i32, name: string) {
 	try {
-		let r = exec_argv(["tr", "\\0", "\n"]);
-	} catch (e) { /* exec_argv doesn't have stdin, see below */ }
-	// exec_argv has no stdin pipe option, so use sh -c "tr '\0' '\n' < /proc/PID/cmdline"
-	try {
-		let r = exec_argv(["sh", "-c",
-			"tr '\\0' '\\n' < /proc/" + pid + "/cmdline"]);
-		if (r.exit_code != 0) { return null; }
-		let argv = r.output.split("\n");
-		let i = 0;
-		while (i < argv.length - 1) {
-			if (argv[i] == name) { return argv[i + 1]; }
+		let f = open("/proc/" + pid + "/cmdline", "r");
+		let buf = f.read_binary();
+		f.close();
+		if (buf == null || buf.length == 0) { return null; }
+
+		// Walk bytes, slice each nul-bounded segment into argv. We only
+		// need to find one match so we could short-circuit on the first
+		// `name` hit, but a full pass is microseconds for typical
+		// cmdlines (< 1 KB) — readability wins.
+		let argv = [];
+		let start: i32 = 0;
+		let i: i32 = 0;
+		while (i < buf.length) {
+			if (buf[i] == 0) {
+				let sub = buf.slice(start, i);
+				argv.push(__string_from_bytes(sub));
+				start = i + 1;
+			}
 			i = i + 1;
+		}
+
+		let j: i32 = 0;
+		while (j < argv.length - 1) {
+			if (argv[j] == name) { return argv[j + 1]; }
+			j = j + 1;
 		}
 	} catch (e) { }
 	return null;
