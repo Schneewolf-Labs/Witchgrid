@@ -1397,7 +1397,9 @@ fn unmanaged_by_node(): object {
 
 fn handle_ui_services(req): object {
 	// Reuse the JSON aggregator's logic — call the agents, build the
-	// merged list, hand to the renderer.
+	// merged list, hand to the renderer. Also fetch the current
+	// profiles map so the renderer can flag a "stale" badge on
+	// services whose profile_version is older than the live profile.
 	let agents = list_all_agents();
 	let merged = [];
 	for (a in agents) {
@@ -1412,7 +1414,8 @@ fn handle_ui_services(req): object {
 			}
 		} catch (e) { }
 	}
-	return { status: 200, body: render_services(merged),
+	let live_profiles = all_profiles_map();
+	return { status: 200, body: render_services(merged, live_profiles),
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 

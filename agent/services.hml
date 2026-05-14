@@ -60,6 +60,15 @@ export fn init_services_schema(db): null {
 		+ "args_json text not null,"
 		+ "started_at text not null"
 		+ ")", []);
+	// profile_version added in slice 8 of the v0.7 dashboard polish.
+	// Cross-version SQLite migration: ALTER TABLE ADD COLUMN succeeds
+	// against fresh DBs (column gets created normally) and against
+	// existing DBs (nullable column added, old rows get NULL). Wrapped
+	// in try/catch because ALTER TABLE re-running on a DB that already
+	// has the column throws "duplicate column name".
+	try {
+		db_exec(db, "alter table services add column profile_version integer", []);
+	} catch (e) { }
 	return null;
 }
 
@@ -272,10 +281,15 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	}
 
 	let now = iso_now(db);
+	// profile_version comes from CP's all_profiles_map() which stamps
+	// __version onto the inlined profile object. Captured at spawn time
+	// so the dashboard can flag a "stale" badge if the operator edits
+	// the profile after the service is already running.
+	let pv = prof?.__version;
 	db_exec(db,
-		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at) "
-		+ "values (?, ?, ?, ?, ?, ?, ?, ?)",
-		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now]);
+		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv]);
 
 	return {
 		id: id,
@@ -285,12 +299,13 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 		port: port,
 		log_path: log_path,
 		started_at: now,
+		profile_version: pv,
 	};
 }
 
 export fn list_services(db): array {
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at "
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version "
 		+ "from services order by started_at desc", []);
 	let out = [];
 	for (row in rows) {
@@ -302,6 +317,7 @@ export fn list_services(db): array {
 			port: row.port,
 			log_path: row.log_path,
 			started_at: row.started_at,
+			profile_version: row?.profile_version,
 			alive: process_alive(row.pid),
 		});
 	}

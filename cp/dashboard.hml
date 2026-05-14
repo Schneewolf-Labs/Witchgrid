@@ -549,8 +549,10 @@ export fn render_missing(missing_data, all_nodes): string {
 
 // ── /ui/services fragment ────────────────────────────────────────────
 
-// services_data: [{id, profile, model_path, port, alive, node_id, ...}]
-export fn render_services(services_data): string {
+// services_data: [{id, profile, model_path, port, alive, node_id, profile_version?, ...}]
+// live_profiles: { name → profile object with __version stamped } so we can
+//                flag a stale badge when the profile's been edited since spawn.
+export fn render_services(services_data, live_profiles): string {
 	if (services_data.length == 0) {
 		return "<p class=\"empty\">No services running. POST /services to spawn.</p>";
 	}
@@ -563,6 +565,19 @@ export fn render_services(services_data): string {
 		let alive_class = "alive-no";
 		let alive_text = "✗ dead";
 		if (s.alive) { alive_class = "alive-yes"; alive_text = "● live"; }
+		// Stale badge: this service was spawned against an older
+		// version of the profile than the one currently saved. Operator
+		// should restart for the new args to take effect.
+		let stale_badge = "";
+		let live = live_profiles?[s.profile];
+		if (live != null && s?.profile_version != null
+			&& live.__version > s.profile_version) {
+			stale_badge = " <span class=\"badge badge-state-draining\""
+				+ " title=\"profile edited since spawn (live v"
+				+ live.__version + " > running v" + s.profile_version
+				+ "); restart for new args\">stale v" + s.profile_version
+				+ " → v" + live.__version + "</span>";
+		}
 		// Trim model path to just the basename for legibility.
 		// Hemlock has no rfind/find_last on strings, so split + take last.
 		let model = s.model_path;
@@ -579,7 +594,7 @@ export fn render_services(services_data): string {
 		let log_js  = "showServiceLog('" + esc(s.id) + "','"
 			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
 		html = html + "<tr>"
-			+ "<td><strong>" + esc(s.profile) + "</strong></td>"
+			+ "<td><strong>" + esc(s.profile) + "</strong>" + stale_badge + "</td>"
 			+ "<td>" + esc(s.node_id) + "</td>"
 			+ "<td><code>" + s.port + "</code></td>"
 			+ "<td class=\"" + alive_class + "\">" + alive_text + "</td>"
