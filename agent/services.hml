@@ -69,31 +69,48 @@ export fn init_services_schema(db): null {
 	try {
 		db_exec(db, "alter table services add column profile_version integer", []);
 	} catch (e) { }
+	// state added for orphan adoption: services rows are now
+	// soft-deleted ('stopped' / 'dead') instead of removed, so when
+	// the agent restarts and finds an orphan llama-server matching a
+	// previously-stored row's port, we can re-adopt with the right
+	// profile metadata. Defaults to 'running' for fresh inserts and
+	// for migration of pre-existing rows (those should all be live;
+	// reap_zombie_services will catch any that aren't on next pass).
+	try {
+		db_exec(db, "alter table services add column state text not null default 'running'", []);
+	} catch (e) { }
+	// profile_json holds the full inlined profile object so adoption
+	// can rebuild the row exactly as CP originally pushed it. Nullable
+	// for back-compat with rows inserted by older agents.
+	try {
+		db_exec(db, "alter table services add column profile_json text", []);
+	} catch (e) { }
 	return null;
 }
 
-// Garbage-collect rows for services whose pid no longer points at a
-// live llama-server process. Catches three cases:
+// Mark stale rows as 'dead' (soft-delete) so the orphan-adoption
+// path can later port-match a discovered llama-server back to the
+// profile metadata that originally spawned it. Catches:
 //
 //   1. Process exited (crash, OOM, operator kill) — process_alive
-//      returns false, row is stale, drop.
+//      returns false. Row becomes 'dead'.
 //   2. PID recycled to a different process — process_alive returns
-//      true (something is at that pid) but cmdline doesn't start with
-//      llama-server, so it's not ours. Drop. Defensive against the
-//      edge case where a long-lived agent's children outlive the OS
-//      pid wraparound and a sudoer claims the slot.
-//   3. PID alive AND is one of our llama-servers — keep the row.
-//      This is the agent-crash-and-restart "bring orphans back under
-//      our wing" path; the children survived (init reparented via
-//      setsid), the row survived in sqlite, reconciliation is
-//      automatic.
+//      true but cmdline isn't llama-server. Row becomes 'dead'.
+//   3. PID alive AND is one of our llama-servers — keep state.
+//      This is the agent-crash-and-restart path; children survived
+//      (init reparented via setsid), the row survived in sqlite,
+//      reconciliation is automatic.
 //
-// Without reap, GET /services would keep reporting alive=false for
-// every dead row, and pick_port would still treat those ports as
-// "in use" and bump past them — leaking port numbers over time.
-// Returns the number of rows deleted (for logging).
+// Also prunes 'dead' rows older than ADOPTION_HISTORY_DAYS so the
+// table doesn't grow forever. 7d is plenty — after a week, the
+// llama-server children have almost certainly been killed by reboot.
+//
+// Returns the number of rows transitioned to 'dead' (for logging).
+let ADOPTION_HISTORY_DAYS = 7;
+
 export fn reap_zombie_services(db): i32 {
-	let rows = query(db, "select id, pid from services", []);
+	let rows = query(db,
+		"select id, pid from services where state = 'running'", []);
 	let reaped = 0;
 	for (row in rows) {
 		let drop = false;
@@ -103,10 +120,19 @@ export fn reap_zombie_services(db): i32 {
 			drop = true;
 		}
 		if (drop) {
-			db_exec(db, "delete from services where id = ?", [row.id]);
+			db_exec(db,
+				"update services set state = 'dead' where id = ?",
+				[row.id]);
 			reaped = reaped + 1;
 		}
 	}
+	// Prune ancient soft-deleted rows. Keep enough recent history
+	// for adoption to work across the kinds of restart windows that
+	// happen during normal ops (CP upgrades, agent bounces).
+	db_exec(db,
+		"delete from services where state in ('dead', 'stopped') "
+		+ "and started_at < datetime('now', ?)",
+		["-" + ADOPTION_HISTORY_DAYS + " days"]);
 	return reaped;
 }
 
@@ -140,16 +166,31 @@ fn is_our_llama_server(pid: i32): bool {
 // Uses `pgrep -af llama-server` rather than nvidia-smi: CPU-only
 // services (gpu_layers=0) don't appear in nvidia-smi compute apps,
 // and we want to catch those too.
+// On boot, walk same-uid llama-server processes and reconcile them
+// with our services table. Three outcomes per discovered process:
+//
+//   - Already running in our table (PID match) → no-op
+//   - Port matches a soft-deleted row (state in 'dead'/'stopped')
+//     and the row has profile_json → ADOPT: update pid, flip state
+//     back to 'running'. The service is now under our wing again.
+//   - No port match anywhere → log [orphan] and leave alone. We
+//     have no profile metadata to reconstruct it; operator decides.
+//
+// This is the "agent crashed mid-flight, children survived" recovery
+// path: the row was preserved in sqlite (because reap soft-deletes
+// rather than hard-deletes), the child kept running, and now we
+// stitch them back together by port.
 export fn discover_orphan_llama_servers(db, our_uid: i32): null {
 	let r = null;
 	try {
 		r = exec_argv(["pgrep", "-u", "" + our_uid, "-f", "llama-server"]);
 	} catch (e) { return null; }
-	// pgrep exits 1 when no matches — fine, nothing to reconcile.
 	if (r.output.length == 0) { return null; }
 
+	// PIDs already running in our table — skip.
 	let known = {};
-	let owned = query(db, "select pid from services", []);
+	let owned = query(db,
+		"select pid from services where state = 'running'", []);
 	for (o in owned) { known["" + o.pid] = true; }
 
 	let lines = r.output.split("\n");
@@ -157,20 +198,46 @@ export fn discover_orphan_llama_servers(db, our_uid: i32): null {
 		let pid_str = line.trim();
 		if (pid_str.length == 0) { continue; }
 		let pid = i32(pid_str);
-		// pgrep -f matches the whole cmdline, so e.g. "vim
-		// agent/services.hml" containing the literal "llama-server"
-		// would slip through — verify cmdline argv[0].
 		if (!is_our_llama_server(pid)) { continue; }
 		if (known.has("" + pid)) { continue; }
-		// pgrep -u already filtered by uid, but keep as belt-and-
-		// suspenders against pgrep flags varying by distro.
 		if (!is_our_uid(pid, our_uid)) { continue; }
-		let port = read_arg_after(pid, "--port");
+		let port_str = read_arg_after(pid, "--port");
 		let model = read_arg_after(pid, "-m");
-		print("[orphan] pid " + pid + " port=" + (port ?? "?")
-			+ " model=" + (model ?? "?")
-			+ " — running but unmanaged. Either kill it manually or "
-			+ "let CP auto-spawn into a different port for the same profile.");
+		if (port_str == null) {
+			print("[orphan] pid " + pid + " no --port in argv, can't adopt");
+			continue;
+		}
+		let port = i32(port_str);
+
+		// Find the most recent soft-deleted row with this port +
+		// matching model_path (if we know the model). Model match
+		// guards against the case where the operator stopped one
+		// service, started a different one on the same port, then
+		// the agent crashed — we don't want to adopt the new one
+		// into the old one's profile slot.
+		let candidates = query(db,
+			"select id, profile, port, profile_json, profile_version "
+			+ "from services where state in ('dead', 'stopped') and port = ? "
+			+ "and (model_path = ? or model_path is null) "
+			+ "order by started_at desc limit 1",
+			[port, model ?? ""]);
+		if (candidates.length == 0) {
+			print("[orphan] pid " + pid + " port=" + port
+				+ " model=" + (model ?? "?")
+				+ " — running but no matching history row. "
+				+ "Kill manually or spawn a fresh service for the same profile.");
+			continue;
+		}
+		let cand = candidates[0];
+		// Adopt: bind the new pid to the historical row, flip back
+		// to 'running'. The profile_json on the row already carries
+		// everything CP needs to recognize this service.
+		db_exec(db,
+			"update services set pid = ?, state = 'running' where id = ?",
+			[pid, cand.id]);
+		print("[adopt] pid " + pid + " port=" + port + " profile="
+			+ cand.profile + " v" + cand.profile_version
+			+ " — re-attached to historical row " + cand.id.substr(0, 8) + "…");
 	}
 	return null;
 }
@@ -414,10 +481,15 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// so the dashboard can flag a "stale" badge if the operator edits
 	// the profile after the service is already running.
 	let pv = prof?.__version;
+	// profile_json holds the full inlined profile so adoption can
+	// rebuild the row exactly when an orphan is discovered after
+	// agent restart with sqlite intact OR after sqlite wipe (when
+	// adoption falls back to log-only because no row exists at all).
+	let pjson = stringify(prof);
 	db_exec(db,
-		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version) "
-		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv]);
+		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version, profile_json, state) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv, pjson]);
 
 	return {
 		id: id,
@@ -432,9 +504,13 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 }
 
 export fn list_services(db): array {
+	// Filter to running rows so the dashboard doesn't show every
+	// historical spawn. Adoption-history rows (state in 'dead' /
+	// 'stopped') are kept around for the discovery path but not
+	// surfaced to operators.
 	let rows = query(db,
 		"select id, profile, model_path, pid, port, log_path, started_at, profile_version "
-		+ "from services order by started_at desc", []);
+		+ "from services where state = 'running' order by started_at desc", []);
 	let out = [];
 	for (row in rows) {
 		out.push({
@@ -453,7 +529,8 @@ export fn list_services(db): array {
 }
 
 export fn stop_service(db, id: string): bool {
-	let rows = query(db, "select pid from services where id = ?", [id]);
+	let rows = query(db,
+		"select pid from services where id = ? and state = 'running'", [id]);
 	if (rows.length == 0) {
 		return false;
 	}
@@ -461,7 +538,10 @@ export fn stop_service(db, id: string): bool {
 	if (process_alive(pid)) {
 		try { kill(pid, SIGTERM); } catch (e) { /* race with exit; fine */ }
 	}
-	db_exec(db, "delete from services where id = ?", [id]);
+	// Soft-delete: keep the row so adoption can match by port if the
+	// operator later restarts the service with the same profile and
+	// the previous llama-server hadn't yet exited.
+	db_exec(db, "update services set state = 'stopped' where id = ?", [id]);
 	return true;
 }
 
