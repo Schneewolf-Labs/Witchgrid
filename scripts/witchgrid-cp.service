@@ -1,0 +1,35 @@
+[Unit]
+Description=Witchgrid control plane
+Documentation=https://github.com/Schneewolf-Labs/Witchgrid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nbeerbower
+Group=nbeerbower
+# The launcher sources ~/.witchgrid/cp.env, cd's to the binary's dir
+# (so the relative DB_PATH "witchgrid.db" lands next to the binary
+# and ./backups/ lands in the right place), then exec's the binary.
+ExecStart=/home/nbeerbower/witchgrid-cp.sh
+WorkingDirectory=/home/nbeerbower/witchgrid
+
+# Restart policy: any non-zero exit or crash → bring it back. 5s
+# grace period gives sqlite time to release the WAL lock cleanly.
+Restart=on-failure
+RestartSec=5
+
+# StandardOutput goes to the journal — view with `journalctl -u witchgrid-cp -f`.
+# The launcher script's redirect to ~/witchgrid/cp.log is gone under
+# systemd; everything flows through the journal.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=witchgrid-cp
+
+# Resource limits — generous defaults; CP itself is lightweight,
+# but it spawns sqlite + libwebsockets contexts and we don't want
+# accidental EMFILE under load.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
