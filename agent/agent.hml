@@ -52,7 +52,7 @@ import { homedir } from "@stdlib/os";
 import { exists, make_dirs } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
-import { init_services_schema, make_handlers, reap_zombie_services } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
@@ -399,6 +399,17 @@ fn main(): null {
 	if (reaped > 0) {
 		print("[agent] reaped " + reaped + " zombie service rows from prior run");
 	}
+	// Surface any same-uid llama-servers we don't have rows for —
+	// catches the "agent's sqlite was wiped but children survived"
+	// case + cross-checks against PID recycling. No auto-adoption
+	// (we lack the original profile metadata to fabricate a row);
+	// operator decides whether to claim or kill.
+	try {
+		let uid_r = exec_argv(["id", "-u"]);
+		if (uid_r.exit_code == 0) {
+			discover_orphan_llama_servers(db, i32(uid_r.output.trim()));
+		}
+	} catch (e) { }
 	print("[agent] sqlite ready: " + DB_PATH);
 
 	// Introspect the local llama-server binary once at boot so CP can

@@ -73,22 +73,140 @@ export fn init_services_schema(db): null {
 }
 
 // Garbage-collect rows for services whose pid no longer points at a
-// live process. Catches the case where the agent restarted but a
-// previously-spawned llama-server is gone (crashed, or operator killed
-// it externally). Without this, GET /services would keep reporting
-// alive=false for every dead row, and pick_port would still treat
-// those ports as "in use" and bump past them — leaking port numbers
-// over time. Returns the number of rows deleted (for logging).
+// live llama-server process. Catches three cases:
+//
+//   1. Process exited (crash, OOM, operator kill) — process_alive
+//      returns false, row is stale, drop.
+//   2. PID recycled to a different process — process_alive returns
+//      true (something is at that pid) but cmdline doesn't start with
+//      llama-server, so it's not ours. Drop. Defensive against the
+//      edge case where a long-lived agent's children outlive the OS
+//      pid wraparound and a sudoer claims the slot.
+//   3. PID alive AND is one of our llama-servers — keep the row.
+//      This is the agent-crash-and-restart "bring orphans back under
+//      our wing" path; the children survived (init reparented via
+//      setsid), the row survived in sqlite, reconciliation is
+//      automatic.
+//
+// Without reap, GET /services would keep reporting alive=false for
+// every dead row, and pick_port would still treat those ports as
+// "in use" and bump past them — leaking port numbers over time.
+// Returns the number of rows deleted (for logging).
 export fn reap_zombie_services(db): i32 {
 	let rows = query(db, "select id, pid from services", []);
 	let reaped = 0;
 	for (row in rows) {
+		let drop = false;
 		if (!process_alive(row.pid)) {
+			drop = true;
+		} else if (!is_our_llama_server(row.pid)) {
+			drop = true;
+		}
+		if (drop) {
 			db_exec(db, "delete from services where id = ?", [row.id]);
 			reaped = reaped + 1;
 		}
 	}
 	return reaped;
+}
+
+// True iff /proc/<pid>/cmdline names a llama-server binary. Used by
+// reap_zombie_services to detect PID recycling (alive process at the
+// stored pid that ISN'T one of our llama-servers).
+fn is_our_llama_server(pid: i32): bool {
+	try {
+		let f = open("/proc/" + pid + "/cmdline", "r");
+		let content = f.read();
+		f.close();
+		if (content == null || content.length == 0) { return false; }
+		// argv[0] is the first nul-terminated string. Look for either
+		// "llama-server" anywhere in the leading segment (covers both
+		// `/usr/local/bin/llama-server` absolute paths and bare names).
+		let nul = content.find("\0");
+		let head = nul > 0 ? content.substr(0, nul) : content;
+		return head.find("llama-server") >= 0;
+	} catch (e) {
+		return false;
+	}
+}
+
+// Walk own-uid llama-server processes and emit a log line for any
+// not currently represented in the services table. Doesn't auto-
+// adopt — without the original profile/intent metadata we can't
+// fabricate a matching services row that would survive a witchgrid
+// upgrade. But surfacing them at boot lets the operator see "hey,
+// these are here, decide whether to claim or kill."
+//
+// Uses `pgrep -af llama-server` rather than nvidia-smi: CPU-only
+// services (gpu_layers=0) don't appear in nvidia-smi compute apps,
+// and we want to catch those too.
+export fn discover_orphan_llama_servers(db, our_uid: i32): null {
+	let r = null;
+	try {
+		r = exec_argv(["pgrep", "-u", "" + our_uid, "-f", "llama-server"]);
+	} catch (e) { return null; }
+	// pgrep exits 1 when no matches — fine, nothing to reconcile.
+	if (r.output.length == 0) { return null; }
+
+	let known = {};
+	let owned = query(db, "select pid from services", []);
+	for (o in owned) { known["" + o.pid] = true; }
+
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let pid_str = line.trim();
+		if (pid_str.length == 0) { continue; }
+		let pid = i32(pid_str);
+		// pgrep -f matches the whole cmdline, so e.g. "vim
+		// agent/services.hml" containing the literal "llama-server"
+		// would slip through — verify cmdline argv[0].
+		if (!is_our_llama_server(pid)) { continue; }
+		if (known.has("" + pid)) { continue; }
+		// pgrep -u already filtered by uid, but keep as belt-and-
+		// suspenders against pgrep flags varying by distro.
+		if (!is_our_uid(pid, our_uid)) { continue; }
+		let port = read_arg_after(pid, "--port");
+		let model = read_arg_after(pid, "-m");
+		print("[orphan] pid " + pid + " port=" + (port ?? "?")
+			+ " model=" + (model ?? "?")
+			+ " — running but unmanaged. Either kill it manually or "
+			+ "let CP auto-spawn into a different port for the same profile.");
+	}
+	return null;
+}
+
+fn is_our_uid(pid: i32, our_uid: i32): bool {
+	try {
+		let s = exec_argv(["stat", "-c", "%u", "/proc/" + pid]);
+		if (s.exit_code != 0) { return false; }
+		return i32(s.output.trim()) == our_uid;
+	} catch (e) { return false; }
+}
+
+// Read /proc/<pid>/cmdline, find the named arg, return its value
+// (the next argv element). Null when not found or unreadable.
+//
+// Hemlock 2.4.0 file.read() truncates at the first 0x00 byte (same
+// bug pattern as the pre-2.3.1 stream.read), so we can't slurp the
+// nul-separated cmdline directly. Shell out to `tr` to convert nuls
+// to newlines, then split. Fix once Hemlock gets file.read_binary().
+fn read_arg_after(pid: i32, name: string) {
+	try {
+		let r = exec_argv(["tr", "\\0", "\n"]);
+	} catch (e) { /* exec_argv doesn't have stdin, see below */ }
+	// exec_argv has no stdin pipe option, so use sh -c "tr '\0' '\n' < /proc/PID/cmdline"
+	try {
+		let r = exec_argv(["sh", "-c",
+			"tr '\\0' '\\n' < /proc/" + pid + "/cmdline"]);
+		if (r.exit_code != 0) { return null; }
+		let argv = r.output.split("\n");
+		let i = 0;
+		while (i < argv.length - 1) {
+			if (argv[i] == name) { return argv[i + 1]; }
+			i = i + 1;
+		}
+	} catch (e) { }
+	return null;
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
