@@ -1167,6 +1167,15 @@ fn pick_placement(model_path: string, profile) {
 	let est = estimate_vram_mb(g, i32(profile.context), profile.kv_type);
 	let needed_mb = est.total_mb;
 
+	// CPU-only intent: gpu_layers=0 means llama-server runs entirely on
+	// CPU (no offload). Skip the GPU-fit search and take the first
+	// active node — same rule pick_placement_via_alias applies. Without
+	// this, an explicit-model spawn of a CPU profile (e.g. designer-cpu)
+	// is wrongly rejected with "no GPU has enough free VRAM" even though
+	// it needs zero VRAM. Returned with empty gpu_indices so the agent
+	// doesn't set CUDA_VISIBLE_DEVICES / --tensor-split.
+	let cpu_only = (profile?.intent?.gpu_layers == 0);
+
 	let rows = query(DB,
 		"select node_id, agent_url, hardware_json from nodes "
 		+ "where agent_url is not null "
@@ -1176,6 +1185,15 @@ fn pick_placement(model_path: string, profile) {
 		["-" + STALE_NODE_SECONDS + " seconds"]);
 
 	for (row in rows) {
+		if (cpu_only) {
+			return {
+				node_id:      row.node_id,
+				agent_url:    row.agent_url,
+				gpu_indices:  [],
+				tensor_split: null,
+				est_mb:       needed_mb,
+			};
+		}
 		let hw = parse(row.hardware_json);
 		let gpus = hw?.gpus ?? [];
 		let subset = pick_gpu_subset(gpus, needed_mb);
@@ -1470,6 +1488,56 @@ fn find_service_for_profile(profile_name: string) {
 		}
 	}
 	return null;
+}
+
+// GET /resolve/{profile-or-alias} — control-plane location lookup.
+//
+// The data-plane counterpart of the /v1/llama proxy: instead of
+// forwarding the inference request, just return WHERE the live
+// llama-server is, so a consumer (FlameWorker/FlameGen) can connect
+// directly and keep the CP out of the inference hot path entirely.
+// Side-effect-free and cheap: alias-resolve + one /services scan, no
+// proxying, no auto-spawn (spawn stays an explicit POST /services).
+//
+// 200 { profile, alias, host, port, base_url } when a matching
+// service is running; 404 { error, profile } when it isn't (the
+// consumer then decides: spawn via POST /services, or back off and
+// re-resolve). Public — it's a location, not a secret, and workers
+// must reach it before any bearer is provisioned.
+fn handle_resolve(req): object {
+	let prefix = "/resolve/";
+	if (req.path.length <= prefix.length) {
+		return { status: 400,
+			body: "{\"error\":\"profile required: /resolve/{profile-or-alias}\"}" };
+	}
+	let raw = req.path.substr(prefix.length, req.path.length - prefix.length);
+	// Tolerate a trailing slash and ignore any extra path segments.
+	let slash = raw.find("/");
+	let alias = raw;
+	if (slash >= 0) { alias = raw.substr(0, slash); }
+	if (alias.length == 0) {
+		return { status: 400,
+			body: "{\"error\":\"profile required: /resolve/{profile-or-alias}\"}" };
+	}
+
+	let profile_name = resolve_profile_name(alias);
+	let target = find_service_for_profile(profile_name);
+	if (target == null) {
+		return { status: 404, body: stringify({
+			error: "no running service for profile",
+			profile: profile_name,
+			alias: alias,
+		}) };
+	}
+
+	let base = "http://" + target.agent_host + ":" + target.port;
+	return { status: 200, body: stringify({
+		profile:  profile_name,
+		alias:    alias,
+		host:     target.agent_host,
+		port:     target.port,
+		base_url: base,
+	}) };
 }
 
 // Wait for a freshly-spawned llama-server to flip from "Loading model" to
@@ -2989,6 +3057,11 @@ fn main(): null {
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
 		{ method: "GET",  path: "/services/log/", prefix: true, handler: handle_service_log, public: true },
+		// Control-plane location lookup — consumers resolve a profile/
+		// alias to a live llama-server host:port and connect directly
+		// (CP stays off the inference data path). public: a location,
+		// not a secret, and workers hit it before any bearer exists.
+		{ method: "GET",  path: "/resolve/",      prefix: true, handler: handle_resolve, public: true },
 		// Dashboard shell + static assets (all baked into the binary)
 		{ method: "GET",  path: "/",                       handler: handle_page_overview,    public: true },
 		{ method: "GET",  path: "/catalog",                handler: handle_page_catalog,     public: true },
