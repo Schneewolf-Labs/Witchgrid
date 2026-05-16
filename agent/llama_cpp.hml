@@ -258,6 +258,168 @@ async fn install_task(db, transfer_id: string, tag: string, flavor: string,
 // resolved binary path on success, throws otherwise. Caller is
 // responsible for re-running capability introspection + version
 // probe after activate (so CP sees the new build version).
+// ── source-build install ──────────────────────────────────────────
+// Parallel to sd_cpp.hml's source mode. The prebuilt matrix only
+// ships Vulkan/CPU for Linux (no native CUDA — the asset_url comment
+// notes CUDA users were expected to hand-build + PATH it). flavor ==
+// "source" makes that agent-managed: git clone + cmake build against
+// the node's toolchain. CUDA when nvcc is present (native perf,
+// what the prebuilt matrix can't give), else Vulkan, else CPU.
+// llama.cpp vendors ggml in-tree (no git submodules), unlike sd.cpp.
+
+let LLAMA_REPO = "https://github.com/ggerganov/llama.cpp";
+
+// Absolute nvcc path or null — passed to cmake via
+// -DCMAKE_CUDA_COMPILER so it needn't be on the agent's PATH (CUDA
+// lives under /usr/local/cuda*/bin which witchgrid-agent.sh omits).
+fn detect_nvcc(): string {
+	if (exists("/usr/local/cuda/bin/nvcc")) { return "/usr/local/cuda/bin/nvcc"; }
+	let r = null;
+	try { r = exec_argv(["which", "nvcc"]); } catch (e) { return null; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return null;
+}
+
+// GPU0 compute capability as a CMAKE_CUDA_ARCHITECTURES token
+// ("8.9" -> "89"); falls back to "86;89" (Ampere+Ada fleet).
+fn detect_cuda_arch(): string {
+	let r = null;
+	try {
+		r = exec_argv(["nvidia-smi", "--query-gpu=compute_cap",
+			"--format=csv,noheader"]);
+	} catch (e) { return "86;89"; }
+	if (r.exit_code != 0) { return "86;89"; }
+	let lines = r.output.split("\n");
+	for (ln in lines) {
+		let s = ln.trim();
+		if (s.length == 0) { continue; }
+		let out = "";
+		let i = 0;
+		while (i < s.length) {
+			let ch = s.substr(i, 1);
+			if (ch != ".") { out = out + ch; }
+			i = i + 1;
+		}
+		if (out.length > 0) { return out; }
+	}
+	return "86;89";
+}
+
+fn nproc_str(): string {
+	let r = null;
+	try { r = exec_argv(["nproc"]); } catch (e) { return "8"; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return "8";
+}
+
+// Build llama.cpp from source into target_dir. Multi-minute cmake
+// build runs in the same detached task install_task uses; status
+// sits at 'building' until it returns (do_list surfaces it).
+async fn source_install_task(db, transfer_id: string, tag: string,
+                            target_dir: string): null {
+	db_exec(db, "update llama_cpp_installs set status='cloning' where id=?",
+		[transfer_id]);
+	let cr = null;
+	try {
+		cr = exec_argv(["git", "clone", LLAMA_REPO, target_dir]);
+	} catch (e) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["git clone exec failed (install git?): " + e, transfer_id]);
+		return null;
+	}
+	if (cr.exit_code != 0) {
+		let t = (cr?.stderr ?? cr?.output ?? "");
+		if (t.length > 400) { t = t.substr(t.length - 400, 400); }
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["git clone exit " + cr.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+	// Pin the checkout to the tag for reproducibility unless it's a
+	// "build HEAD" sentinel. A miss is a hard error. llama.cpp has no
+	// submodules (ggml is vendored), so no submodule step.
+	let tl = tag.lower();
+	if (tl != "head" && tl != "main" && tl != "master" && tl != "latest") {
+		let ok = true;
+		let co = null;
+		try { co = exec_argv(["git", "-C", target_dir, "checkout", "-q", tag]); }
+		catch (e) { ok = false; }
+		if (co == null || co.exit_code != 0) { ok = false; }
+		if (!ok) {
+			db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+				["git checkout '" + tag + "' failed (not a valid ref; use a "
+					+ "release tag like b9124, or 'head' for the default branch)",
+				 transfer_id]);
+			return null;
+		}
+	}
+
+	db_exec(db, "update llama_cpp_installs set status='building' where id=?",
+		[transfer_id]);
+	let build_dir = target_dir + "/build";
+	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
+		"-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_BUILD_SERVER=ON"];
+	let nvcc = detect_nvcc();
+	let backend = "cpu";
+	if (nvcc != null) {
+		backend = "cuda";
+		cfg.push("-DGGML_CUDA=ON");
+		cfg.push("-DCMAKE_CUDA_COMPILER=" + nvcc);
+		cfg.push("-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch());
+	} else if (exists("/usr/include/vulkan/vulkan.h")) {
+		backend = "vulkan";
+		cfg.push("-DGGML_VULKAN=ON");
+	}
+	print("[llama_cpp] " + transfer_id + " source build backend=" + backend);
+	let cf = null;
+	try { cf = exec_argv(cfg); } catch (e) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["cmake configure exec failed (install cmake?): " + e, transfer_id]);
+		return null;
+	}
+	if (cf.exit_code != 0) {
+		let t = (cf?.stderr ?? cf?.output ?? "");
+		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["cmake configure exit " + cf.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+	let bf = null;
+	try {
+		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
+			"-j", nproc_str()]);
+	} catch (e) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["cmake build exec failed: " + e, transfer_id]);
+		return null;
+	}
+	if (bf.exit_code != 0) {
+		let t = (bf?.stderr ?? bf?.output ?? "");
+		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["cmake build exit " + bf.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+
+	let bin = find_binary_in(target_dir);
+	if (bin == null) {
+		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
+			["build completed but no llama-server binary found under "
+				+ target_dir + " (expected build/bin/llama-server)", transfer_id]);
+		return null;
+	}
+	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
+	let stat = null;
+	try { stat = file_stat(bin); } catch (e) { }
+	let now = iso_now(db);
+	db_exec(db,
+		"update llama_cpp_installs "
+		+ "set status='complete', bytes_total=?, completed_at=? where id=?",
+		[(stat == null ? 0 : stat.size), now, transfer_id]);
+	print("[llama_cpp] " + transfer_id + " source build complete: " + tag
+		+ "/" + backend);
+	return null;
+}
+
 export fn activate(tag: string): string {
 	let root = install_root();
 	let target = root + "/" + tag;
@@ -293,14 +455,39 @@ export fn make_handlers(db, rescan_caps_after): object {
 			return { status: 400, body: "{\"error\":\"tag required (e.g. b9124)\"}" };
 		}
 		if (flavor == null) {
-			return { status: 400, body: "{\"error\":\"flavor required (use detect_flavor result or specify)\"}" };
+			return { status: 400, body: "{\"error\":\"flavor required (source, or a prebuilt: ubuntu-vulkan-x64|ubuntu-x64|macos-arm64)\"}" };
 		}
 		let root = install_root();
 		try { make_dirs(root); } catch (e) { }
 		let target_dir = root + "/" + tag;
-		let url = asset_url(tag, flavor);
 		let id = new_id(db);
 		let now = iso_now(db);
+
+		// flavor == "source": git clone + cmake build on this node.
+		// The prebuilt matrix has no native-CUDA Linux binary; source
+		// build is how a CUDA box gets native llama-server under
+		// witchgrid management instead of a hand-built PATH binary.
+		if (flavor == "source") {
+			if (exists(target_dir)) {
+				return { status: 409, body: stringify({
+					error: "target dir already exists: " + target_dir
+						+ " (remove it or pick a different tag)",
+				})};
+			}
+			db_exec(db,
+				"insert into llama_cpp_installs "
+				+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
+				+ "values (?, ?, ?, ?, ?, 'queued', ?)",
+				[id, tag, "source", LLAMA_REPO, target_dir, now]);
+			let st = spawn(source_install_task, db, id, tag, target_dir);
+			detach(st);
+			return { status: 202, body: stringify({
+				install_id: id, tag: tag, flavor: "source",
+				target_dir: target_dir, mode: "source-build",
+			})};
+		}
+
+		let url = asset_url(tag, flavor);
 		db_exec(db,
 			"insert into llama_cpp_installs "
 			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
