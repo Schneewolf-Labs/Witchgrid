@@ -23,7 +23,7 @@
 import { posix_spawn, kill } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
-import { open, open_fd, file_stat } from "@stdlib/fs";
+import { open, open_fd, file_stat, list_dir } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
@@ -430,6 +430,44 @@ fn read_log_tail(path: string, max_bytes: i32): string {
 // noise on top.
 let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
+// Multimodal autoload: a llama.cpp vision model is a normal chat GGUF
+// plus a separate projector (mmproj) GGUF. The catalog can't track the
+// mmproj (no arch metadata — same reason SD ggufs are skipped), so we
+// pair it here from the model's own directory: any sibling whose name
+// contains "mmproj" and ends .gguf. Prefer f16 (projector is small;
+// quantizing it costs vision quality for ~no VRAM — same principle as
+// keeping the KV cache f16), then q8, then whatever's there. Returns
+// the absolute mmproj path or null. An explicit --mmproj in the
+// profile's extra_flags overrides this (checked at the call site).
+fn find_mmproj_sibling(model_path: string) {
+	let li = -1;
+	let i = 0;
+	while (i < model_path.length) {
+		if (model_path.substr(i, 1) == "/") { li = i; }
+		i = i + 1;
+	}
+	if (li < 0) { return null; }
+	let dir = model_path.substr(0, li);
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) { return null; }
+	let f16 = null;
+	let q8 = null;
+	let any = null;
+	for (name in entries) {
+		let ln = name.lower();
+		if (ln.find("mmproj") < 0) { continue; }
+		if (name.length < 5) { continue; }
+		if (name.substr(name.length - 5, 5) != ".gguf") { continue; }
+		let full = dir + "/" + name;
+		if (any == null) { any = full; }
+		if (f16 == null && ln.find("f16") >= 0) { f16 = full; }
+		if (q8 == null && ln.find("q8") >= 0) { q8 = full; }
+	}
+	if (f16 != null) { return f16; }
+	if (q8 != null) { return q8; }
+	return any;
+}
+
 // ── core: spawn ───────────────────────────────────────────────────────
 
 export fn spawn_service(db, profile_name: string, prof, model_path: string, port: i32, gpus, tensor_split, capabilities, binary_path: string): object {
@@ -472,6 +510,22 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	} else {
 		argv.push("--port"); argv.push("" + port);
 		argv.push("--host"); argv.push("0.0.0.0");
+
+		// Multimodal autoload (llama-server only). If the model has a
+		// co-located mmproj projector and the profile didn't already
+		// pin one explicitly, pass it so vision "just works" off a
+		// normal chat profile pointing at a VL model.
+		let has_explicit_mmproj = false;
+		for (f in (prof?.extra_flags ?? [])) {
+			if (f == "--mmproj") { has_explicit_mmproj = true; }
+		}
+		if (!has_explicit_mmproj) {
+			let mmproj = find_mmproj_sibling(model_path);
+			if (mmproj != null) {
+				argv.push("--mmproj"); argv.push(mmproj);
+				print("[spawn] mmproj autoloaded: " + mmproj);
+			}
+		}
 	}
 
 	// Multi-GPU tensor-parallel split. We only emit --tensor-split when
