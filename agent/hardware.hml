@@ -20,6 +20,7 @@
 import { exec_argv } from "@stdlib/process";
 import { cpu_count, total_memory, free_memory } from "@stdlib/os";
 import { exists } from "@stdlib/fs";
+import { parse } from "@stdlib/json";
 
 // Apple Silicon Metal cap: by default Metal can claim ~75% of system
 // RAM as VRAM via MTLDevice.recommendedMaxWorkingSetSize; we round
@@ -74,6 +75,82 @@ fn probe_gpus_nvidia(): array {
 	return gpus;
 }
 
+// AMD probe via rocm-smi. ROCm-compatible cards (Navi 21 / RDNA2+ on
+// the desktop side, plus AMD APUs / iGPUs that expose VRAM through
+// HIP) get surfaced here. llama.cpp speaks HIP via the rocm-x64 build
+// flavor, so a placement target like "RX 6800" actually works.
+//
+// One JSON call gets us name + vram + power for every card. The power
+// key naming differs between dGPU ("Average Graphics Package Power")
+// and APU ("Current Socket Graphics Package Power") so we match either.
+//
+// `start_index` lets the caller continue numbering after NVIDIA so the
+// fleet has a single GPU index space — placement code doesn't need to
+// know about per-vendor namespaces.
+fn probe_gpus_amd(start_index: i32): array {
+	let r = null;
+	try {
+		r = exec_argv(["rocm-smi",
+			"--showmeminfo", "vram",
+			"--showproductname",
+			"--showpower",
+			"--json"]);
+	} catch (e) { return []; }
+	if (r.exit_code != 0 || r.output.length == 0) { return []; }
+
+	let parsed = null;
+	try { parsed = parse(r.output); } catch (e) { return []; }
+	if (parsed == null) { return []; }
+
+	let gpus = [];
+	let next_index = start_index;
+	let card_keys = parsed.keys();
+	for (key in card_keys) {
+		let card = parsed[key];
+		// VRAM fields are decimal-string bytes — convert to MB i32.
+		let total_b: i64 = 0;
+		let used_b:  i64 = 0;
+		let tstr = card?["VRAM Total Memory (B)"];
+		let ustr = card?["VRAM Total Used Memory (B)"];
+		if (tstr != null) { total_b = i64(tstr); }
+		if (ustr != null) { used_b  = i64(ustr); }
+		let total_mb: i32 = i32(total_b / 1048576);
+		let free_mb:  i32 = i32((total_b - used_b) / 1048576);
+		if (free_mb < 0) { free_mb = 0; }
+
+		// Power: try both possible keys (dGPU vs APU naming). rocm-smi
+		// gives a string with no power.limit equivalent without an
+		// extra call — leave limit null for now.
+		let power_draw = null;
+		let pd_avg = card?["Average Graphics Package Power (W)"];
+		let pd_cur = card?["Current Socket Graphics Package Power (W)"];
+		if (pd_avg != null) { power_draw = f64(pd_avg); }
+		else if (pd_cur != null) { power_draw = f64(pd_cur); }
+
+		// Name: "Card series" carries the human-readable label
+		// ("Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"). For APUs
+		// it's a hex device ID, which is uglier — fall back to
+		// "AMD <SKU>" for those (e.g. "AMD RAPHAEL").
+		let name = card?["Card series"] ?? "?";
+		if (name.starts_with("0x")) {
+			let sku = card?["Card SKU"];
+			if (sku != null) { name = "AMD " + sku; }
+		}
+
+		gpus.push({
+			index:         next_index,
+			name:          name,
+			total_mb:      total_mb,
+			free_mb:       free_mb,
+			uuid:          key,                // card0/card1 — stable rocm-smi handle
+			power_draw_w:  power_draw,
+			power_limit_w: null,
+		});
+		next_index = next_index + 1;
+	}
+	return gpus;
+}
+
 // Mac fallback. Apple Silicon GPUs have unified memory — there's no
 // separate VRAM pool, Metal allocates from the same physical RAM as
 // the rest of the system. We surface the M-series as a single GPU
@@ -123,8 +200,18 @@ fn probe_gpus_metal(ram_total_mb: i32, ram_free_mb: i32): array {
 }
 
 fn probe_gpus(ram_total_mb: i32, ram_free_mb: i32): array {
+	// Linux: NVIDIA via nvidia-smi + AMD via rocm-smi, in one fleet-wide
+	// index space (AMD continues numbering after NVIDIA so placement
+	// doesn't need per-vendor namespaces). Either or both vendors may
+	// be empty; only Apple Silicon takes the Metal fallback.
 	let nv = probe_gpus_nvidia();
-	if (nv.length > 0) { return nv; }
+	let amd = probe_gpus_amd(nv.length);
+	if (nv.length > 0 || amd.length > 0) {
+		let merged = [];
+		for (g in nv)  { merged.push(g); }
+		for (g in amd) { merged.push(g); }
+		return merged;
+	}
 	return probe_gpus_metal(ram_total_mb, ram_free_mb);
 }
 
