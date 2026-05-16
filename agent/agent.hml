@@ -52,12 +52,13 @@ import { homedir } from "@stdlib/os";
 import { exists, make_dirs } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
 import { init_llama_cpp_schema, make_handlers as make_llama_cpp_handlers, current_binary_path, detect_flavor } from "./llama_cpp";
+import { init_sd_cpp_schema, make_handlers as make_sd_cpp_handlers, current_binary_path as sd_current_binary_path, detect_flavor as sd_detect_flavor } from "./sd_cpp";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -329,7 +330,20 @@ fn main(): null {
 	// when there's a Witchgrid-managed install, falls back to bare
 	// "llama-server" (PATH lookup) otherwise.
 	let runtime_ref = { value: {} };
-	let caps_ref    = { llama_server: {} };
+	let caps_ref    = { llama_server: {}, sd_server: {} };
+	// sd-server capabilities are introspected for the /capabilities
+	// endpoint + dashboard, but image profiles spawn with an empty
+	// intent map + extra_flags, so spawn correctness does not depend on
+	// this map being populated (services.hml skips the caps-empty guard
+	// for sd-server). Tolerate parse failure → {}.
+	let do_rescan_caps_sd = fn(): null {
+		let sbin = sd_current_binary_path();
+		try { caps_ref.sd_server = introspect(sbin); } catch (e) {
+			eprint("[agent] introspect " + sbin + " failed: " + e);
+			caps_ref.sd_server = {};
+		}
+		return null;
+	};
 	let do_rescan_caps = fn(): null {
 		let bin = current_binary_path();
 		try { caps_ref.llama_server = introspect(bin); } catch (e) {
@@ -351,6 +365,12 @@ fn main(): null {
 		print("[agent] llama-server not installed; capabilities empty (spawn will reject until installed)");
 	} else {
 		print("[agent] llama-server: " + caps_ref.llama_server.keys().length + " flags");
+	}
+	do_rescan_caps_sd();
+	if (caps_ref.sd_server.keys().length == 0) {
+		print("[agent] sd-server not installed (image profiles need /sd_cpp/install)");
+	} else {
+		print("[agent] sd-server: " + caps_ref.sd_server.keys().length + " flags");
 	}
 
 	// Scan the catalog before first /register so CP gets the model list
@@ -375,6 +395,7 @@ fn main(): null {
 	init_services_schema(db);
 	init_transfers_schema(db);
 	init_llama_cpp_schema(db);
+	init_sd_cpp_schema(db);
 
 	register_with_cp(cp_url, {
 		node_id:   node_id,
@@ -407,7 +428,9 @@ fn main(): null {
 	try {
 		let uid_r = exec_argv(["id", "-u"]);
 		if (uid_r.exit_code == 0) {
-			discover_orphan_llama_servers(db, i32(uid_r.output.trim()));
+			let our_uid = i32(uid_r.output.trim());
+			discover_orphan_llama_servers(db, our_uid);
+			discover_orphan_sd_servers(db, our_uid);
 		}
 	} catch (e) { }
 	print("[agent] sqlite ready: " + DB_PATH);
@@ -431,6 +454,7 @@ fn main(): null {
 	// without restarting the agent.
 	fn capabilities_for(binary_name) {
 		if (binary_name == "llama-server") { return caps_ref.llama_server; }
+		if (binary_name == "sd-server")    { return caps_ref.sd_server; }
 		return {};
 	}
 
@@ -449,12 +473,17 @@ fn main(): null {
 	// so a fresh build is reflected in /capabilities + the next
 	// heartbeat's runtime field without restarting the agent.
 	let lcpp = make_llama_cpp_handlers(db, do_rescan_caps);
+	// stable-diffusion.cpp install layer — same lifecycle as llama_cpp;
+	// activate triggers do_rescan_caps_sd so a fresh sd-server build is
+	// reflected without an agent restart.
+	let scpp = make_sd_cpp_handlers(db, do_rescan_caps_sd);
 
 	// Resolve a binary name to its on-disk path. Since v0.7 C2 the
 	// llama_cpp module owns the install layer; current_binary_path()
 	// reads through ~/.witchgrid/llama-server/current/ when set.
 	fn binary_path_for(binary_name) {
 		if (binary_name == "llama-server") { return current_binary_path(); }
+		if (binary_name == "sd-server")    { return sd_current_binary_path(); }
 		return binary_name;
 	}
 
@@ -472,6 +501,7 @@ fn main(): null {
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
 			return { status: 200, body: stringify({
 				"llama-server": caps_ref.llama_server,
+				"sd-server":    caps_ref.sd_server,
 			})};
 		} },
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
@@ -531,6 +561,15 @@ fn main(): null {
 		{ method: "GET",  path: "/llama_cpp/flavor",   handler: fn(req): object {
 			return { status: 200, body: stringify({
 				flavor: detect_flavor(probe(canonical_dir, extra_dirs).role),
+			})};
+		} },
+		// stable-diffusion.cpp lifecycle — mirrors /llama_cpp/*.
+		{ method: "POST", path: "/sd_cpp/install",   handler: scpp.install },
+		{ method: "GET",  path: "/sd_cpp/installed", handler: scpp.list },
+		{ method: "POST", path: "/sd_cpp/activate",  handler: scpp.activate },
+		{ method: "GET",  path: "/sd_cpp/flavor",    handler: fn(req): object {
+			return { status: 200, body: stringify({
+				flavor: sd_detect_flavor(probe(canonical_dir, extra_dirs).role),
 			})};
 		} },
 		{ method: "POST", path: "/port_check",    handler: fn(req): object {

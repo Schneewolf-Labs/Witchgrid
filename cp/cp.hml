@@ -681,6 +681,28 @@ fn seed_default_profiles(db): null {
 				default_model: null,
 			},
 		},
+		{
+			// FlameGen image profile — stable-diffusion.cpp serving the
+			// NikuMixXL4 SDXL anime checkpoint (converted to q8_0 GGUF).
+			// sd-server has no context/kv/gpu-layers concepts so intent
+			// is empty; --diffusion-fa enables flash attention. FlameGen
+			// talks the A1111-compatible /sdapi/v1/txt2img on the
+			// resolved base_url (resolve-then-connect, like designer).
+			// context/kv_type are harmless scalars for CP code paths
+			// that read profile.context / profile.kv_type.
+			name: "image-niku",
+			profile: {
+				binary: "sd-server",
+				intent: {},
+				extra_flags: ["--diffusion-fa"],
+				default_port: 19080,
+				context: 0,
+				kv_type: "f16",
+				model_alias: "nikumixxl4.q8_0",
+				hf_source: null,
+				default_model: null,
+			},
+		},
 	];
 	for (d in defaults) {
 		exec(db,
@@ -1546,8 +1568,18 @@ fn handle_resolve(req): object {
 // need more — make configurable when that bites.
 let AUTOSPAWN_READY_TIMEOUT_SECONDS = 60;
 
-fn wait_for_service_ready(host: string, port: i32): bool {
-	let url = "http://" + host + ":" + port + "/health";
+// Readiness probe path differs per engine: llama-server exposes
+// /health; stable-diffusion.cpp's server has no /health — its
+// lightest always-available GET once the model is loaded is
+// /sdapi/v1/options (returns the loaded checkpoint stem). Caller
+// passes the right path based on the profile's binary.
+fn health_path_for(binary): string {
+	if (binary == "sd-server") { return "/sdapi/v1/options"; }
+	return "/health";
+}
+
+fn wait_for_service_ready(host: string, port: i32, health_path: string): bool {
+	let url = "http://" + host + ":" + port + health_path;
 	let waited = 0;
 	while (waited < AUTOSPAWN_READY_TIMEOUT_SECONDS) {
 		try {
@@ -1665,7 +1697,7 @@ fn auto_spawn(profile_name: string) {
 	}
 
 	let host = extract_host(pick.agent_url);
-	if (!wait_for_service_ready(host, port)) {
+	if (!wait_for_service_ready(host, port, health_path_for(profile?.binary))) {
 		return { error: { status: 503, body: stringify({
 			error: "auto-spawned service did not become ready in "
 				+ AUTOSPAWN_READY_TIMEOUT_SECONDS + "s",
@@ -2509,7 +2541,7 @@ async fn bench_task(bench_id: string, target_node: string,
 	let svc_id = svc.id;
 	let host = extract_host(agent_url);
 
-	if (!wait_for_service_ready(host, port)) {
+	if (!wait_for_service_ready(host, port, "/health")) {
 		try { cp_post_json(agent_url + "/services/stop", { id: svc_id }); } catch (e) { }
 		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
 			["service didn't become ready in " + AUTOSPAWN_READY_TIMEOUT_SECONDS + "s", bench_id]);

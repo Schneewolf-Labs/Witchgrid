@@ -1,0 +1,374 @@
+// sd_cpp.hml — manage stable-diffusion.cpp installs on this node.
+//
+// Sibling of llama_cpp.hml. Same shape, same lifecycle, same `current`
+// symlink hot-swap trick — just a different upstream and binary.
+// Fetches prebuilt release archives from
+// github.com/leejet/stable-diffusion.cpp/releases and extracts them
+// into ~/.witchgrid/sd-server/<tag>/. spawn_service resolves the
+// binary via current_binary_path() (this module's) when prof.binary
+// == "sd-server", so flipping the symlink hot-swaps new spawns.
+//
+// Deltas vs llama_cpp.hml (deliberate, documented):
+//   1. Archives are .zip, not .tar.gz — extract with `unzip`.
+//   2. sd.cpp's asset names embed the build runner's OS version
+//      (e.g. sd-master-0665a7f-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip)
+//      and the release tag (master-602-0665a7f) differs from the
+//      asset's short form (master-0665a7f). That naming is not
+//      reconstructable by pure string templating the way llama.cpp's
+//      `llama-b9124-bin-<flavor>.tar.gz` is, so we resolve the asset's
+//      browser_download_url via the GitHub releases API (one cheap
+//      unauthenticated GET; install is a rare operator action).
+//   3. Binary is `sd-server`.
+//
+// Flavor matrix (Linux prebuilt; sd.cpp ships no Linux-CUDA binary —
+// CUDA is Windows-only upstream, so Linux GPU boxes use the Vulkan
+// build, exactly like the llama.cpp cross-vendor strategy):
+//   - macos-arm64   Apple Silicon (Metal in-binary)
+//   - vulkan        Linux NVIDIA / AMD via Vulkan; cross-vendor
+//   - rocm          Linux AMD ROCm (native; not auto-detected)
+//   - cpu           Linux CPU-only
+//
+// Layout per install:
+//   ~/.witchgrid/sd-server/
+//     master-602-0665a7f/
+//       <release contents>/sd-server      ← actual binary
+//     current -> master-602-0665a7f       ← active install
+
+import { exec_argv } from "@stdlib/process";
+import { stringify, parse } from "@stdlib/json";
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { homedir, platform, arch } from "@stdlib/os";
+import { exists, is_dir, file_stat, list_dir, make_dirs, remove_file, rename } from "@stdlib/fs";
+
+// Where installs live. Per-build subdirs + a `current` symlink.
+fn install_root(): string {
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/sd-server"; }
+	return h + "/.witchgrid/sd-server";
+}
+
+// Auto-detect the right flavor for THIS host.
+//   gpu + darwin/arm64 → macos-arm64
+//   gpu + linux        → vulkan  (works on NVIDIA + AMD)
+//   cpu + darwin/arm64 → macos-arm64
+//   cpu + linux        → cpu
+// Returns null when we can't pick — operator must specify explicitly.
+export fn detect_flavor(role: string): string {
+	let p = platform();
+	let a = arch();
+	if (p == "darwin" && a == "arm64") { return "macos-arm64"; }
+	if (p == "linux" && a == "x86_64") {
+		if (role == "gpu") { return "vulkan"; }
+		return "cpu";
+	}
+	return null;
+}
+
+// True iff the GitHub asset `name` matches the requested flavor for
+// this platform. Linux assets look like
+// sd-<short>-bin-Linux-Ubuntu-<ver>-x86_64[-<flavor>].zip ; the
+// CPU build is the one with NO -vulkan/-rocm/-cuda suffix. macOS is
+// sd-<short>-bin-Darwin-macOS-<ver>-arm64.zip.
+fn asset_matches(name: string, flavor: string): bool {
+	if (name.find(".zip") < 0) { return false; }
+	if (flavor == "macos-arm64") {
+		return name.find("Darwin") >= 0 && name.find("arm64") >= 0;
+	}
+	// Linux flavors.
+	if (name.find("Linux") < 0 || name.find("x86_64") < 0) { return false; }
+	if (flavor == "vulkan") { return name.find("vulkan") >= 0; }
+	if (flavor == "rocm")   { return name.find("rocm") >= 0; }
+	if (flavor == "cpu") {
+		return name.find("vulkan") < 0 && name.find("rocm") < 0
+			&& name.find("cuda") < 0 && name.find("cu12") < 0;
+	}
+	return false;
+}
+
+// Resolve the browser_download_url for a (tag, flavor) pair by asking
+// the GitHub releases API for that tag and matching the asset name.
+// Throws with an actionable message on any failure. curl (not
+// @stdlib/http get_binary) for the same redirect-reliability reason
+// llama_cpp.hml documents; the API endpoint itself returns JSON
+// directly (no CDN redirect), so a plain curl is fine.
+fn resolve_asset_url(tag: string, flavor: string): string {
+	let api = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/tags/" + tag;
+	let r = null;
+	try {
+		r = exec_argv(["curl", "-fsSL", "-H", "Accept: application/vnd.github+json", api]);
+	} catch (e) {
+		throw "curl exec failed resolving release (install curl?): " + e;
+	}
+	if (r.exit_code != 0) {
+		throw "GitHub API GET " + api + " failed (exit " + r.exit_code
+			+ "): tag may not exist. " + (r?.stderr ?? "");
+	}
+	let rel = null;
+	try { rel = parse(r.output); } catch (e) {
+		throw "could not parse GitHub API response for tag " + tag;
+	}
+	let assets = rel?.assets ?? [];
+	for (as in assets) {
+		let nm = as?.name ?? "";
+		if (asset_matches(nm, flavor)) {
+			let u = as?.browser_download_url;
+			if (u != null) { return u; }
+		}
+	}
+	throw "no '" + flavor + "' asset found in release " + tag
+		+ " (assets exist but none matched; check flavor or tag)";
+}
+
+// Find the sd-server binary inside an extracted install dir. The
+// release zip's internal layout isn't fixed across builds, so probe
+// the common shapes and one level of child dirs, same approach as
+// llama_cpp.find_binary_in. Returns null if nothing found.
+fn find_binary_in(dir: string) {
+	let candidates = [
+		dir + "/sd-server",
+		dir + "/bin/sd-server",
+		dir + "/build/bin/sd-server",
+	];
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) { entries = []; }
+	for (name in entries) {
+		candidates.push(dir + "/" + name + "/sd-server");
+		candidates.push(dir + "/" + name + "/bin/sd-server");
+		candidates.push(dir + "/" + name + "/build/bin/sd-server");
+	}
+	for (c in candidates) {
+		if (exists(c)) { return c; }
+	}
+	return null;
+}
+
+// Resolve the active sd-server binary. `current` symlink → its binary
+// when present, else bare "sd-server" (PATH lookup).
+export fn current_binary_path(): string {
+	let root = install_root();
+	let cur = root + "/current";
+	if (!exists(cur)) { return "sd-server"; }
+	let bin = find_binary_in(cur);
+	if (bin != null) { return bin; }
+	return "sd-server";
+}
+
+// Install-job tracking table. Mirrors llama_cpp_installs.
+export fn init_sd_cpp_schema(db): null {
+	db_exec(db, "create table if not exists sd_cpp_installs ("
+		+ "id text primary key,"
+		+ "tag text not null,"
+		+ "flavor text not null,"
+		+ "source_url text not null,"
+		+ "target_dir text not null,"
+		+ "status text not null,"
+		+ "bytes_downloaded integer default 0,"
+		+ "bytes_total integer default 0,"
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+	return null;
+}
+
+fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(8)) as id", []);
+	return r[0].id;
+}
+
+fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+// List installed builds. [{tag, path, binary, is_current, has_binary}].
+export fn list_installed(): array {
+	let root = install_root();
+	if (!exists(root)) { return []; }
+	let entries = null;
+	try { entries = list_dir(root); } catch (e) { return []; }
+	let cur_bin = current_binary_path();
+	let out = [];
+	for (name in entries) {
+		if (name == "." || name == ".." || name == "current") { continue; }
+		let path = root + "/" + name;
+		let is_d = false;
+		try { is_d = is_dir(path); } catch (e) { }
+		if (!is_d) { continue; }
+		let resolved = find_binary_in(path);
+		out.push({
+			tag:        name,
+			path:       path,
+			binary:     resolved,
+			is_current: (resolved != null && cur_bin == resolved),
+			has_binary: resolved != null,
+		});
+	}
+	return out;
+}
+
+// Background install task — curl the zip, `unzip` it, verify the
+// binary landed. Updates status as it progresses.
+async fn install_task(db, transfer_id: string, tag: string, flavor: string,
+                      url: string, target_dir: string): null {
+	let archive = target_dir + ".zip";
+
+	db_exec(db, "update sd_cpp_installs set status='downloading' where id=?",
+		[transfer_id]);
+	let r = null;
+	try {
+		r = exec_argv(["curl", "-fsSL", "-o", archive, url]);
+	} catch (e) {
+		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+			["curl exec failed (install curl?): " + e, transfer_id]);
+		return null;
+	}
+	if (r.exit_code != 0) {
+		let tail = (r?.stderr ?? r?.output ?? "");
+		if (tail.length > 256) { tail = tail.substr(tail.length - 256, 256); }
+		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+			["curl exit " + r.exit_code + ": " + tail, transfer_id]);
+		return null;
+	}
+
+	db_exec(db, "update sd_cpp_installs set status='extracting' where id=?",
+		[transfer_id]);
+	try { make_dirs(target_dir); } catch (e) { }
+	let tr = null;
+	try {
+		tr = exec_argv(["unzip", "-o", archive, "-d", target_dir]);
+	} catch (e) {
+		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+			["unzip exec failed (install unzip?): " + e, transfer_id]);
+		return null;
+	}
+	if (tr.exit_code != 0) {
+		let tail = (tr?.stderr ?? tr?.output ?? "");
+		if (tail.length > 512) { tail = tail.substr(tail.length - 512, 512); }
+		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+			["unzip exit " + tr.exit_code + ": " + tail, transfer_id]);
+		return null;
+	}
+
+	let bin = find_binary_in(target_dir);
+	if (bin == null) {
+		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+			["extracted archive but no sd-server binary found under "
+				+ target_dir + " (tried flat, bin/, build/bin, and child dirs)",
+			 transfer_id]);
+		return null;
+	}
+	// sd-server ships without the executable bit on some release zips;
+	// chmod defensively so spawn doesn't EACCES.
+	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
+	try { remove_file(archive); } catch (e) { }
+
+	let stat = null;
+	try { stat = file_stat(bin); } catch (e) { }
+	let now = iso_now(db);
+	db_exec(db,
+		"update sd_cpp_installs "
+		+ "set status='complete', bytes_total=?, completed_at=? "
+		+ "where id=?",
+		[(stat == null ? 0 : stat.size), now, transfer_id]);
+	print("[sd_cpp] " + transfer_id + " complete: " + tag + "/" + flavor);
+	return null;
+}
+
+// Activate — point `current` at <tag>'s install.
+export fn activate(tag: string): string {
+	let root = install_root();
+	let target = root + "/" + tag;
+	if (!exists(target)) {
+		throw "no install for tag '" + tag + "' at " + target;
+	}
+	if (find_binary_in(target) == null) {
+		throw "install dir exists but no sd-server binary inside " + target;
+	}
+	let cur = root + "/current";
+	let r = exec_argv(["ln", "-sfn", target, cur]);
+	if (r.exit_code != 0) {
+		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
+	}
+	return current_binary_path();
+}
+
+// HTTP handlers. Shape matches llama_cpp.make_handlers so agent.hml
+// wires them identically. rescan_caps_after re-introspects after a
+// symlink flip.
+export fn make_handlers(db, rescan_caps_after): object {
+	let do_install = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		let flavor = payload?.flavor;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required (e.g. master-602-0665a7f)\"}" };
+		}
+		if (flavor == null) {
+			return { status: 400, body: "{\"error\":\"flavor required (vulkan|rocm|cpu|macos-arm64)\"}" };
+		}
+		// Resolve the asset URL up front so a bad tag/flavor fails the
+		// request synchronously with a clear 400 (mirrors how
+		// llama_cpp's pure asset_url() can't be wrong post-validation).
+		let url = null;
+		try { url = resolve_asset_url(tag, flavor); } catch (e) {
+			return { status: 400, body: stringify({ error: "" + e }) };
+		}
+		let root = install_root();
+		try { make_dirs(root); } catch (e) { }
+		let target_dir = root + "/" + tag;
+		let id = new_id(db);
+		let now = iso_now(db);
+		db_exec(db,
+			"insert into sd_cpp_installs "
+			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
+			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
+			[id, tag, flavor, url, target_dir, now]);
+		let t = spawn(install_task, db, id, tag, flavor, url, target_dir);
+		detach(t);
+		return { status: 202, body: stringify({
+			install_id: id, tag: tag, flavor: flavor, target_dir: target_dir,
+		})};
+	};
+
+	let do_list = fn(req): object {
+		let installs = query(db,
+			"select id, tag, flavor, status, bytes_total, error, started_at, completed_at "
+			+ "from sd_cpp_installs "
+			+ "where status in ('queued','downloading','extracting') "
+			+ "   or started_at > datetime('now','-1 hour') "
+			+ "order by started_at desc",
+			[]);
+		return { status: 200, body: stringify({
+			installed:    list_installed(),
+			recent_jobs:  installs,
+			current_path: current_binary_path(),
+		})};
+	};
+
+	let do_activate = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required\"}" };
+		}
+		let new_path = null;
+		try { new_path = activate(tag); } catch (e) {
+			return { status: 400, body: stringify({ error: "" + e }) };
+		}
+		try { rescan_caps_after(); } catch (e) {
+			eprint("[sd_cpp] post-activate rescan failed: " + e);
+		}
+		return { status: 200, body: stringify({
+			tag: tag, current_path: new_path,
+		})};
+	};
+
+	return { install: do_install, list: do_list, activate: do_activate };
+}

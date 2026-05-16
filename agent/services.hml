@@ -242,6 +242,76 @@ export fn discover_orphan_llama_servers(db, our_uid: i32): null {
 	return null;
 }
 
+// sd-server (stable-diffusion.cpp) orphan reconciliation. Parallel to
+// discover_orphan_llama_servers — same crash-recovery contract — but
+// matches the sd-server binary and reads the bind port from
+// --listen-port (sd-server's flag) instead of --port.
+fn is_our_sd_server(pid: i32): bool {
+	try {
+		let f = open("/proc/" + pid + "/cmdline", "r");
+		let content = f.read();
+		f.close();
+		if (content == null || content.length == 0) { return false; }
+		let nul = content.find("\0");
+		let head = nul > 0 ? content.substr(0, nul) : content;
+		return head.find("sd-server") >= 0;
+	} catch (e) {
+		return false;
+	}
+}
+
+export fn discover_orphan_sd_servers(db, our_uid: i32): null {
+	let r = null;
+	try {
+		r = exec_argv(["pgrep", "-u", "" + our_uid, "-f", "sd-server"]);
+	} catch (e) { return null; }
+	if (r.output.length == 0) { return null; }
+
+	let known = {};
+	let owned = query(db,
+		"select pid from services where state = 'running'", []);
+	for (o in owned) { known["" + o.pid] = true; }
+
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let pid_str = line.trim();
+		if (pid_str.length == 0) { continue; }
+		let pid = i32(pid_str);
+		if (!is_our_sd_server(pid)) { continue; }
+		if (known.has("" + pid)) { continue; }
+		if (!is_our_uid(pid, our_uid)) { continue; }
+		let port_str = read_arg_after(pid, "--listen-port");
+		let model = read_arg_after(pid, "-m");
+		if (port_str == null) {
+			print("[orphan] sd pid " + pid + " no --listen-port in argv, can't adopt");
+			continue;
+		}
+		let port = i32(port_str);
+
+		let candidates = query(db,
+			"select id, profile, port, profile_json, profile_version "
+			+ "from services where state in ('dead', 'stopped') and port = ? "
+			+ "and (model_path = ? or model_path is null) "
+			+ "order by started_at desc limit 1",
+			[port, model ?? ""]);
+		if (candidates.length == 0) {
+			print("[orphan] sd pid " + pid + " port=" + port
+				+ " model=" + (model ?? "?")
+				+ " — running but no matching history row. "
+				+ "Kill manually or spawn a fresh service for the same profile.");
+			continue;
+		}
+		let cand = candidates[0];
+		db_exec(db,
+			"update services set pid = ?, state = 'running' where id = ?",
+			[pid, cand.id]);
+		print("[adopt] sd pid " + pid + " port=" + port + " profile="
+			+ cand.profile + " v" + cand.profile_version
+			+ " — re-attached to historical row " + cand.id.substr(0, 8) + "…");
+	}
+	return null;
+}
+
 fn is_our_uid(pid: i32, our_uid: i32): bool {
 	try {
 		let s = exec_argv(["stat", "-c", "%u", "/proc/" + pid]);
@@ -376,16 +446,33 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// lookup) provided by agent.hml's caller — comes from
 	// llama_cpp.current_binary_path() since v0.7 C2 so a Witchgrid-
 	// managed install is honored.
-	if (capabilities == null || capabilities.keys().length == 0) {
+	// sd-server (stable-diffusion.cpp) is a second engine with a
+	// different CLI surface: image profiles carry an empty intent map
+	// (no context/kv/gpu-layers concepts) + extra_flags only, and the
+	// bind flags are -l/--listen-port, not --host/--port. It also has
+	// no --tensor-split. Branch on the profile's declared binary.
+	let is_sd = (prof?.binary == "sd-server");
+
+	// The caps-empty guard exists because llama profiles render intents
+	// against the parsed --help map; an empty map means a broken/missing
+	// binary. sd-server image profiles render no intents, so an empty
+	// caps map is benign there — skip the guard for sd-server.
+	if (!is_sd && (capabilities == null || capabilities.keys().length == 0)) {
 		throw "agent has no parsed capabilities for " + prof.binary
 			+ " (introspection may have failed at boot — check agent log)";
 	}
 	let argv = [binary_path];
-	let derived = render_argv(prof.intent, prof?.extra_flags ?? [], capabilities);
+	let derived = render_argv(prof?.intent ?? {}, prof?.extra_flags ?? [],
+		capabilities ?? {});
 	for (a in derived) { argv.push(a); }
 	argv.push("-m"); argv.push(model_path);
-	argv.push("--port"); argv.push("" + port);
-	argv.push("--host"); argv.push("0.0.0.0");
+	if (is_sd) {
+		argv.push("--listen-port"); argv.push("" + port);
+		argv.push("-l"); argv.push("0.0.0.0");
+	} else {
+		argv.push("--port"); argv.push("" + port);
+		argv.push("--host"); argv.push("0.0.0.0");
+	}
 
 	// Multi-GPU tensor-parallel split. We only emit --tensor-split when
 	// CP told us to — for single-GPU spawns the flag isn't needed (or
@@ -397,7 +484,7 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// shipping a malformed argv. The placement decision was made on the
 	// assumption tensor-split would work; if it can't, the operator
 	// needs to know.
-	if (tensor_split != null && tensor_split.length > 1) {
+	if (!is_sd && tensor_split != null && tensor_split.length > 1) {
 		if (!capabilities.has("tensor-split")) {
 			throw "binary does not support --tensor-split but CP placed a "
 				+ "multi-GPU spawn (" + tensor_split.length + " GPUs). "
