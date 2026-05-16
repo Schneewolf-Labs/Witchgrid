@@ -540,6 +540,25 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 		setenv("CUDA_VISIBLE_DEVICES", "");
 	}
 
+	// sd-server can't find libstable-diffusion.so on its own: the
+	// upstream prebuilt's RUNPATH is the dead GitHub-Actions build dir
+	// (no $ORIGIN), and even a source build keeps the lib next to the
+	// binary rather than in a system path. Point LD_LIBRARY_PATH at the
+	// binary's own directory so the co-located .so (and any ggml libs)
+	// resolve. Same transient-parent-env trick as CUDA_VISIBLE_DEVICES.
+	// The agent's launch env doesn't set LD_LIBRARY_PATH, so a plain
+	// set→unset (no prior-value restore) is safe here.
+	if (is_sd) {
+		let li = -1;
+		let bi = 0;
+		while (bi < binary_path.length) {
+			if (binary_path.substr(bi, 1) == "/") { li = bi; }
+			bi = bi + 1;
+		}
+		let libdir = li >= 0 ? binary_path.substr(0, li) : ".";
+		setenv("LD_LIBRARY_PATH", libdir);
+	}
+
 	let result = posix_spawn(argv, {
 		stdin: null_fd,
 		stdout: log_fd,
@@ -549,6 +568,9 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 
 	if (pinned || cpu_only) {
 		unsetenv("CUDA_VISIBLE_DEVICES");
+	}
+	if (is_sd) {
+		unsetenv("LD_LIBRARY_PATH");
 	}
 	fd_close(log_fd);
 	fd_close(null_fd);
