@@ -1,0 +1,466 @@
+// whisper_cpp.hml — manage whisper.cpp installs on this node.
+//
+// Third sibling of llama_cpp.hml / sd_cpp.hml. Same shape, same
+// lifecycle, same `current` symlink hot-swap trick — just a
+// different upstream (ggml-org/whisper.cpp) and binary
+// (`whisper-server`). spawn_service resolves the binary via this
+// module's current_binary_path() when prof.binary == "whisper-server",
+// so flipping the symlink hot-swaps new spawns.
+//
+// Deltas vs sd_cpp.hml (deliberate, documented):
+//   1. SOURCE-BUILD ONLY for v1. whisper.cpp's GitHub prebuilt asset
+//      naming has churned heavily across releases (whisper-cublas vs
+//      whisper-cuda vs whisper-bin-Linux-…, occasional gaps for some
+//      flavors entirely) — the asset-matcher would be fragile and
+//      break silently on every other release. Source build runs on
+//      whatever toolchain the node has, gives the operator full
+//      control over the backend (CPU/CUDA/Vulkan), and is
+//      reproducible. A prebuilt-download path can be added later
+//      mirroring sd_cpp.resolve_asset_url, but isn't worth the churn
+//      now.
+//   2. Binary is `whisper-server` (older whisper.cpp builds named it
+//      `server`; we probe both shapes in find_binary_in).
+//   3. Backend CMake flags use the ggml-shared `GGML_*` namespace
+//      (modern whisper.cpp), not the legacy `WHISPER_*` aliases.
+//      `-DWHISPER_BUILD_SERVER=ON` is set explicitly because older
+//      versions defaulted it off.
+//
+// Hardware customization: the install `flavor` parameter picks the
+// build backend (cuda / vulkan / cpu / macos-arm64 / source). `source`
+// auto-detects: CUDA if nvcc is on the box, else Vulkan if the
+// headers are installed, else CPU. The explicit flavors override the
+// autodetect for operators who want a specific backend regardless of
+// what's detected.
+//
+// Model-size customization happens per-profile at spawn time, NOT at
+// install time — register multiple profiles (audio-whisper-tiny,
+// audio-whisper-medium, audio-whisper-large-v3) all binding to this
+// binary, each pinning a different model path. Whisper models are
+// .bin / .gguf files; like sd-cpp checkpoints they're not catalogable
+// by the agent's GGUF scanner (no LLM arch metadata), so spawn them
+// with the explicit `model: <abs path>` pin.
+//
+// Layout per install:
+//   ~/.witchgrid/whisper-server/
+//     v1.7.4/
+//       build/bin/whisper-server         ← actual binary
+//     current -> v1.7.4                  ← active install
+
+import { exec_argv } from "@stdlib/process";
+import { stringify, parse } from "@stdlib/json";
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { homedir, platform, arch } from "@stdlib/os";
+import { exists, is_dir, file_stat, list_dir, make_dirs, remove_file, rename } from "@stdlib/fs";
+
+let WHISPER_REPO = "https://github.com/ggml-org/whisper.cpp";
+
+// Where installs live. Per-build subdirs + a `current` symlink.
+fn install_root(): string {
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/whisper-server"; }
+	return h + "/.witchgrid/whisper-server";
+}
+
+// Auto-detect the right flavor for THIS host.
+//   gpu + darwin/arm64 → macos-arm64 (CoreML in-binary)
+//   gpu + linux        → cuda  (preferred over vulkan when nvcc exists;
+//                                operator can override with flavor=vulkan)
+//   cpu + darwin/arm64 → macos-arm64
+//   cpu + linux        → cpu
+// Returns null when we can't pick — operator must specify explicitly.
+export fn detect_flavor(role: string): string {
+	let p = platform();
+	let a = arch();
+	if (p == "darwin" && a == "arm64") { return "macos-arm64"; }
+	if (p == "linux" && a == "x86_64") {
+		if (role == "gpu") { return "cuda"; }
+		return "cpu";
+	}
+	return null;
+}
+
+// Find the whisper-server binary inside an install dir. cmake's
+// output path is build/bin/whisper-server in modern whisper.cpp;
+// older builds called it `server` and put it in slightly different
+// places. Probe the common shapes + one level of child dirs.
+fn find_binary_in(dir: string) {
+	let candidates = [
+		dir + "/whisper-server",
+		dir + "/server",
+		dir + "/bin/whisper-server",
+		dir + "/bin/server",
+		dir + "/build/bin/whisper-server",
+		dir + "/build/bin/server",
+	];
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) { entries = []; }
+	for (name in entries) {
+		candidates.push(dir + "/" + name + "/whisper-server");
+		candidates.push(dir + "/" + name + "/server");
+		candidates.push(dir + "/" + name + "/build/bin/whisper-server");
+		candidates.push(dir + "/" + name + "/build/bin/server");
+	}
+	for (c in candidates) {
+		if (exists(c)) { return c; }
+	}
+	return null;
+}
+
+// Resolve the active whisper-server binary. `current` symlink → its
+// binary when present, else bare "whisper-server" (PATH lookup).
+export fn current_binary_path(): string {
+	let root = install_root();
+	let cur = root + "/current";
+	if (!exists(cur)) { return "whisper-server"; }
+	let bin = find_binary_in(cur);
+	if (bin != null) { return bin; }
+	return "whisper-server";
+}
+
+// Install-job tracking table. Mirrors llama_cpp_installs /
+// sd_cpp_installs schema 1:1 so the dashboard can render all three
+// the same way.
+export fn init_whisper_cpp_schema(db): null {
+	db_exec(db, "create table if not exists whisper_cpp_installs ("
+		+ "id text primary key,"
+		+ "tag text not null,"
+		+ "flavor text not null,"
+		+ "source_url text not null,"
+		+ "target_dir text not null,"
+		+ "status text not null,"
+		+ "bytes_downloaded integer default 0,"
+		+ "bytes_total integer default 0,"
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+	return null;
+}
+
+fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(8)) as id", []);
+	return r[0].id;
+}
+
+fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+// List installed builds. [{tag, path, binary, is_current, has_binary}].
+export fn list_installed(): array {
+	let root = install_root();
+	if (!exists(root)) { return []; }
+	let entries = null;
+	try { entries = list_dir(root); } catch (e) { return []; }
+	let cur_bin = current_binary_path();
+	let out = [];
+	for (name in entries) {
+		if (name == "." || name == ".." || name == "current") { continue; }
+		let path = root + "/" + name;
+		let is_d = false;
+		try { is_d = is_dir(path); } catch (e) { }
+		if (!is_d) { continue; }
+		let resolved = find_binary_in(path);
+		out.push({
+			tag:        name,
+			path:       path,
+			binary:     resolved,
+			is_current: (resolved != null && cur_bin == resolved),
+			has_binary: resolved != null,
+		});
+	}
+	return out;
+}
+
+// Absolute nvcc path, or null. Same approach + rationale as
+// sd_cpp.detect_nvcc.
+fn detect_nvcc(): string {
+	if (exists("/usr/local/cuda/bin/nvcc")) { return "/usr/local/cuda/bin/nvcc"; }
+	let r = null;
+	try { r = exec_argv(["which", "nvcc"]); } catch (e) { return null; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return null;
+}
+
+// CUDA compute capability of GPU 0 as a CMAKE_CUDA_ARCHITECTURES
+// token. See sd_cpp.detect_cuda_arch for full rationale.
+fn detect_cuda_arch(): string {
+	let r = null;
+	try {
+		r = exec_argv(["nvidia-smi", "--query-gpu=compute_cap",
+			"--format=csv,noheader"]);
+	} catch (e) { return "86;89"; }
+	if (r.exit_code != 0) { return "86;89"; }
+	let lines = r.output.split("\n");
+	for (ln in lines) {
+		let s = ln.trim();
+		if (s.length == 0) { continue; }
+		let out = "";
+		let i = 0;
+		while (i < s.length) {
+			let ch = s.substr(i, 1);
+			if (ch != ".") { out = out + ch; }
+			i = i + 1;
+		}
+		if (out.length > 0) { return out; }
+	}
+	return "86;89";
+}
+
+fn nproc_str(): string {
+	let r = null;
+	try { r = exec_argv(["nproc"]); } catch (e) { return "8"; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return "8";
+}
+
+// Decide which backend to enable in the cmake configure step. The
+// explicit flavors override autodetect; `source` (or anything else)
+// falls through to "best available" detection.
+fn pick_backend(flavor: string): string {
+	if (flavor == "cuda")        { return "cuda"; }
+	if (flavor == "vulkan")      { return "vulkan"; }
+	if (flavor == "cpu")         { return "cpu"; }
+	if (flavor == "macos-arm64") { return "metal"; }
+	// flavor == "source" or anything else: auto-detect.
+	if (detect_nvcc() != null)                       { return "cuda"; }
+	if (exists("/usr/include/vulkan/vulkan.h"))      { return "vulkan"; }
+	let p = platform();
+	let a = arch();
+	if (p == "darwin" && a == "arm64")               { return "metal"; }
+	return "cpu";
+}
+
+// Build whisper.cpp from source into target_dir. Backend picked by
+// pick_backend(flavor). The cmake build is multi-minute; runs in the
+// same detached task pattern sd_cpp uses, so status sits at 'building'
+// until it returns (do_list surfaces it).
+async fn source_install_task(db, transfer_id: string, tag: string,
+                            flavor: string, target_dir: string): null {
+	db_exec(db, "update whisper_cpp_installs set status='cloning' where id=?",
+		[transfer_id]);
+	let cr = null;
+	try {
+		cr = exec_argv(["git", "clone", "--recursive", WHISPER_REPO, target_dir]);
+	} catch (e) {
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["git clone exec failed (install git?): " + e, transfer_id]);
+		return null;
+	}
+	if (cr.exit_code != 0) {
+		let t = (cr?.stderr ?? cr?.output ?? "");
+		if (t.length > 400) { t = t.substr(t.length - 400, 400); }
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["git clone exit " + cr.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+
+	// Pin to the requested tag unless it's a "build HEAD" sentinel.
+	// Mirrors sd_cpp source_install_task — silent miss is a hard error
+	// (don't ship a different commit than asked for).
+	let tl = tag.lower();
+	if (tl != "head" && tl != "main" && tl != "master" && tl != "latest") {
+		let ok = true;
+		let co = null;
+		try { co = exec_argv(["git", "-C", target_dir, "checkout", "-q", tag]); }
+		catch (e) { ok = false; }
+		if (co == null || co.exit_code != 0) { ok = false; }
+		if (ok) {
+			try { exec_argv(["git", "-C", target_dir, "submodule", "update",
+				"--init", "--recursive"]); } catch (e) { }
+		}
+		if (!ok) {
+			db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+				["git checkout '" + tag + "' failed (not a valid ref; use a "
+					+ "release tag like v1.7.4, or 'head' to build the "
+					+ "default branch)", transfer_id]);
+			return null;
+		}
+	}
+
+	db_exec(db, "update whisper_cpp_installs set status='building' where id=?",
+		[transfer_id]);
+	let build_dir = target_dir + "/build";
+	let backend = pick_backend(flavor);
+	// WHISPER_BUILD_SERVER is sometimes off by default in older builds.
+	// Force it on so we always end up with whisper-server in build/bin/.
+	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
+		"-DCMAKE_BUILD_TYPE=Release",
+		"-DWHISPER_BUILD_SERVER=ON",
+		"-DWHISPER_BUILD_EXAMPLES=ON"];
+	if (backend == "cuda") {
+		let nvcc = detect_nvcc();
+		if (nvcc == null) {
+			db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+				["flavor=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
+					+ "(install CUDA toolkit, or use flavor=cpu/vulkan/source)",
+				 transfer_id]);
+			return null;
+		}
+		cfg.push("-DGGML_CUDA=1");
+		cfg.push("-DCMAKE_CUDA_COMPILER=" + nvcc);
+		cfg.push("-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch());
+	} else if (backend == "vulkan") {
+		cfg.push("-DGGML_VULKAN=1");
+	} else if (backend == "metal") {
+		cfg.push("-DGGML_METAL=1");
+		// CoreML support is an opt-in compile flag — enable when on
+		// Apple Silicon since the perf win for whisper is large.
+		cfg.push("-DWHISPER_COREML=1");
+	}
+	// CPU: no extra flags, default cmake config covers it.
+	print("[whisper_cpp] " + transfer_id + " source build backend=" + backend);
+	let cf = null;
+	try { cf = exec_argv(cfg); } catch (e) {
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["cmake configure exec failed (install cmake?): " + e, transfer_id]);
+		return null;
+	}
+	if (cf.exit_code != 0) {
+		let t = (cf?.stderr ?? cf?.output ?? "");
+		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["cmake configure exit " + cf.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+	let bf = null;
+	try {
+		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
+			"-j", nproc_str(), "--target", "whisper-server"]);
+	} catch (e) {
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["cmake build exec failed: " + e, transfer_id]);
+		return null;
+	}
+	if (bf.exit_code != 0) {
+		let t = (bf?.stderr ?? bf?.output ?? "");
+		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["cmake build exit " + bf.exit_code + ": " + t, transfer_id]);
+		return null;
+	}
+
+	let bin = find_binary_in(target_dir);
+	if (bin == null) {
+		db_exec(db, "update whisper_cpp_installs set status='error', error=? where id=?",
+			["build completed but no whisper-server binary found under "
+				+ target_dir + " (expected build/bin/whisper-server). Older "
+				+ "whisper.cpp versions may build it as 'server' — check "
+				+ "build output for the actual target name.", transfer_id]);
+		return null;
+	}
+	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
+	let stat = null;
+	try { stat = file_stat(bin); } catch (e) { }
+	let now = iso_now(db);
+	db_exec(db,
+		"update whisper_cpp_installs "
+		+ "set status='complete', bytes_total=?, completed_at=? where id=?",
+		[(stat == null ? 0 : stat.size), now, transfer_id]);
+	print("[whisper_cpp] " + transfer_id + " source build complete: " + tag
+		+ "/" + backend);
+	return null;
+}
+
+// Activate — point `current` at <tag>'s install.
+export fn activate(tag: string): string {
+	let root = install_root();
+	let target = root + "/" + tag;
+	if (!exists(target)) {
+		throw "no install for tag '" + tag + "' at " + target;
+	}
+	if (find_binary_in(target) == null) {
+		throw "install dir exists but no whisper-server binary inside " + target;
+	}
+	let cur = root + "/current";
+	let r = exec_argv(["ln", "-sfn", target, cur]);
+	if (r.exit_code != 0) {
+		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
+	}
+	return current_binary_path();
+}
+
+// HTTP handlers. Shape matches llama_cpp / sd_cpp make_handlers so
+// agent.hml wires them identically. rescan_caps_after re-introspects
+// after a symlink flip.
+export fn make_handlers(db, rescan_caps_after): object {
+	let do_install = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		let flavor = payload?.flavor;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required (e.g. v1.7.4, or 'head')\"}" };
+		}
+		if (flavor == null) {
+			return { status: 400, body: "{\"error\":\"flavor required (source|cuda|vulkan|cpu|macos-arm64)\"}" };
+		}
+		let root = install_root();
+		try { make_dirs(root); } catch (e) { }
+		let target_dir = root + "/" + tag;
+		let id = new_id(db);
+		let now = iso_now(db);
+
+		// All v1 install modes are source-build. The flavor arg controls
+		// the backend (cuda/vulkan/cpu/macos-arm64) or `source` for
+		// auto-detect. git clone refuses a non-empty target.
+		if (exists(target_dir)) {
+			return { status: 409, body: stringify({
+				error: "target dir already exists: " + target_dir
+					+ " (remove it or pick a different tag)",
+			})};
+		}
+		db_exec(db,
+			"insert into whisper_cpp_installs "
+			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
+			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
+			[id, tag, flavor, WHISPER_REPO, target_dir, now]);
+		let st = spawn(source_install_task, db, id, tag, flavor, target_dir);
+		detach(st);
+		return { status: 202, body: stringify({
+			install_id: id, tag: tag, flavor: flavor,
+			target_dir: target_dir, mode: "source-build",
+		})};
+	};
+
+	let do_list = fn(req): object {
+		let installs = query(db,
+			"select id, tag, flavor, status, bytes_total, error, started_at, completed_at "
+			+ "from whisper_cpp_installs "
+			+ "where status in ('queued','cloning','building') "
+			+ "   or started_at > datetime('now','-1 hour') "
+			+ "order by started_at desc",
+			[]);
+		return { status: 200, body: stringify({
+			installed:    list_installed(),
+			recent_jobs:  installs,
+			current_path: current_binary_path(),
+		})};
+	};
+
+	let do_activate = fn(req): object {
+		let payload = null;
+		try { payload = parse(req?.body ?? "{}"); } catch (e) {
+			return { status: 400, body: "{\"error\":\"bad json\"}" };
+		}
+		let tag = payload?.tag;
+		if (tag == null) {
+			return { status: 400, body: "{\"error\":\"tag required\"}" };
+		}
+		let new_path = null;
+		try { new_path = activate(tag); } catch (e) {
+			return { status: 400, body: stringify({ error: "" + e }) };
+		}
+		try { rescan_caps_after(); } catch (e) {
+			eprint("[whisper_cpp] post-activate rescan failed: " + e);
+		}
+		return { status: 200, body: stringify({
+			tag: tag, current_path: new_path,
+		})};
+	};
+
+	return { install: do_install, list: do_list, activate: do_activate };
+}

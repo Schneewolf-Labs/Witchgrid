@@ -331,13 +331,29 @@ fn nproc_str(): string {
 	return "8";
 }
 
+// Decide which backend to enable in the cmake configure step. The
+// explicit flavors are pass-throughs (operator forced it); anything
+// else (including "source") falls through to "best available"
+// autodetect — CUDA if nvcc is on the box, else Vulkan if its
+// headers are installed, else CPU. macOS Metal is enabled by sd-cpp's
+// own CMakeLists on darwin/arm64 so we don't need a flag for it.
+// (Mirrors whisper_cpp.pick_backend for cross-engine consistency.)
+fn pick_backend(flavor: string): string {
+	if (flavor == "cuda")   { return "cuda"; }
+	if (flavor == "vulkan") { return "vulkan"; }
+	if (flavor == "cpu")    { return "cpu"; }
+	if (detect_nvcc() != null)                  { return "cuda"; }
+	if (exists("/usr/include/vulkan/vulkan.h")) { return "vulkan"; }
+	return "cpu";
+}
+
 // Build sd.cpp from source into target_dir. CUDA if nvcc is present
 // (best perf on the NVIDIA fleet), else Vulkan if the dev headers are
 // installed, else CPU. The cmake build is multi-minute; this runs in
 // the same detached task install_task uses, so status sits at
 // 'building' until it returns (do_list surfaces it).
 async fn source_install_task(db, transfer_id: string, tag: string,
-                            target_dir: string): null {
+                            flavor: string, target_dir: string): null {
 	db_exec(db, "update sd_cpp_installs set status='cloning' where id=?",
 		[transfer_id]);
 	let cr = null;
@@ -384,17 +400,23 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	let build_dir = target_dir + "/build";
 	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
 		"-DCMAKE_BUILD_TYPE=Release"];
-	let nvcc = detect_nvcc();
-	let backend = "cpu";
-	if (nvcc != null) {
-		backend = "cuda";
+	let backend = pick_backend(flavor);
+	if (backend == "cuda") {
+		let nvcc = detect_nvcc();
+		if (nvcc == null) {
+			db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
+				["backend=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
+					+ "(install CUDA toolkit, or pick a different flavor)",
+				 transfer_id]);
+			return null;
+		}
 		cfg.push("-DSD_CUDA=ON");
 		cfg.push("-DCMAKE_CUDA_COMPILER=" + nvcc);
 		cfg.push("-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch());
-	} else if (exists("/usr/include/vulkan/vulkan.h")) {
-		backend = "vulkan";
+	} else if (backend == "vulkan") {
 		cfg.push("-DSD_VULKAN=ON");
 	}
+	// cpu (and darwin/arm64 Metal-by-default): no extra flags.
 	print("[sd_cpp] " + transfer_id + " source build backend=" + backend);
 	let cf = null;
 	try { cf = exec_argv(cfg); } catch (e) {
@@ -411,8 +433,12 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	}
 	let bf = null;
 	try {
+		// --target sd-server: only build the server binary we ship.
+		// sd.cpp's CMake produces ~half a dozen example/util binaries
+		// (sd CLI, esrgan tooling, etc.) that we don't use and never
+		// touch — skipping them noticeably cuts build wall time.
 		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
-			"-j", nproc_str()]);
+			"-j", nproc_str(), "--target", "sd-server"]);
 	} catch (e) {
 		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
 			["cmake build exec failed: " + e, transfer_id]);
@@ -502,7 +528,7 @@ export fn make_handlers(db, rescan_caps_after): object {
 				+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 				+ "values (?, ?, ?, ?, ?, 'queued', ?)",
 				[id, tag, "source", SD_REPO, target_dir, now]);
-			let st = spawn(source_install_task, db, id, tag, target_dir);
+			let st = spawn(source_install_task, db, id, tag, "source", target_dir);
 			detach(st);
 			return { status: 202, body: stringify({
 				install_id: id, tag: tag, flavor: "source",

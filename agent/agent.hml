@@ -59,6 +59,7 @@ import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
 import { init_llama_cpp_schema, make_handlers as make_llama_cpp_handlers, current_binary_path, detect_flavor } from "./llama_cpp";
 import { init_sd_cpp_schema, make_handlers as make_sd_cpp_handlers, current_binary_path as sd_current_binary_path, detect_flavor as sd_detect_flavor } from "./sd_cpp";
+import { init_whisper_cpp_schema, make_handlers as make_whisper_cpp_handlers, current_binary_path as wcpp_current_binary_path, detect_flavor as wcpp_detect_flavor } from "./whisper_cpp";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -330,7 +331,7 @@ fn main(): null {
 	// when there's a Witchgrid-managed install, falls back to bare
 	// "llama-server" (PATH lookup) otherwise.
 	let runtime_ref = { value: {} };
-	let caps_ref    = { llama_server: {}, sd_server: {} };
+	let caps_ref    = { llama_server: {}, sd_server: {}, whisper_server: {} };
 	// sd-server capabilities are introspected for the /capabilities
 	// endpoint + dashboard, but image profiles spawn with an empty
 	// intent map + extra_flags, so spawn correctness does not depend on
@@ -372,6 +373,21 @@ fn main(): null {
 	} else {
 		print("[agent] sd-server: " + caps_ref.sd_server.keys().length + " flags");
 	}
+	// whisper-server has no static `--help` flags worth introspecting for
+	// the capabilities map (its CLI is short and stable across versions),
+	// so the caps entry stays {} regardless. Just record presence so the
+	// startup log + dashboard can show it.
+	let do_rescan_caps_wcpp = fn(): null {
+		let wbin = wcpp_current_binary_path();
+		caps_ref.whisper_server = (wbin == "whisper-server") ? {} : { installed: true };
+		return null;
+	};
+	do_rescan_caps_wcpp();
+	if (caps_ref.whisper_server.keys().length == 0) {
+		print("[agent] whisper-server not installed (audio profiles need /whisper_cpp/install)");
+	} else {
+		print("[agent] whisper-server: present at " + wcpp_current_binary_path());
+	}
 
 	// Scan the catalog before first /register so CP gets the model list
 	// on the very first contact (placement can use it immediately).
@@ -396,6 +412,7 @@ fn main(): null {
 	init_transfers_schema(db);
 	init_llama_cpp_schema(db);
 	init_sd_cpp_schema(db);
+	init_whisper_cpp_schema(db);
 
 	register_with_cp(cp_url, {
 		node_id:   node_id,
@@ -477,13 +494,17 @@ fn main(): null {
 	// activate triggers do_rescan_caps_sd so a fresh sd-server build is
 	// reflected without an agent restart.
 	let scpp = make_sd_cpp_handlers(db, do_rescan_caps_sd);
+	// whisper.cpp install layer — same lifecycle. Activate rescan is
+	// cheap (no introspect call, just a presence stamp).
+	let wcpp = make_whisper_cpp_handlers(db, do_rescan_caps_wcpp);
 
 	// Resolve a binary name to its on-disk path. Since v0.7 C2 the
 	// llama_cpp module owns the install layer; current_binary_path()
 	// reads through ~/.witchgrid/llama-server/current/ when set.
 	fn binary_path_for(binary_name) {
-		if (binary_name == "llama-server") { return current_binary_path(); }
-		if (binary_name == "sd-server")    { return sd_current_binary_path(); }
+		if (binary_name == "llama-server")   { return current_binary_path(); }
+		if (binary_name == "sd-server")      { return sd_current_binary_path(); }
+		if (binary_name == "whisper-server") { return wcpp_current_binary_path(); }
 		return binary_name;
 	}
 
@@ -500,8 +521,9 @@ fn main(): null {
 		// stub returns 410; route left out so 404 is the response.
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
 			return { status: 200, body: stringify({
-				"llama-server": caps_ref.llama_server,
-				"sd-server":    caps_ref.sd_server,
+				"llama-server":   caps_ref.llama_server,
+				"sd-server":      caps_ref.sd_server,
+				"whisper-server": caps_ref.whisper_server,
 			})};
 		} },
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
@@ -570,6 +592,16 @@ fn main(): null {
 		{ method: "GET",  path: "/sd_cpp/flavor",    handler: fn(req): object {
 			return { status: 200, body: stringify({
 				flavor: sd_detect_flavor(probe(canonical_dir, extra_dirs).role),
+			})};
+		} },
+		// whisper.cpp lifecycle — mirrors /llama_cpp/* and /sd_cpp/*.
+		// Source-build-only for v1; flavor picks the backend.
+		{ method: "POST", path: "/whisper_cpp/install",   handler: wcpp.install },
+		{ method: "GET",  path: "/whisper_cpp/installed", handler: wcpp.list },
+		{ method: "POST", path: "/whisper_cpp/activate",  handler: wcpp.activate },
+		{ method: "GET",  path: "/whisper_cpp/flavor",    handler: fn(req): object {
+			return { status: 200, body: stringify({
+				flavor: wcpp_detect_flavor(probe(canonical_dir, extra_dirs).role),
 			})};
 		} },
 		{ method: "POST", path: "/port_check",    handler: fn(req): object {
