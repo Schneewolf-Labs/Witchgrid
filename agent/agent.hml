@@ -60,6 +60,7 @@ import { init_transfers_schema, make_pull_handler, list_transfers } from "./tran
 import { init_llama_cpp_schema, make_handlers as make_llama_cpp_handlers, current_binary_path, detect_flavor } from "./llama_cpp";
 import { init_sd_cpp_schema, make_handlers as make_sd_cpp_handlers, current_binary_path as sd_current_binary_path, detect_flavor as sd_detect_flavor } from "./sd_cpp";
 import { init_whisper_cpp_schema, make_handlers as make_whisper_cpp_handlers, current_binary_path as wcpp_current_binary_path, detect_flavor as wcpp_detect_flavor } from "./whisper_cpp";
+import { init_piper_cpp_schema, make_handlers as make_piper_cpp_handlers, current_binary_path as pcpp_current_binary_path, detect_flavor as pcpp_detect_flavor } from "./piper_cpp";
 
 let DB_PATH = "witchgrid-agent.db";
 
@@ -331,7 +332,7 @@ fn main(): null {
 	// when there's a Witchgrid-managed install, falls back to bare
 	// "llama-server" (PATH lookup) otherwise.
 	let runtime_ref = { value: {} };
-	let caps_ref    = { llama_server: {}, sd_server: {}, whisper_server: {} };
+	let caps_ref    = { llama_server: {}, sd_server: {}, whisper_server: {}, piper: {} };
 	// sd-server capabilities are introspected for the /capabilities
 	// endpoint + dashboard, but image profiles spawn with an empty
 	// intent map + extra_flags, so spawn correctness does not depend on
@@ -388,6 +389,19 @@ fn main(): null {
 	} else {
 		print("[agent] whisper-server: present at " + wcpp_current_binary_path());
 	}
+	// piper: same "presence stamp" pattern as whisper — its CLI flags
+	// aren't worth introspecting per-spawn.
+	let do_rescan_caps_pcpp = fn(): null {
+		let pbin = pcpp_current_binary_path();
+		caps_ref.piper = (pbin == "piper") ? {} : { installed: true };
+		return null;
+	};
+	do_rescan_caps_pcpp();
+	if (caps_ref.piper.keys().length == 0) {
+		print("[agent] piper not installed (tts profiles need /piper_cpp/install)");
+	} else {
+		print("[agent] piper: present at " + pcpp_current_binary_path());
+	}
 
 	// Scan the catalog before first /register so CP gets the model list
 	// on the very first contact (placement can use it immediately).
@@ -413,6 +427,7 @@ fn main(): null {
 	init_llama_cpp_schema(db);
 	init_sd_cpp_schema(db);
 	init_whisper_cpp_schema(db);
+	init_piper_cpp_schema(db);
 
 	register_with_cp(cp_url, {
 		node_id:   node_id,
@@ -497,6 +512,8 @@ fn main(): null {
 	// whisper.cpp install layer — same lifecycle. Activate rescan is
 	// cheap (no introspect call, just a presence stamp).
 	let wcpp = make_whisper_cpp_handlers(db, do_rescan_caps_wcpp);
+	// piper install layer — same shape as whisper. TTS counterpart.
+	let pcpp = make_piper_cpp_handlers(db, do_rescan_caps_pcpp);
 
 	// Resolve a binary name to its on-disk path. Since v0.7 C2 the
 	// llama_cpp module owns the install layer; current_binary_path()
@@ -505,6 +522,7 @@ fn main(): null {
 		if (binary_name == "llama-server")   { return current_binary_path(); }
 		if (binary_name == "sd-server")      { return sd_current_binary_path(); }
 		if (binary_name == "whisper-server") { return wcpp_current_binary_path(); }
+		if (binary_name == "piper")          { return pcpp_current_binary_path(); }
 		return binary_name;
 	}
 
@@ -524,6 +542,7 @@ fn main(): null {
 				"llama-server":   caps_ref.llama_server,
 				"sd-server":      caps_ref.sd_server,
 				"whisper-server": caps_ref.whisper_server,
+				"piper":          caps_ref.piper,
 			})};
 		} },
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
@@ -602,6 +621,16 @@ fn main(): null {
 		{ method: "GET",  path: "/whisper_cpp/flavor",    handler: fn(req): object {
 			return { status: 200, body: stringify({
 				flavor: wcpp_detect_flavor(probe(canonical_dir, extra_dirs).role),
+			})};
+		} },
+		// piper lifecycle — TTS counterpart to whisper. Closes the
+		// audio loop (whisper STT in, llama chat, piper TTS out).
+		{ method: "POST", path: "/piper_cpp/install",   handler: pcpp.install },
+		{ method: "GET",  path: "/piper_cpp/installed", handler: pcpp.list },
+		{ method: "POST", path: "/piper_cpp/activate",  handler: pcpp.activate },
+		{ method: "GET",  path: "/piper_cpp/flavor",    handler: fn(req): object {
+			return { status: 200, body: stringify({
+				flavor: pcpp_detect_flavor(probe(canonical_dir, extra_dirs).role),
 			})};
 		} },
 		{ method: "POST", path: "/port_check",    handler: fn(req): object {

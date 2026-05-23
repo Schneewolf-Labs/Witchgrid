@@ -1,48 +1,62 @@
 // llama_cpp.hml — manage llama.cpp installs on this node.
 //
-// Fetches prebuilt release tarballs from github.com/ggerganov/llama.cpp/releases
-// and extracts them into a per-build directory under
-// ~/.witchgrid/llama-server/<tag>/. The agent points at the active
-// build via a `current` symlink. spawn_service uses current_binary_path()
-// instead of the bare PATH `llama-server`, so flipping the symlink
-// hot-swaps the binary new spawns will use.
+// First of the engine modules; uses engine_common for the shared
+// install_root / probe_binary / schema / list / activate / CUDA detect
+// / pick_backend / error-mark scaffolding. Per-engine bits owned here:
+// upstream repo, asset URL template (llama.cpp's release naming IS
+// templatable, unlike sd.cpp — no GitHub API call needed for prebuilt
+// resolution), source-build cmake flag translation, llama-server's
+// binary-discovery candidate paths.
 //
 // Flavor matrix (only what GitHub releases ship pre-built):
 //   - macos-arm64           Apple Silicon (Metal in-binary)
 //   - ubuntu-vulkan-x64     Linux NVIDIA / AMD via Vulkan; cross-vendor
-//                           but slower than native CUDA (which the
-//                           release matrix doesn't ship — operators
-//                           on CUDA-capable boxes who want native
-//                           perf still build llama.cpp themselves
-//                           and put it on PATH; that's the fallback)
+//                           but slower than native CUDA
 //   - ubuntu-x64            Linux CPU-only
+//   - source                git clone + cmake build on this node;
+//                           how CUDA-native llama-server gets under
+//                           witchgrid management (the prebuilt matrix
+//                           ships no Linux-CUDA tarball)
 //
 // Layout per install:
 //   ~/.witchgrid/llama-server/
-//     b9124/
-//       build/bin/llama-server        ← actual binary
-//       build/bin/libggml*.so         ← runtime libs ($ORIGIN rpath)
-//       ... other release contents ...
-//     b9100/
-//       build/bin/...
-//     current -> b9124                 ← active install
-//
-// current_binary_path() returns the resolved binary; if no install
-// exists yet (fresh agent, operator still using system llama-server),
-// it returns plain "llama-server" and the OS PATH lookup wins.
+//     b9124/build/bin/llama-server   ← actual binary
+//     current -> b9124                ← active install
 
 import { exec_argv } from "@stdlib/process";
 import { stringify, parse } from "@stdlib/json";
 import { exec as db_exec, query } from "@stdlib/sqlite";
-import { homedir, platform, arch } from "@stdlib/os";
-import { exists, is_dir, file_stat, list_dir, make_dirs, remove_file, rename } from "@stdlib/fs";
-import { get_binary } from "@stdlib/http";
+import { platform, arch } from "@stdlib/os";
+import { exists, file_stat, make_dirs, remove_file } from "@stdlib/fs";
+import {
+	install_root_for, probe_binary, resolve_current,
+	ensure_install_schema, new_id, iso_now,
+	list_installs_at, flip_current,
+	detect_nvcc, detect_cuda_arch, nproc_str, pick_backend, mark_error,
+} from "./engine_common";
 
-// Where installs live. Per-build subdirs + a `current` symlink.
+let LLAMA_REPO    = "https://github.com/ggerganov/llama.cpp";
+let ENGINE_NAME   = "llama-server";
+let INSTALL_TABLE = "llama_cpp_installs";
+
+// llama.cpp's release tarballs use a few layouts:
+//   <root>/llama-server                          (flat — rare)
+//   <root>/build/bin/llama-server                (older Linux + source)
+//   <root>/llama-bNNNN/llama-server              (current Linux + Mac)
+//   <root>/llama-bNNNN/build/bin/llama-server    (some hybrids)
+// probe_binary tries each + one level of child dirs; the child-dir
+// probe catches the `llama-bNNNN/` cases automatically.
+let BIN_CANDIDATES = [
+	"llama-server",
+	"build/bin/llama-server",
+];
+
 fn install_root(): string {
-	let h = homedir();
-	if (h == null || h.length == 0) { return "/var/lib/witchgrid/llama-server"; }
-	return h + "/.witchgrid/llama-server";
+	return install_root_for("llama-server");
+}
+
+fn find_binary(dir: string) {
+	return probe_binary(dir, BIN_CANDIDATES);
 }
 
 // Compose the GitHub-releases asset URL for a (tag, flavor) pair.
@@ -52,12 +66,7 @@ fn asset_url(tag: string, flavor: string): string {
 		+ tag + "/llama-" + tag + "-bin-" + flavor + ".tar.gz";
 }
 
-// Auto-detect the right flavor for THIS host. Probe role + OS:
-//   gpu + darwin/arm64 → macos-arm64
-//   gpu + linux        → ubuntu-vulkan-x64  (works on NVIDIA + AMD)
-//   cpu + darwin/arm64 → macos-arm64        (still has Metal, fine)
-//   cpu + linux        → ubuntu-x64
-// Returns null when we can't pick — operator must specify explicitly.
+// Auto-detect the right flavor for THIS host.
 export fn detect_flavor(role: string): string {
 	let p = platform();
 	let a = arch();
@@ -69,274 +78,131 @@ export fn detect_flavor(role: string): string {
 	return null;
 }
 
-// Find the llama-server binary inside an extracted install dir.
-// llama.cpp's release tarballs use a few different layouts:
-//   <root>/llama-server                    (flat — rare)
-//   <root>/build/bin/llama-server          (older Linux builds)
-//   <root>/llama-bNNNN/llama-server        (current Linux + Mac)
-//   <root>/llama-bNNNN/build/bin/llama-server   (some hybrids)
-// Try in order, return the first one that exists. Returns null if
-// nothing's found (caller treats as "install incomplete").
-fn find_binary_in(dir: string) {
-	let candidates = [
-		dir + "/llama-server",
-		dir + "/build/bin/llama-server",
-	];
-	// Also probe direct children matching llama-bNNNN/.
-	let entries = null;
-	try { entries = list_dir(dir); } catch (e) { entries = []; }
-	for (name in entries) {
-		if (name.starts_with("llama-")) {
-			candidates.push(dir + "/" + name + "/llama-server");
-			candidates.push(dir + "/" + name + "/build/bin/llama-server");
-		}
-	}
-	for (c in candidates) {
-		if (exists(c)) { return c; }
-	}
-	return null;
-}
-
-// Resolve the active llama-server binary. When `current` symlink
-// exists + points somewhere with a binary inside, return that path.
-// Otherwise fall back to bare "llama-server" (PATH lookup).
-//
-// The symlink approach lets us atomic-swap to a new build without
-// disturbing in-flight services (those have already exec'd the old
-// binary's pid; OS keeps the inode alive even if the symlink moves).
 export fn current_binary_path(): string {
-	let root = install_root();
-	let cur = root + "/current";
-	if (!exists(cur)) { return "llama-server"; }
-	let bin = find_binary_in(cur);
-	if (bin != null) { return bin; }
-	return "llama-server";
+	return resolve_current(install_root(), BIN_CANDIDATES, ENGINE_NAME);
 }
 
-// Schema for tracking install jobs (mirrors model_transfers shape).
-// Distinct table because the lifecycle is slightly different — no
-// peer-pull mode, source is always GitHub releases.
 export fn init_llama_cpp_schema(db): null {
-	db_exec(db, "create table if not exists llama_cpp_installs ("
-		+ "id text primary key,"
-		+ "tag text not null,"
-		+ "flavor text not null,"
-		+ "source_url text not null,"
-		+ "target_dir text not null,"
-		+ "status text not null,"             // queued|downloading|extracting|complete|error
-		+ "bytes_downloaded integer default 0,"
-		+ "bytes_total integer default 0,"
-		+ "error text,"
-		+ "started_at text not null,"
-		+ "completed_at text"
-		+ ")", []);
-	return null;
+	return ensure_install_schema(db, INSTALL_TABLE);
 }
 
-fn new_id(db): string {
-	let r = query(db, "select hex(randomblob(8)) as id", []);
-	return r[0].id;
-}
-
-fn iso_now(db): string {
-	let r = query(db, "select datetime('now') as ts", []);
-	return r[0].ts;
-}
-
-// List installed builds. Returns [{tag, path, is_current, has_binary}].
-// is_current is true for the build the `current` symlink points at.
 export fn list_installed(): array {
-	let root = install_root();
-	if (!exists(root)) { return []; }
-	let entries = null;
-	try { entries = list_dir(root); } catch (e) { return []; }
-
-	// Resolve current target by reading what the symlink itself looks
-	// like. Hemlock doesn't expose readlink, so we infer from existence.
-	// Approximation: if current exists, we'll mark whichever build's
-	// binary path equals current's binary path as current.
-	let cur_bin = current_binary_path();
-
-	let out = [];
-	for (name in entries) {
-		if (name == "." || name == ".." || name == "current") { continue; }
-		let path = root + "/" + name;
-		// Skip non-directories (stray .tar.gz files left from a
-		// failed install, etc.). list_installed should reflect actual
-		// installs, not download cruft.
-		let is_d = false;
-		try { is_d = is_dir(path); } catch (e) { }
-		if (!is_d) { continue; }
-		let resolved = find_binary_in(path);
-		out.push({
-			tag:        name,
-			path:       path,
-			binary:     resolved,
-			is_current: (resolved != null && cur_bin == resolved),
-			has_binary: resolved != null,
-		});
-	}
-	return out;
+	return list_installs_at(install_root(), find_binary, current_binary_path());
 }
 
-// Background install task — download tarball via download_streaming,
-// extract via `tar -xzf`, ensure the binary exists at the expected
-// path. Updates status as it progresses.
+export fn activate(tag: string): string {
+	flip_current(install_root(), tag, find_binary, ENGINE_NAME);
+	return current_binary_path();
+}
+
+// ─── prebuilt install task ───────────────────────────────────────
+
 async fn install_task(db, transfer_id: string, tag: string, flavor: string,
                       url: string, target_dir: string): null {
 	let tarball = target_dir + ".tar.gz";
 
-	db_exec(db, "update llama_cpp_installs set status='downloading' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='downloading' where id=?",
 		[transfer_id]);
-	// Shell out to curl for the download. Hemlock's @stdlib/http
-	// get_binary doesn't follow the GitHub → CDN redirect chain
-	// reliably for these release tarballs (returns status 0 / empty
-	// body); curl handles it cleanly and is universally available
-	// on Linux + macOS. Tarballs are 8-100MB so writing to disk
-	// directly via -o keeps memory bounded.
+	// curl, not @stdlib/http.get_binary — get_binary's redirect
+	// handling for GitHub release tarballs returns status 0 / empty
+	// body in some cases; curl handles the redirect chain cleanly and
+	// is universally available. Tarballs are 8-100MB so -o to disk
+	// keeps memory bounded.
 	let r = null;
-	try {
-		r = exec_argv(["curl", "-fsSL", "-o", tarball, url]);
-	} catch (e) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["curl exec failed (install curl?): " + e, transfer_id]);
+	try { r = exec_argv(["curl", "-fsSL", "-o", tarball, url]); }
+	catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"curl exec failed (install curl?): " + e, 0);
 		return null;
 	}
 	if (r.exit_code != 0) {
-		let tail = (r?.stderr ?? r?.output ?? "");
-		if (tail.length > 256) { tail = tail.substr(tail.length - 256, 256); }
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["curl exit " + r.exit_code + ": " + tail, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"curl exit " + r.exit_code + ": " + (r?.stderr ?? r?.output ?? ""),
+			256);
 		return null;
 	}
 
-	db_exec(db, "update llama_cpp_installs set status='extracting' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='extracting' where id=?",
 		[transfer_id]);
-	// mkdir -p target_dir, then `tar -xzf tarball -C target_dir`.
 	try { make_dirs(target_dir); } catch (e) { }
 	let tr = null;
-	try {
-		tr = exec_argv(["tar", "-xzf", tarball, "-C", target_dir]);
-	} catch (e) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["tar exec failed (install tar?): " + e, transfer_id]);
+	try { tr = exec_argv(["tar", "-xzf", tarball, "-C", target_dir]); }
+	catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"tar exec failed (install tar?): " + e, 0);
 		return null;
 	}
 	if (tr.exit_code != 0) {
-		let tail = (tr?.stderr ?? tr?.output ?? "");
-		if (tail.length > 512) { tail = tail.substr(tail.length - 512, 512); }
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["tar exit " + tr.exit_code + ": " + tail, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"tar exit " + tr.exit_code + ": " + (tr?.stderr ?? tr?.output ?? ""),
+			512);
 		return null;
 	}
 
-	// Sanity: the binary should now exist somewhere recognizable.
-	let bin = find_binary_in(target_dir);
+	let bin = find_binary(target_dir);
 	if (bin == null) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["extracted tarball but no llama-server binary found under "
-				+ target_dir + " (tried flat, build/bin, and llama-*/ layouts)",
-			 transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"extracted tarball but no llama-server binary found under "
+				+ target_dir + " (tried flat, build/bin, and llama-*/ layouts)", 0);
 		return null;
 	}
-	// Cleanup tarball — saved space, the binary's extracted.
 	try { remove_file(tarball); } catch (e) { }
 
 	let stat = null;
 	try { stat = file_stat(bin); } catch (e) { }
 	let now = iso_now(db);
 	db_exec(db,
-		"update llama_cpp_installs "
-		+ "set status='complete', bytes_total=?, completed_at=? "
-		+ "where id=?",
+		"update " + INSTALL_TABLE
+		+ " set status='complete', bytes_total=?, completed_at=? where id=?",
 		[(stat == null ? 0 : stat.size), now, transfer_id]);
 	print("[llama_cpp] " + transfer_id + " complete: " + tag + "/" + flavor);
 	return null;
 }
 
-// Activate — point `current` at <tag>'s install. Returns the new
-// resolved binary path on success, throws otherwise. Caller is
-// responsible for re-running capability introspection + version
-// probe after activate (so CP sees the new build version).
-// ── source-build install ──────────────────────────────────────────
-// Parallel to sd_cpp.hml's source mode. The prebuilt matrix only
-// ships Vulkan/CPU for Linux (no native CUDA — the asset_url comment
-// notes CUDA users were expected to hand-build + PATH it). flavor ==
-// "source" makes that agent-managed: git clone + cmake build against
-// the node's toolchain. CUDA when nvcc is present (native perf,
-// what the prebuilt matrix can't give), else Vulkan, else CPU.
-// llama.cpp vendors ggml in-tree (no git submodules), unlike sd.cpp.
+// ─── source-build task ───────────────────────────────────────────
 
-let LLAMA_REPO = "https://github.com/ggerganov/llama.cpp";
-
-// Absolute nvcc path or null — passed to cmake via
-// -DCMAKE_CUDA_COMPILER so it needn't be on the agent's PATH (CUDA
-// lives under /usr/local/cuda*/bin which witchgrid-agent.sh omits).
-fn detect_nvcc(): string {
-	if (exists("/usr/local/cuda/bin/nvcc")) { return "/usr/local/cuda/bin/nvcc"; }
-	let r = null;
-	try { r = exec_argv(["which", "nvcc"]); } catch (e) { return null; }
-	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
-	return null;
-}
-
-// GPU0 compute capability as a CMAKE_CUDA_ARCHITECTURES token
-// ("8.9" -> "89"); falls back to "86;89" (Ampere+Ada fleet).
-fn detect_cuda_arch(): string {
-	let r = null;
-	try {
-		r = exec_argv(["nvidia-smi", "--query-gpu=compute_cap",
-			"--format=csv,noheader"]);
-	} catch (e) { return "86;89"; }
-	if (r.exit_code != 0) { return "86;89"; }
-	let lines = r.output.split("\n");
-	for (ln in lines) {
-		let s = ln.trim();
-		if (s.length == 0) { continue; }
-		let out = "";
-		let i = 0;
-		while (i < s.length) {
-			let ch = s.substr(i, 1);
-			if (ch != ".") { out = out + ch; }
-			i = i + 1;
+// Translate the shared pick_backend tag into llama.cpp's cmake flags.
+// llama.cpp uses the ggml-shared `GGML_*` namespace.
+fn cmake_flags_for(backend: string, transfer_id: string, db): array {
+	if (backend == "cuda") {
+		let nvcc = detect_nvcc();
+		if (nvcc == null) {
+			mark_error(db, INSTALL_TABLE, transfer_id,
+				"backend=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
+					+ "(install CUDA toolkit, or pick a different flavor)", 0);
+			return null;
 		}
-		if (out.length > 0) { return out; }
+		return [
+			"-DGGML_CUDA=ON",
+			"-DCMAKE_CUDA_COMPILER=" + nvcc,
+			"-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch(),
+		];
 	}
-	return "86;89";
+	if (backend == "vulkan") { return ["-DGGML_VULKAN=ON"]; }
+	// cpu / metal: no extra flags (metal auto-enabled on darwin).
+	return [];
 }
 
-fn nproc_str(): string {
-	let r = null;
-	try { r = exec_argv(["nproc"]); } catch (e) { return "8"; }
-	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
-	return "8";
-}
-
-// Build llama.cpp from source into target_dir. Multi-minute cmake
-// build runs in the same detached task install_task uses; status
-// sits at 'building' until it returns (do_list surfaces it).
 async fn source_install_task(db, transfer_id: string, tag: string,
-                            target_dir: string): null {
-	db_exec(db, "update llama_cpp_installs set status='cloning' where id=?",
+                            flavor: string, target_dir: string): null {
+	db_exec(db, "update " + INSTALL_TABLE + " set status='cloning' where id=?",
 		[transfer_id]);
 	let cr = null;
 	try {
+		// llama.cpp vendors ggml in-tree — no --recursive needed.
 		cr = exec_argv(["git", "clone", LLAMA_REPO, target_dir]);
 	} catch (e) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["git clone exec failed (install git?): " + e, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"git clone exec failed (install git?): " + e, 0);
 		return null;
 	}
 	if (cr.exit_code != 0) {
-		let t = (cr?.stderr ?? cr?.output ?? "");
-		if (t.length > 400) { t = t.substr(t.length - 400, 400); }
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["git clone exit " + cr.exit_code + ": " + t, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"git clone exit " + cr.exit_code + ": " + (cr?.stderr ?? cr?.output ?? ""),
+			400);
 		return null;
 	}
-	// Pin the checkout to the tag for reproducibility unless it's a
-	// "build HEAD" sentinel. A miss is a hard error. llama.cpp has no
-	// submodules (ggml is vendored), so no submodule step.
+
 	let tl = tag.lower();
 	if (tl != "head" && tl != "main" && tl != "master" && tl != "latest") {
 		let ok = true;
@@ -345,66 +211,62 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 		catch (e) { ok = false; }
 		if (co == null || co.exit_code != 0) { ok = false; }
 		if (!ok) {
-			db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-				["git checkout '" + tag + "' failed (not a valid ref; use a "
-					+ "release tag like b9124, or 'head' for the default branch)",
-				 transfer_id]);
+			mark_error(db, INSTALL_TABLE, transfer_id,
+				"git checkout '" + tag + "' failed (not a valid ref; use a "
+					+ "release tag like b9124, or 'head' for the default branch)", 0);
 			return null;
 		}
 	}
 
-	db_exec(db, "update llama_cpp_installs set status='building' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='building' where id=?",
 		[transfer_id]);
 	let build_dir = target_dir + "/build";
+	let backend = pick_backend(flavor);
+	let backend_flags = cmake_flags_for(backend, transfer_id, db);
+	if (backend_flags == null) { return null; }
+
 	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
 		"-DCMAKE_BUILD_TYPE=Release", "-DLLAMA_BUILD_SERVER=ON"];
-	let nvcc = detect_nvcc();
-	let backend = "cpu";
-	if (nvcc != null) {
-		backend = "cuda";
-		cfg.push("-DGGML_CUDA=ON");
-		cfg.push("-DCMAKE_CUDA_COMPILER=" + nvcc);
-		cfg.push("-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch());
-	} else if (exists("/usr/include/vulkan/vulkan.h")) {
-		backend = "vulkan";
-		cfg.push("-DGGML_VULKAN=ON");
-	}
+	for (f in backend_flags) { cfg.push(f); }
 	print("[llama_cpp] " + transfer_id + " source build backend=" + backend);
+
 	let cf = null;
 	try { cf = exec_argv(cfg); } catch (e) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["cmake configure exec failed (install cmake?): " + e, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake configure exec failed (install cmake?): " + e, 0);
 		return null;
 	}
 	if (cf.exit_code != 0) {
-		let t = (cf?.stderr ?? cf?.output ?? "");
-		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["cmake configure exit " + cf.exit_code + ": " + t, transfer_id]);
-		return null;
-	}
-	let bf = null;
-	try {
-		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
-			"-j", nproc_str()]);
-	} catch (e) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["cmake build exec failed: " + e, transfer_id]);
-		return null;
-	}
-	if (bf.exit_code != 0) {
-		let t = (bf?.stderr ?? bf?.output ?? "");
-		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["cmake build exit " + bf.exit_code + ": " + t, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake configure exit " + cf.exit_code + ": "
+				+ (cf?.stderr ?? cf?.output ?? ""), 600);
 		return null;
 	}
 
-	let bin = find_binary_in(target_dir);
+	let bf = null;
+	try {
+		// --target llama-server: only build the one binary we ship.
+		// llama.cpp builds many examples (perplexity, embedding, quantize,
+		// llama-cli, …) that we don't use here — skipping cuts build time.
+		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
+			"-j", nproc_str(), "--target", "llama-server"]);
+	} catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake build exec failed: " + e, 0);
+		return null;
+	}
+	if (bf.exit_code != 0) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake build exit " + bf.exit_code + ": "
+				+ (bf?.stderr ?? bf?.output ?? ""), 600);
+		return null;
+	}
+
+	let bin = find_binary(target_dir);
 	if (bin == null) {
-		db_exec(db, "update llama_cpp_installs set status='error', error=? where id=?",
-			["build completed but no llama-server binary found under "
-				+ target_dir + " (expected build/bin/llama-server)", transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"build completed but no llama-server binary found under "
+				+ target_dir + " (expected build/bin/llama-server)", 0);
 		return null;
 	}
 	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
@@ -412,37 +274,16 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	try { stat = file_stat(bin); } catch (e) { }
 	let now = iso_now(db);
 	db_exec(db,
-		"update llama_cpp_installs "
-		+ "set status='complete', bytes_total=?, completed_at=? where id=?",
+		"update " + INSTALL_TABLE
+		+ " set status='complete', bytes_total=?, completed_at=? where id=?",
 		[(stat == null ? 0 : stat.size), now, transfer_id]);
 	print("[llama_cpp] " + transfer_id + " source build complete: " + tag
 		+ "/" + backend);
 	return null;
 }
 
-export fn activate(tag: string): string {
-	let root = install_root();
-	let target = root + "/" + tag;
-	if (!exists(target)) {
-		throw "no install for tag '" + tag + "' at " + target;
-	}
-	if (find_binary_in(target) == null) {
-		throw "install dir exists but no llama-server binary inside " + target;
-	}
-	let cur = root + "/current";
-	// `ln -sfn` overwrites an existing symlink atomically (the -n
-	// keeps it from following an existing link and creating one
-	// inside it — common gotcha when current already points at a
-	// directory).
-	let r = exec_argv(["ln", "-sfn", target, cur]);
-	if (r.exit_code != 0) {
-		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
-	}
-	return current_binary_path();
-}
+// ─── HTTP handlers ───────────────────────────────────────────────
 
-// HTTP handlers. install + activate need access to the rescan
-// callback so the agent can re-introspect capabilities after a flip.
 export fn make_handlers(db, rescan_caps_after): object {
 	let do_install = fn(req): object {
 		let payload = null;
@@ -463,10 +304,6 @@ export fn make_handlers(db, rescan_caps_after): object {
 		let id = new_id(db);
 		let now = iso_now(db);
 
-		// flavor == "source": git clone + cmake build on this node.
-		// The prebuilt matrix has no native-CUDA Linux binary; source
-		// build is how a CUDA box gets native llama-server under
-		// witchgrid management instead of a hand-built PATH binary.
 		if (flavor == "source") {
 			if (exists(target_dir)) {
 				return { status: 409, body: stringify({
@@ -475,11 +312,11 @@ export fn make_handlers(db, rescan_caps_after): object {
 				})};
 			}
 			db_exec(db,
-				"insert into llama_cpp_installs "
+				"insert into " + INSTALL_TABLE + " "
 				+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 				+ "values (?, ?, ?, ?, ?, 'queued', ?)",
 				[id, tag, "source", LLAMA_REPO, target_dir, now]);
-			let st = spawn(source_install_task, db, id, tag, target_dir);
+			let st = spawn(source_install_task, db, id, tag, "source", target_dir);
 			detach(st);
 			return { status: 202, body: stringify({
 				install_id: id, tag: tag, flavor: "source",
@@ -489,7 +326,7 @@ export fn make_handlers(db, rescan_caps_after): object {
 
 		let url = asset_url(tag, flavor);
 		db_exec(db,
-			"insert into llama_cpp_installs "
+			"insert into " + INSTALL_TABLE + " "
 			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
 			[id, tag, flavor, url, target_dir, now]);
@@ -503,8 +340,8 @@ export fn make_handlers(db, rescan_caps_after): object {
 	let do_list = fn(req): object {
 		let installs = query(db,
 			"select id, tag, flavor, status, bytes_total, error, started_at, completed_at "
-			+ "from llama_cpp_installs "
-			+ "where status in ('queued','downloading','extracting') "
+			+ "from " + INSTALL_TABLE + " "
+			+ "where status in ('queued','downloading','extracting','cloning','building') "
 			+ "   or started_at > datetime('now','-1 hour') "
 			+ "order by started_at desc",
 			[]);
@@ -528,9 +365,6 @@ export fn make_handlers(db, rescan_caps_after): object {
 		try { new_path = activate(tag); } catch (e) {
 			return { status: 400, body: stringify({ error: "" + e }) };
 		}
-		// Re-introspect capabilities + re-probe version against the
-		// new binary so subsequent spawns + the next heartbeat see
-		// the right data.
 		try { rescan_caps_after(); } catch (e) {
 			eprint("[llama_cpp] post-activate rescan failed: " + e);
 		}

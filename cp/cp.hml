@@ -704,6 +704,30 @@ fn seed_default_profiles(db): null {
 			},
 		},
 		{
+			// Text-to-speech starter — piper serving an English voice.
+			// Counterpart to audio-whisper-base; together they close the
+			// audio loop (STT in / chat / TTS out). piper's HTTP server
+			// expects --model <abs path to .onnx> at spawn (model files
+			// aren't catalog-able, like sd-cpp/whisper-cpp); clone this
+			// profile and point at a different rhasspy/piper-voices
+			// model for a different voice/language.
+			name: "tts-piper-en",
+			profile: {
+				binary: "piper",
+				intent: {},
+				extra_flags: ["--http"],
+				default_port: 19095,
+				context: 0,
+				kv_type: "f16",
+				model_alias: "piper-en_US-lessac-medium",
+				hf_source: {
+					repo: "rhasspy/piper-voices",
+					file: "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
+				},
+				default_model: null,
+			},
+		},
+		{
 			// Speech-to-text starter — whisper.cpp serving the base.en
 			// GGUF (~150 MB, fast on CPU and tiny on a GPU). Consumers
 			// hit the OpenAI-compatible /v1/audio/transcriptions on the
@@ -1658,11 +1682,12 @@ let AUTOSPAWN_READY_TIMEOUT_SECONDS = 60;
 // passes the right path based on the profile's binary.
 fn health_path_for(binary): string {
 	if (binary == "sd-server")      { return "/sdapi/v1/options"; }
-	// whisper-server's HTTP layer returns 200 on `/` once the server is
-	// listening; there's no dedicated /health. The model file is loaded
-	// when --model is passed at spawn time, so 200 on `/` indicates both
-	// listener-up AND model-loaded for an eagerly-loaded server.
+	// whisper-server / piper: minimal HTTP surfaces, both return 200
+	// on `/` once the listener is bound. piper's model is loaded on
+	// first request; whisper's is loaded eagerly when --model is
+	// passed at spawn time.
 	if (binary == "whisper-server") { return "/"; }
+	if (binary == "piper")          { return "/"; }
 	return "/health";
 }
 

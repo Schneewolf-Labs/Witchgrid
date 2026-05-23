@@ -1,0 +1,221 @@
+// engine_common.hml — shared scaffolding for inference engine modules
+// (llama_cpp / sd_cpp / whisper_cpp / piper_cpp).
+//
+// Each engine module owns its upstream URL, binary name, asset matcher,
+// and cmake flag mapping — but ~60% of the surface (install_root,
+// symlink-based current, schema DDL, list/activate, CUDA detection,
+// build helpers) was identical across all of them. This module hosts
+// the identical parts as named helpers; engine modules import them
+// and pass the engine-specific bits as parameters.
+//
+// Helpers are stateless and pure (or take explicit DB / FS args), so
+// they're trivially testable and engines can mix-and-match.
+
+import { exec_argv } from "@stdlib/process";
+import { exec as db_exec, query } from "@stdlib/sqlite";
+import { homedir } from "@stdlib/os";
+import { exists, is_dir, list_dir } from "@stdlib/fs";
+
+// ─── install layout ──────────────────────────────────────────────
+
+// Per-engine install root under the agent user's homedir, or a
+// /var/lib/witchgrid fallback (matches the legacy per-engine defaults
+// the original llama_cpp.install_root etc. computed inline).
+export fn install_root_for(engine: string): string {
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/" + engine; }
+	return h + "/.witchgrid/" + engine;
+}
+
+// Probe `dir` and one level of its children for any of `candidates`
+// (each candidate is a path-relative-to-dir, e.g.
+// "build/bin/sd-server"). Returns the first absolute path that exists
+// or null if none match. Mirrors the legacy find_binary_in routines.
+export fn probe_binary(dir: string, candidates: array) {
+	let absolute = [];
+	for (rel in candidates) {
+		absolute.push(dir + "/" + rel);
+	}
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) { entries = []; }
+	for (name in entries) {
+		if (name == "." || name == "..") { continue; }
+		for (rel in candidates) {
+			absolute.push(dir + "/" + name + "/" + rel);
+		}
+	}
+	for (p in absolute) {
+		if (exists(p)) { return p; }
+	}
+	return null;
+}
+
+// Resolve `<root>/current/<binary>` via the symlink, falling back to
+// the bare binary name (PATH lookup) when no install is active.
+export fn resolve_current(root: string, candidates: array, fallback_name: string): string {
+	let cur = root + "/current";
+	if (!exists(cur)) { return fallback_name; }
+	let bin = probe_binary(cur, candidates);
+	if (bin != null) { return bin; }
+	return fallback_name;
+}
+
+// ─── schema ──────────────────────────────────────────────────────
+
+// CREATE TABLE for an engine's install-job tracking table. All four
+// engines use the same shape — only the table name differs. Idempotent.
+export fn ensure_install_schema(db, table: string): null {
+	db_exec(db, "create table if not exists " + table + " ("
+		+ "id text primary key,"
+		+ "tag text not null,"
+		+ "flavor text not null,"
+		+ "source_url text not null,"
+		+ "target_dir text not null,"
+		+ "status text not null,"
+		+ "bytes_downloaded integer default 0,"
+		+ "bytes_total integer default 0,"
+		+ "error text,"
+		+ "started_at text not null,"
+		+ "completed_at text"
+		+ ")", []);
+	return null;
+}
+
+export fn new_id(db): string {
+	let r = query(db, "select hex(randomblob(8)) as id", []);
+	return r[0].id;
+}
+
+export fn iso_now(db): string {
+	let r = query(db, "select datetime('now') as ts", []);
+	return r[0].ts;
+}
+
+// ─── install listing / activation ────────────────────────────────
+
+// List installs under `root`. Each entry: {tag, path, binary,
+// is_current, has_binary}. `find` is called with each candidate
+// install dir to locate its binary (engine-specific paths). `current`
+// is the active-binary path returned by the engine's
+// current_binary_path(); we mark the install whose binary == current
+// as is_current.
+export fn list_installs_at(root: string, find, current: string): array {
+	if (!exists(root)) { return []; }
+	let entries = null;
+	try { entries = list_dir(root); } catch (e) { return []; }
+	let out = [];
+	for (name in entries) {
+		if (name == "." || name == ".." || name == "current") { continue; }
+		let path = root + "/" + name;
+		let is_d = false;
+		try { is_d = is_dir(path); } catch (e) { }
+		if (!is_d) { continue; }
+		let resolved = find(path);
+		out.push({
+			tag:        name,
+			path:       path,
+			binary:     resolved,
+			is_current: (resolved != null && current == resolved),
+			has_binary: resolved != null,
+		});
+	}
+	return out;
+}
+
+// Flip the `current` symlink to <root>/<tag>. Throws with an
+// actionable message on failure. `find` validates that the install
+// directory actually contains a binary (defensive — catches stale or
+// partial installs that would silently 'activate' as broken).
+export fn flip_current(root: string, tag: string, find, binary_name: string): null {
+	let target = root + "/" + tag;
+	if (!exists(target)) {
+		throw "no install for tag '" + tag + "' at " + target;
+	}
+	if (find(target) == null) {
+		throw "install dir exists but no " + binary_name + " binary inside " + target;
+	}
+	let cur = root + "/current";
+	let r = exec_argv(["ln", "-sfn", target, cur]);
+	if (r.exit_code != 0) {
+		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
+	}
+	return null;
+}
+
+// ─── build environment detection ─────────────────────────────────
+
+// Absolute nvcc path, or null. We resolve nvcc explicitly so cmake
+// doesn't depend on it being on the agent's PATH (it usually isn't —
+// CUDA installs under /usr/local/cuda*/bin which witchgrid-agent.sh
+// doesn't add).
+export fn detect_nvcc(): string {
+	if (exists("/usr/local/cuda/bin/nvcc")) { return "/usr/local/cuda/bin/nvcc"; }
+	let r = null;
+	try { r = exec_argv(["which", "nvcc"]); } catch (e) { return null; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return null;
+}
+
+// CUDA compute capability of GPU 0 as a CMAKE_CUDA_ARCHITECTURES
+// token (e.g. "8.9" -> "89"). Falls back to "86;89" (Ampere + Ada —
+// the current fleet) when nvidia-smi can't tell us. cmake accepts
+// either a single arch or a semicolon list.
+export fn detect_cuda_arch(): string {
+	let r = null;
+	try {
+		r = exec_argv(["nvidia-smi", "--query-gpu=compute_cap",
+			"--format=csv,noheader"]);
+	} catch (e) { return "86;89"; }
+	if (r.exit_code != 0) { return "86;89"; }
+	let lines = r.output.split("\n");
+	for (ln in lines) {
+		let s = ln.trim();
+		if (s.length == 0) { continue; }
+		let out = "";
+		let i = 0;
+		while (i < s.length) {
+			let ch = s.substr(i, 1);
+			if (ch != ".") { out = out + ch; }
+			i = i + 1;
+		}
+		if (out.length > 0) { return out; }
+	}
+	return "86;89";
+}
+
+export fn nproc_str(): string {
+	let r = null;
+	try { r = exec_argv(["nproc"]); } catch (e) { return "8"; }
+	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
+	return "8";
+}
+
+// Backend picker for source builds. Explicit flavors win; anything
+// else (typically "source") auto-detects: CUDA if nvcc, else Vulkan
+// if its headers exist, else CPU. Returns a backend tag the caller
+// translates to engine-specific cmake flags.
+export fn pick_backend(flavor: string): string {
+	if (flavor == "cuda")        { return "cuda"; }
+	if (flavor == "vulkan")      { return "vulkan"; }
+	if (flavor == "cpu")         { return "cpu"; }
+	if (flavor == "macos-arm64") { return "metal"; }
+	if (detect_nvcc() != null)                  { return "cuda"; }
+	if (exists("/usr/include/vulkan/vulkan.h")) { return "vulkan"; }
+	return "cpu";
+}
+
+// ─── tiny error-mark helper ──────────────────────────────────────
+
+// DRY for the very common "update <table> set status='error', error=?
+// where id=?" + truncate-tail-of-stderr/stdout pattern. The
+// truncation keeps DB rows from ballooning when a long build dumps
+// thousands of lines on failure.
+export fn mark_error(db, table: string, id: string, err: string, tail_limit: i32): null {
+	let t = err ?? "";
+	if (tail_limit > 0 && t.length > tail_limit) {
+		t = t.substr(t.length - tail_limit, tail_limit);
+	}
+	db_exec(db, "update " + table + " set status='error', error=? where id=?",
+		[t, id]);
+	return null;
+}

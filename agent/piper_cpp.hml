@@ -1,30 +1,36 @@
-// whisper_cpp.hml — manage whisper.cpp installs on this node.
+// piper_cpp.hml — manage piper TTS installs on this node.
 //
-// Third sibling of llama_cpp.hml / sd_cpp.hml; uses the shared
-// engine_common scaffolding for install_root / probe_binary / schema
-// / list / activate / CUDA detect / pick_backend / error-mark. This
-// module owns only the whisper-specific bits: upstream repo, binary
-// name + candidate paths, cmake flag translation, and a small
-// source_install_task that wires those into the shared build flow.
+// Fourth sibling. Uses engine_common like the other three. piper is
+// the natural pair with whisper.cpp — together they close the audio
+// loop (whisper STT in / llama chat / piper TTS out).
 //
-// Why source-only for v1: whisper.cpp's GitHub prebuilt asset naming
-// churns release-to-release (cublas vs cuda vs whisper-bin-Linux-…,
-// occasional gaps for some flavors). Source build runs on whatever
-// toolchain the node has, gives the operator full backend control
-// (cuda/vulkan/cpu/macos-arm64/source-autodetect), and is
-// reproducible. A prebuilt-download path can be added later by
-// mirroring sd_cpp.resolve_asset_url.
+// Upstream is rhasspy/piper (https://github.com/rhasspy/piper). Its
+// `piper` binary supports an HTTP server mode (`piper --http :port
+// --model voice.onnx`) that returns WAV bytes for posted text.
 //
-// Hardware customization: install `flavor` picks the cmake backend.
-// Model-size customization is per-profile at spawn time (clone the
-// audio-whisper-base starter, point at ggml-medium / ggml-large-v3).
-// Whisper models aren't catalog-able (no LLM arch metadata), so spawn
-// with the explicit `model: <abs path>` pin, same as sd-cpp.
+// Why source-only for v1: piper's GitHub-releases prebuilts are
+// architecture-specific tarballs without a stable flavor matrix
+// (artifacts are essentially per-arch CPU binaries with onnxruntime
+// bundled). Source build via cmake is the most reliable cross-host
+// path; the build's own CMake config pulls onnxruntime via piper's
+// download-libs.sh-equivalent (operator needs cmake + curl + git).
+//
+// GPU acceleration is via ONNX Runtime's CUDA execution provider,
+// which requires a CUDA-enabled onnxruntime build. piper's default
+// build script fetches the CPU onnxruntime; getting CUDA support
+// means swapping the runtime — out of scope for v1, document and
+// leave CPU as the realistic default. Whisper handles the GPU side
+// of audio; piper's CPU is fast enough for TTS at human cadence.
+//
+// Model files: rhasspy/piper-voices on HuggingFace ship .onnx + .onnx.json
+// pairs. NOT GGUF — like sd-cpp / whisper.cpp models, these aren't
+// catalogable by the agent's GGUF scanner; spawn with the explicit
+// `model: <abs path to .onnx>` pin.
 //
 // Layout per install:
-//   ~/.witchgrid/whisper-server/
-//     v1.7.4/build/bin/whisper-server     ← actual binary
-//     current -> v1.7.4                   ← active install
+//   ~/.witchgrid/piper/
+//     v1.2.0/build/piper      ← actual binary
+//     current -> v1.2.0       ← active install
 
 import { exec_argv } from "@stdlib/process";
 import { stringify, parse } from "@stdlib/json";
@@ -35,43 +41,39 @@ import {
 	install_root_for, probe_binary, resolve_current,
 	ensure_install_schema, new_id, iso_now,
 	list_installs_at, flip_current,
-	detect_nvcc, detect_cuda_arch, nproc_str, pick_backend, mark_error,
+	nproc_str, mark_error,
 } from "./engine_common";
 
-let WHISPER_REPO  = "https://github.com/ggml-org/whisper.cpp";
-let ENGINE_NAME   = "whisper-server";
-let INSTALL_TABLE = "whisper_cpp_installs";
+let PIPER_REPO    = "https://github.com/rhasspy/piper";
+let ENGINE_NAME   = "piper";
+let INSTALL_TABLE = "piper_cpp_installs";
 
-// Candidate binary paths inside an install dir. Modern whisper.cpp
-// puts the server at build/bin/whisper-server; older builds named it
-// `server` (and sometimes placed it differently). probe_binary tries
-// each + one level of child dirs.
+// piper's CMake output puts the binary at build/piper (and on macOS
+// sometimes build/Release/piper). Probe the common shapes + child
+// dirs (release archives unpack to a piper/ subdir).
 let BIN_CANDIDATES = [
-	"whisper-server", "server",
-	"bin/whisper-server", "bin/server",
-	"build/bin/whisper-server", "build/bin/server",
+	"piper",
+	"bin/piper",
+	"build/piper",
+	"build/bin/piper",
+	"build/Release/piper",
 ];
 
 fn install_root(): string {
-	return install_root_for("whisper-server");
+	return install_root_for("piper");
 }
 
 fn find_binary(dir: string) {
 	return probe_binary(dir, BIN_CANDIDATES);
 }
 
-// Auto-detect the right flavor for THIS host (operator override via
-// /whisper_cpp/install {flavor: ...}). gpu+linux → cuda (we prefer
-// CUDA over vulkan when nvcc exists; operator passes flavor=vulkan
-// to override). gpu+darwin/arm64 → macos-arm64 (CoreML in-binary).
+// Auto-detect the right flavor for THIS host. piper has no GPU path
+// in v1 (see header), so role doesn't matter — only platform does.
 export fn detect_flavor(role: string): string {
 	let p = platform();
 	let a = arch();
 	if (p == "darwin" && a == "arm64") { return "macos-arm64"; }
-	if (p == "linux" && a == "x86_64") {
-		if (role == "gpu") { return "cuda"; }
-		return "cpu";
-	}
+	if (p == "linux" && a == "x86_64") { return "cpu"; }
 	return null;
 }
 
@@ -79,7 +81,7 @@ export fn current_binary_path(): string {
 	return resolve_current(install_root(), BIN_CANDIDATES, ENGINE_NAME);
 }
 
-export fn init_whisper_cpp_schema(db): null {
+export fn init_piper_cpp_schema(db): null {
 	return ensure_install_schema(db, INSTALL_TABLE);
 }
 
@@ -92,41 +94,17 @@ export fn activate(tag: string): string {
 	return current_binary_path();
 }
 
-// Translate the shared pick_backend tag into whisper.cpp's cmake
-// flags. Returns the list of -D<flag> args to append to the cmake
-// configure command (empty list for CPU since cmake defaults cover it).
-fn cmake_flags_for(backend: string, transfer_id: string, db): array {
-	if (backend == "cuda") {
-		let nvcc = detect_nvcc();
-		if (nvcc == null) {
-			mark_error(db, INSTALL_TABLE, transfer_id,
-				"flavor=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
-					+ "(install CUDA toolkit, or use flavor=cpu/vulkan/source)", 0);
-			return null;
-		}
-		return [
-			"-DGGML_CUDA=1",
-			"-DCMAKE_CUDA_COMPILER=" + nvcc,
-			"-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch(),
-		];
-	}
-	if (backend == "vulkan") { return ["-DGGML_VULKAN=1"]; }
-	if (backend == "metal") {
-		// CoreML support is an opt-in compile flag — enable when on
-		// Apple Silicon since the perf win for whisper is large.
-		return ["-DGGML_METAL=1", "-DWHISPER_COREML=1"];
-	}
-	// cpu: no extra flags, default cmake config covers it.
-	return [];
-}
-
+// Source build. piper's CMake config pulls onnxruntime via its own
+// download script; we just invoke cmake configure + build and let
+// piper handle its deps. No backend matrix to translate (piper has
+// no GGML_CUDA-style toggle in v1).
 async fn source_install_task(db, transfer_id: string, tag: string,
                             flavor: string, target_dir: string): null {
 	db_exec(db, "update " + INSTALL_TABLE + " set status='cloning' where id=?",
 		[transfer_id]);
 	let cr = null;
 	try {
-		cr = exec_argv(["git", "clone", "--recursive", WHISPER_REPO, target_dir]);
+		cr = exec_argv(["git", "clone", "--recursive", PIPER_REPO, target_dir]);
 	} catch (e) {
 		mark_error(db, INSTALL_TABLE, transfer_id,
 			"git clone exec failed (install git?): " + e, 0);
@@ -153,8 +131,7 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 		if (!ok) {
 			mark_error(db, INSTALL_TABLE, transfer_id,
 				"git checkout '" + tag + "' failed (not a valid ref; use a "
-					+ "release tag like v1.7.4, or 'head' to build the "
-					+ "default branch)", 0);
+					+ "release tag like 2023.11.14-2, or 'head' for the default branch)", 0);
 			return null;
 		}
 	}
@@ -162,18 +139,9 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	db_exec(db, "update " + INSTALL_TABLE + " set status='building' where id=?",
 		[transfer_id]);
 	let build_dir = target_dir + "/build";
-	let backend = pick_backend(flavor);
-	let backend_flags = cmake_flags_for(backend, transfer_id, db);
-	if (backend_flags == null) { return null; }   // mark_error already fired
-
-	// WHISPER_BUILD_SERVER is sometimes off by default in older builds;
-	// force it on so we always end up with whisper-server in build/bin/.
 	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
-		"-DCMAKE_BUILD_TYPE=Release",
-		"-DWHISPER_BUILD_SERVER=ON",
-		"-DWHISPER_BUILD_EXAMPLES=ON"];
-	for (f in backend_flags) { cfg.push(f); }
-	print("[whisper_cpp] " + transfer_id + " source build backend=" + backend);
+		"-DCMAKE_BUILD_TYPE=Release"];
+	print("[piper_cpp] " + transfer_id + " source build (flavor=" + flavor + ", CPU only in v1)");
 
 	let cf = null;
 	try { cf = exec_argv(cfg); } catch (e) {
@@ -184,14 +152,16 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	if (cf.exit_code != 0) {
 		mark_error(db, INSTALL_TABLE, transfer_id,
 			"cmake configure exit " + cf.exit_code + ": "
-				+ (cf?.stderr ?? cf?.output ?? ""), 600);
+				+ (cf?.stderr ?? cf?.output ?? "") + "\n"
+				+ "(piper's build pulls onnxruntime via its own download "
+				+ "script — needs curl + a working network)", 800);
 		return null;
 	}
 
 	let bf = null;
 	try {
 		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
-			"-j", nproc_str(), "--target", "whisper-server"]);
+			"-j", nproc_str(), "--target", "piper"]);
 	} catch (e) {
 		mark_error(db, INSTALL_TABLE, transfer_id,
 			"cmake build exec failed: " + e, 0);
@@ -207,10 +177,9 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	let bin = find_binary(target_dir);
 	if (bin == null) {
 		mark_error(db, INSTALL_TABLE, transfer_id,
-			"build completed but no whisper-server binary found under "
-				+ target_dir + " (expected build/bin/whisper-server). Older "
-				+ "whisper.cpp versions build it as 'server' — check the "
-				+ "build output for the actual target name.", 0);
+			"build completed but no piper binary found under " + target_dir
+				+ " (expected build/piper). If piper's cmake split into "
+				+ "multi-config, check build/Release/piper instead.", 0);
 		return null;
 	}
 	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
@@ -221,8 +190,7 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 		"update " + INSTALL_TABLE
 		+ " set status='complete', bytes_total=?, completed_at=? where id=?",
 		[(stat == null ? 0 : stat.size), now, transfer_id]);
-	print("[whisper_cpp] " + transfer_id + " source build complete: " + tag
-		+ "/" + backend);
+	print("[piper_cpp] " + transfer_id + " source build complete: " + tag);
 	return null;
 }
 
@@ -235,10 +203,10 @@ export fn make_handlers(db, rescan_caps_after): object {
 		let tag = payload?.tag;
 		let flavor = payload?.flavor;
 		if (tag == null) {
-			return { status: 400, body: "{\"error\":\"tag required (e.g. v1.7.4, or 'head')\"}" };
+			return { status: 400, body: "{\"error\":\"tag required (e.g. 2023.11.14-2, or 'head')\"}" };
 		}
 		if (flavor == null) {
-			return { status: 400, body: "{\"error\":\"flavor required (source|cuda|vulkan|cpu|macos-arm64)\"}" };
+			return { status: 400, body: "{\"error\":\"flavor required (source|cpu|macos-arm64)\"}" };
 		}
 		let root = install_root();
 		try { make_dirs(root); } catch (e) { }
@@ -255,7 +223,7 @@ export fn make_handlers(db, rescan_caps_after): object {
 			"insert into " + INSTALL_TABLE + " "
 			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
-			[id, tag, flavor, WHISPER_REPO, target_dir, now]);
+			[id, tag, flavor, PIPER_REPO, target_dir, now]);
 		let st = spawn(source_install_task, db, id, tag, flavor, target_dir);
 		detach(st);
 		return { status: 202, body: stringify({
@@ -293,7 +261,7 @@ export fn make_handlers(db, rescan_caps_after): object {
 			return { status: 400, body: stringify({ error: "" + e }) };
 		}
 		try { rescan_caps_after(); } catch (e) {
-			eprint("[whisper_cpp] post-activate rescan failed: " + e);
+			eprint("[piper_cpp] post-activate rescan failed: " + e);
 		}
 		return { status: 200, body: stringify({
 			tag: tag, current_path: new_path,

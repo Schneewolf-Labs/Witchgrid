@@ -1,58 +1,65 @@
 // sd_cpp.hml — manage stable-diffusion.cpp installs on this node.
 //
-// Sibling of llama_cpp.hml. Same shape, same lifecycle, same `current`
-// symlink hot-swap trick — just a different upstream and binary.
-// Fetches prebuilt release archives from
-// github.com/leejet/stable-diffusion.cpp/releases and extracts them
-// into ~/.witchgrid/sd-server/<tag>/. spawn_service resolves the
-// binary via current_binary_path() (this module's) when prof.binary
-// == "sd-server", so flipping the symlink hot-swaps new spawns.
+// Second sibling of llama_cpp.hml; uses engine_common for the shared
+// install_root / probe_binary / schema / list / activate / CUDA detect
+// / pick_backend scaffolding. Per-engine bits owned here: upstream,
+// asset matcher (GitHub releases naming is unpredictable enough to
+// need API resolution rather than a URL template), source-build cmake
+// flag translation.
 //
-// Deltas vs llama_cpp.hml (deliberate, documented):
-//   1. Archives are .zip, not .tar.gz — extract with `unzip`.
-//   2. sd.cpp's asset names embed the build runner's OS version
-//      (e.g. sd-master-0665a7f-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip)
-//      and the release tag (master-602-0665a7f) differs from the
-//      asset's short form (master-0665a7f). That naming is not
-//      reconstructable by pure string templating the way llama.cpp's
-//      `llama-b9124-bin-<flavor>.tar.gz` is, so we resolve the asset's
-//      browser_download_url via the GitHub releases API (one cheap
-//      unauthenticated GET; install is a rare operator action).
-//   3. Binary is `sd-server`.
-//
-// Flavor matrix (Linux prebuilt; sd.cpp ships no Linux-CUDA binary —
-// CUDA is Windows-only upstream, so Linux GPU boxes use the Vulkan
-// build, exactly like the llama.cpp cross-vendor strategy):
-//   - macos-arm64   Apple Silicon (Metal in-binary)
-//   - vulkan        Linux NVIDIA / AMD via Vulkan; cross-vendor
-//   - rocm          Linux AMD ROCm (native; not auto-detected)
-//   - cpu           Linux CPU-only
+// Why both prebuilt + source: sd.cpp ships Ubuntu-24.04 / glibc-2.38
+// Linux prebuilts which don't run on older boxes. flavor=="source"
+// triggers a local cmake build against the node's toolchain. The
+// flavor parameter doubles as the source-build backend override
+// when the install task is invoked with cuda/vulkan/cpu/macos-arm64
+// directly (currently the API only routes flavor=="source" to source,
+// but source_install_task respects whatever flavor it receives so the
+// plumbing is ready).
 //
 // Layout per install:
 //   ~/.witchgrid/sd-server/
-//     master-602-0665a7f/
-//       <release contents>/sd-server      ← actual binary
+//     master-602-0665a7f/.../sd-server   ← actual binary
 //     current -> master-602-0665a7f       ← active install
 
 import { exec_argv } from "@stdlib/process";
 import { stringify, parse } from "@stdlib/json";
 import { exec as db_exec, query } from "@stdlib/sqlite";
-import { homedir, platform, arch } from "@stdlib/os";
-import { exists, is_dir, file_stat, list_dir, make_dirs, remove_file, rename } from "@stdlib/fs";
+import { platform, arch } from "@stdlib/os";
+import { exists, file_stat, make_dirs, remove_file } from "@stdlib/fs";
+import {
+	install_root_for, probe_binary, resolve_current,
+	ensure_install_schema, new_id, iso_now,
+	list_installs_at, flip_current,
+	detect_nvcc, detect_cuda_arch, nproc_str, pick_backend, mark_error,
+} from "./engine_common";
 
-// Where installs live. Per-build subdirs + a `current` symlink.
+let SD_REPO       = "https://github.com/leejet/stable-diffusion.cpp";
+let ENGINE_NAME   = "sd-server";
+let INSTALL_TABLE = "sd_cpp_installs";
+
+// Candidate binary paths inside an install dir (flat extracted zip,
+// child-dir layout, source build's build/bin).
+let BIN_CANDIDATES = [
+	"sd-server",
+	"bin/sd-server",
+	"build/bin/sd-server",
+];
+
 fn install_root(): string {
-	let h = homedir();
-	if (h == null || h.length == 0) { return "/var/lib/witchgrid/sd-server"; }
-	return h + "/.witchgrid/sd-server";
+	return install_root_for("sd-server");
+}
+
+fn find_binary(dir: string) {
+	return probe_binary(dir, BIN_CANDIDATES);
 }
 
 // Auto-detect the right flavor for THIS host.
 //   gpu + darwin/arm64 → macos-arm64
-//   gpu + linux        → vulkan  (works on NVIDIA + AMD)
+//   gpu + linux        → vulkan  (cross-vendor — sd.cpp ships no
+//                                 Linux CUDA prebuilt; source build
+//                                 is the path for CUDA)
 //   cpu + darwin/arm64 → macos-arm64
 //   cpu + linux        → cpu
-// Returns null when we can't pick — operator must specify explicitly.
 export fn detect_flavor(role: string): string {
 	let p = platform();
 	let a = arch();
@@ -64,17 +71,17 @@ export fn detect_flavor(role: string): string {
 	return null;
 }
 
+// ─── prebuilt asset resolution ───────────────────────────────────
+
 // True iff the GitHub asset `name` matches the requested flavor for
 // this platform. Linux assets look like
-// sd-<short>-bin-Linux-Ubuntu-<ver>-x86_64[-<flavor>].zip ; the
-// CPU build is the one with NO -vulkan/-rocm/-cuda suffix. macOS is
-// sd-<short>-bin-Darwin-macOS-<ver>-arm64.zip.
+// sd-<short>-bin-Linux-Ubuntu-<ver>-x86_64[-<flavor>].zip ; the CPU
+// build is the one with NO -vulkan/-rocm/-cuda suffix.
 fn asset_matches(name: string, flavor: string): bool {
 	if (name.find(".zip") < 0) { return false; }
 	if (flavor == "macos-arm64") {
 		return name.find("Darwin") >= 0 && name.find("arm64") >= 0;
 	}
-	// Linux flavors.
 	if (name.find("Linux") < 0 || name.find("x86_64") < 0) { return false; }
 	if (flavor == "vulkan") { return name.find("vulkan") >= 0; }
 	if (flavor == "rocm")   { return name.find("rocm") >= 0; }
@@ -85,12 +92,11 @@ fn asset_matches(name: string, flavor: string): bool {
 	return false;
 }
 
-// Resolve the browser_download_url for a (tag, flavor) pair by asking
-// the GitHub releases API for that tag and matching the asset name.
-// Throws with an actionable message on any failure. curl (not
-// @stdlib/http get_binary) for the same redirect-reliability reason
-// llama_cpp.hml documents; the API endpoint itself returns JSON
-// directly (no CDN redirect), so a plain curl is fine.
+// Resolve a (tag, flavor) pair to a browser_download_url via the
+// GitHub releases API. sd.cpp's asset names embed the build runner's
+// OS version + a short release form that can't be reconstructed by
+// pure string templating, so we ask the API rather than guess. One
+// cheap unauthenticated GET per install — install is rare.
 fn resolve_asset_url(tag: string, flavor: string): string {
 	let api = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/tags/" + tag;
 	let r = null;
@@ -119,147 +125,70 @@ fn resolve_asset_url(tag: string, flavor: string): string {
 		+ " (assets exist but none matched; check flavor or tag)";
 }
 
-// Find the sd-server binary inside an extracted install dir. The
-// release zip's internal layout isn't fixed across builds, so probe
-// the common shapes and one level of child dirs, same approach as
-// llama_cpp.find_binary_in. Returns null if nothing found.
-fn find_binary_in(dir: string) {
-	let candidates = [
-		dir + "/sd-server",
-		dir + "/bin/sd-server",
-		dir + "/build/bin/sd-server",
-	];
-	let entries = null;
-	try { entries = list_dir(dir); } catch (e) { entries = []; }
-	for (name in entries) {
-		candidates.push(dir + "/" + name + "/sd-server");
-		candidates.push(dir + "/" + name + "/bin/sd-server");
-		candidates.push(dir + "/" + name + "/build/bin/sd-server");
-	}
-	for (c in candidates) {
-		if (exists(c)) { return c; }
-	}
-	return null;
-}
-
-// Resolve the active sd-server binary. `current` symlink → its binary
-// when present, else bare "sd-server" (PATH lookup).
 export fn current_binary_path(): string {
-	let root = install_root();
-	let cur = root + "/current";
-	if (!exists(cur)) { return "sd-server"; }
-	let bin = find_binary_in(cur);
-	if (bin != null) { return bin; }
-	return "sd-server";
+	return resolve_current(install_root(), BIN_CANDIDATES, ENGINE_NAME);
 }
 
-// Install-job tracking table. Mirrors llama_cpp_installs.
 export fn init_sd_cpp_schema(db): null {
-	db_exec(db, "create table if not exists sd_cpp_installs ("
-		+ "id text primary key,"
-		+ "tag text not null,"
-		+ "flavor text not null,"
-		+ "source_url text not null,"
-		+ "target_dir text not null,"
-		+ "status text not null,"
-		+ "bytes_downloaded integer default 0,"
-		+ "bytes_total integer default 0,"
-		+ "error text,"
-		+ "started_at text not null,"
-		+ "completed_at text"
-		+ ")", []);
-	return null;
+	return ensure_install_schema(db, INSTALL_TABLE);
 }
 
-fn new_id(db): string {
-	let r = query(db, "select hex(randomblob(8)) as id", []);
-	return r[0].id;
-}
-
-fn iso_now(db): string {
-	let r = query(db, "select datetime('now') as ts", []);
-	return r[0].ts;
-}
-
-// List installed builds. [{tag, path, binary, is_current, has_binary}].
 export fn list_installed(): array {
-	let root = install_root();
-	if (!exists(root)) { return []; }
-	let entries = null;
-	try { entries = list_dir(root); } catch (e) { return []; }
-	let cur_bin = current_binary_path();
-	let out = [];
-	for (name in entries) {
-		if (name == "." || name == ".." || name == "current") { continue; }
-		let path = root + "/" + name;
-		let is_d = false;
-		try { is_d = is_dir(path); } catch (e) { }
-		if (!is_d) { continue; }
-		let resolved = find_binary_in(path);
-		out.push({
-			tag:        name,
-			path:       path,
-			binary:     resolved,
-			is_current: (resolved != null && cur_bin == resolved),
-			has_binary: resolved != null,
-		});
-	}
-	return out;
+	return list_installs_at(install_root(), find_binary, current_binary_path());
 }
 
-// Background install task — curl the zip, `unzip` it, verify the
-// binary landed. Updates status as it progresses.
+export fn activate(tag: string): string {
+	flip_current(install_root(), tag, find_binary, ENGINE_NAME);
+	return current_binary_path();
+}
+
+// ─── prebuilt install task (download zip, unzip, validate) ───────
+
 async fn install_task(db, transfer_id: string, tag: string, flavor: string,
                       url: string, target_dir: string): null {
 	let archive = target_dir + ".zip";
 
-	db_exec(db, "update sd_cpp_installs set status='downloading' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='downloading' where id=?",
 		[transfer_id]);
 	let r = null;
-	try {
-		r = exec_argv(["curl", "-fsSL", "-o", archive, url]);
-	} catch (e) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["curl exec failed (install curl?): " + e, transfer_id]);
+	try { r = exec_argv(["curl", "-fsSL", "-o", archive, url]); }
+	catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"curl exec failed (install curl?): " + e, 0);
 		return null;
 	}
 	if (r.exit_code != 0) {
-		let tail = (r?.stderr ?? r?.output ?? "");
-		if (tail.length > 256) { tail = tail.substr(tail.length - 256, 256); }
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["curl exit " + r.exit_code + ": " + tail, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"curl exit " + r.exit_code + ": " + (r?.stderr ?? r?.output ?? ""),
+			256);
 		return null;
 	}
 
-	db_exec(db, "update sd_cpp_installs set status='extracting' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='extracting' where id=?",
 		[transfer_id]);
 	try { make_dirs(target_dir); } catch (e) { }
 	let tr = null;
-	try {
-		tr = exec_argv(["unzip", "-o", archive, "-d", target_dir]);
-	} catch (e) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["unzip exec failed (install unzip?): " + e, transfer_id]);
+	try { tr = exec_argv(["unzip", "-o", archive, "-d", target_dir]); }
+	catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"unzip exec failed (install unzip?): " + e, 0);
 		return null;
 	}
 	if (tr.exit_code != 0) {
-		let tail = (tr?.stderr ?? tr?.output ?? "");
-		if (tail.length > 512) { tail = tail.substr(tail.length - 512, 512); }
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["unzip exit " + tr.exit_code + ": " + tail, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"unzip exit " + tr.exit_code + ": " + (tr?.stderr ?? tr?.output ?? ""),
+			512);
 		return null;
 	}
 
-	let bin = find_binary_in(target_dir);
+	let bin = find_binary(target_dir);
 	if (bin == null) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["extracted archive but no sd-server binary found under "
-				+ target_dir + " (tried flat, bin/, build/bin, and child dirs)",
-			 transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"extracted archive but no sd-server binary found under " + target_dir
+				+ " (tried flat, bin/, build/bin, and child dirs)", 0);
 		return null;
 	}
-	// sd-server ships without the executable bit on some release zips;
-	// chmod defensively so spawn doesn't EACCES.
+	// Some release zips ship without the executable bit. Defensive chmod.
 	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
 	try { remove_file(archive); } catch (e) { }
 
@@ -267,114 +196,58 @@ async fn install_task(db, transfer_id: string, tag: string, flavor: string,
 	try { stat = file_stat(bin); } catch (e) { }
 	let now = iso_now(db);
 	db_exec(db,
-		"update sd_cpp_installs "
-		+ "set status='complete', bytes_total=?, completed_at=? "
-		+ "where id=?",
+		"update " + INSTALL_TABLE
+		+ " set status='complete', bytes_total=?, completed_at=? where id=?",
 		[(stat == null ? 0 : stat.size), now, transfer_id]);
 	print("[sd_cpp] " + transfer_id + " complete: " + tag + "/" + flavor);
 	return null;
 }
 
-// Activate — point `current` at <tag>'s install.
-// ── source-build install ──────────────────────────────────────────
-// sd.cpp publishes ONLY Ubuntu-24.04 / glibc-2.38 Linux prebuilts, so
-// the download path can't run on older boxes (e.g. Schneewolf on
-// Pop!_OS 22.04 / glibc 2.35). flavor == "source" builds sd.cpp from
-// git against the node's own toolchain instead. This is Witchgrid's
-// first agent-managed source build; llama_cpp.hml is still
-// prebuilt-only (CUDA-native llama users hand-build + PATH it).
+// ─── source-build task ───────────────────────────────────────────
 
-let SD_REPO = "https://github.com/leejet/stable-diffusion.cpp";
-
-// Absolute nvcc path, or null. We pass it to cmake explicitly via
-// -DCMAKE_CUDA_COMPILER so the build doesn't depend on nvcc being on
-// the agent's PATH (it usually isn't — CUDA installs under
-// /usr/local/cuda*/bin which witchgrid-agent.sh doesn't add).
-fn detect_nvcc(): string {
-	if (exists("/usr/local/cuda/bin/nvcc")) { return "/usr/local/cuda/bin/nvcc"; }
-	let r = null;
-	try { r = exec_argv(["which", "nvcc"]); } catch (e) { return null; }
-	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
-	return null;
-}
-
-// Compute capability of GPU 0 as a CMAKE_CUDA_ARCHITECTURES token
-// (e.g. "8.9" -> "89"). Falls back to "86;89" (Ampere+Ada — the
-// current fleet) when nvidia-smi can't tell us.
-fn detect_cuda_arch(): string {
-	let r = null;
-	try {
-		r = exec_argv(["nvidia-smi", "--query-gpu=compute_cap",
-			"--format=csv,noheader"]);
-	} catch (e) { return "86;89"; }
-	if (r.exit_code != 0) { return "86;89"; }
-	let lines = r.output.split("\n");
-	for (ln in lines) {
-		let s = ln.trim();
-		if (s.length == 0) { continue; }
-		let out = "";
-		let i = 0;
-		while (i < s.length) {
-			let ch = s.substr(i, 1);
-			if (ch != ".") { out = out + ch; }
-			i = i + 1;
+// Translate the shared pick_backend tag into sd.cpp's cmake flags.
+// sd-cpp uses SD_* macros (not the GGML_* shared namespace whisper
+// uses), and macOS Metal is auto-enabled by sd.cpp's CMakeLists on
+// darwin/arm64 so we don't need a flag for it.
+fn cmake_flags_for(backend: string, transfer_id: string, db): array {
+	if (backend == "cuda") {
+		let nvcc = detect_nvcc();
+		if (nvcc == null) {
+			mark_error(db, INSTALL_TABLE, transfer_id,
+				"backend=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
+					+ "(install CUDA toolkit, or pick a different flavor)", 0);
+			return null;
 		}
-		if (out.length > 0) { return out; }
+		return [
+			"-DSD_CUDA=ON",
+			"-DCMAKE_CUDA_COMPILER=" + nvcc,
+			"-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch(),
+		];
 	}
-	return "86;89";
+	if (backend == "vulkan") { return ["-DSD_VULKAN=ON"]; }
+	// cpu / metal: no extra flags.
+	return [];
 }
 
-fn nproc_str(): string {
-	let r = null;
-	try { r = exec_argv(["nproc"]); } catch (e) { return "8"; }
-	if (r.exit_code == 0 && r.output.trim().length > 0) { return r.output.trim(); }
-	return "8";
-}
-
-// Decide which backend to enable in the cmake configure step. The
-// explicit flavors are pass-throughs (operator forced it); anything
-// else (including "source") falls through to "best available"
-// autodetect — CUDA if nvcc is on the box, else Vulkan if its
-// headers are installed, else CPU. macOS Metal is enabled by sd-cpp's
-// own CMakeLists on darwin/arm64 so we don't need a flag for it.
-// (Mirrors whisper_cpp.pick_backend for cross-engine consistency.)
-fn pick_backend(flavor: string): string {
-	if (flavor == "cuda")   { return "cuda"; }
-	if (flavor == "vulkan") { return "vulkan"; }
-	if (flavor == "cpu")    { return "cpu"; }
-	if (detect_nvcc() != null)                  { return "cuda"; }
-	if (exists("/usr/include/vulkan/vulkan.h")) { return "vulkan"; }
-	return "cpu";
-}
-
-// Build sd.cpp from source into target_dir. CUDA if nvcc is present
-// (best perf on the NVIDIA fleet), else Vulkan if the dev headers are
-// installed, else CPU. The cmake build is multi-minute; this runs in
-// the same detached task install_task uses, so status sits at
-// 'building' until it returns (do_list surfaces it).
 async fn source_install_task(db, transfer_id: string, tag: string,
                             flavor: string, target_dir: string): null {
-	db_exec(db, "update sd_cpp_installs set status='cloning' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='cloning' where id=?",
 		[transfer_id]);
 	let cr = null;
 	try {
 		cr = exec_argv(["git", "clone", "--recursive", SD_REPO, target_dir]);
 	} catch (e) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["git clone exec failed (install git?): " + e, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"git clone exec failed (install git?): " + e, 0);
 		return null;
 	}
 	if (cr.exit_code != 0) {
-		let t = (cr?.stderr ?? cr?.output ?? "");
-		if (t.length > 400) { t = t.substr(t.length - 400, 400); }
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["git clone exit " + cr.exit_code + ": " + t, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"git clone exit " + cr.exit_code + ": " + (cr?.stderr ?? cr?.output ?? ""),
+			400);
 		return null;
 	}
-	// tag is the install label. Unless it's a "build HEAD" sentinel,
-	// pin the checkout to it so the install is reproducible and matches
-	// the prebuilt path's tag semantics. A miss is a hard error (don't
-	// silently ship a different commit than asked for).
+
 	let tl = tag.lower();
 	if (tl != "head" && tl != "main" && tl != "master" && tl != "latest") {
 		let ok = true;
@@ -387,76 +260,63 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 				"--init", "--recursive"]); } catch (e) { }
 		}
 		if (!ok) {
-			db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-				["git checkout '" + tag + "' failed (not a valid ref; use a "
+			mark_error(db, INSTALL_TABLE, transfer_id,
+				"git checkout '" + tag + "' failed (not a valid ref; use a "
 					+ "release tag like master-602-0665a7f, or 'head' to build "
-					+ "the default branch)", transfer_id]);
+					+ "the default branch)", 0);
 			return null;
 		}
 	}
 
-	db_exec(db, "update sd_cpp_installs set status='building' where id=?",
+	db_exec(db, "update " + INSTALL_TABLE + " set status='building' where id=?",
 		[transfer_id]);
 	let build_dir = target_dir + "/build";
-	let cfg = ["cmake", "-S", target_dir, "-B", build_dir,
-		"-DCMAKE_BUILD_TYPE=Release"];
 	let backend = pick_backend(flavor);
-	if (backend == "cuda") {
-		let nvcc = detect_nvcc();
-		if (nvcc == null) {
-			db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-				["backend=cuda but nvcc not found on PATH or /usr/local/cuda/bin "
-					+ "(install CUDA toolkit, or pick a different flavor)",
-				 transfer_id]);
-			return null;
-		}
-		cfg.push("-DSD_CUDA=ON");
-		cfg.push("-DCMAKE_CUDA_COMPILER=" + nvcc);
-		cfg.push("-DCMAKE_CUDA_ARCHITECTURES=" + detect_cuda_arch());
-	} else if (backend == "vulkan") {
-		cfg.push("-DSD_VULKAN=ON");
-	}
-	// cpu (and darwin/arm64 Metal-by-default): no extra flags.
+	let backend_flags = cmake_flags_for(backend, transfer_id, db);
+	if (backend_flags == null) { return null; }
+
+	let cfg = ["cmake", "-S", target_dir, "-B", build_dir, "-DCMAKE_BUILD_TYPE=Release"];
+	for (f in backend_flags) { cfg.push(f); }
 	print("[sd_cpp] " + transfer_id + " source build backend=" + backend);
+
 	let cf = null;
 	try { cf = exec_argv(cfg); } catch (e) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["cmake configure exec failed (install cmake?): " + e, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake configure exec failed (install cmake?): " + e, 0);
 		return null;
 	}
 	if (cf.exit_code != 0) {
-		let t = (cf?.stderr ?? cf?.output ?? "");
-		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["cmake configure exit " + cf.exit_code + ": " + t, transfer_id]);
-		return null;
-	}
-	let bf = null;
-	try {
-		// --target sd-server: only build the server binary we ship.
-		// sd.cpp's CMake produces ~half a dozen example/util binaries
-		// (sd CLI, esrgan tooling, etc.) that we don't use and never
-		// touch — skipping them noticeably cuts build wall time.
-		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
-			"-j", nproc_str(), "--target", "sd-server"]);
-	} catch (e) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["cmake build exec failed: " + e, transfer_id]);
-		return null;
-	}
-	if (bf.exit_code != 0) {
-		let t = (bf?.stderr ?? bf?.output ?? "");
-		if (t.length > 600) { t = t.substr(t.length - 600, 600); }
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["cmake build exit " + bf.exit_code + ": " + t, transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake configure exit " + cf.exit_code + ": "
+				+ (cf?.stderr ?? cf?.output ?? ""), 600);
 		return null;
 	}
 
-	let bin = find_binary_in(target_dir);
+	let bf = null;
+	try {
+		// --target sd-server: only build the server binary we ship.
+		// sd.cpp produces several example/util binaries (sd CLI, esrgan
+		// tooling, …) that we never touch — skipping them cuts build
+		// wall time noticeably.
+		bf = exec_argv(["cmake", "--build", build_dir, "--config", "Release",
+			"-j", nproc_str(), "--target", "sd-server"]);
+	} catch (e) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake build exec failed: " + e, 0);
+		return null;
+	}
+	if (bf.exit_code != 0) {
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"cmake build exit " + bf.exit_code + ": "
+				+ (bf?.stderr ?? bf?.output ?? ""), 600);
+		return null;
+	}
+
+	let bin = find_binary(target_dir);
 	if (bin == null) {
-		db_exec(db, "update sd_cpp_installs set status='error', error=? where id=?",
-			["build completed but no sd-server binary found under "
-				+ target_dir + " (expected build/bin/sd-server)", transfer_id]);
+		mark_error(db, INSTALL_TABLE, transfer_id,
+			"build completed but no sd-server binary found under "
+				+ target_dir + " (expected build/bin/sd-server)", 0);
 		return null;
 	}
 	try { exec_argv(["chmod", "+x", bin]); } catch (e) { }
@@ -464,34 +324,16 @@ async fn source_install_task(db, transfer_id: string, tag: string,
 	try { stat = file_stat(bin); } catch (e) { }
 	let now = iso_now(db);
 	db_exec(db,
-		"update sd_cpp_installs "
-		+ "set status='complete', bytes_total=?, completed_at=? where id=?",
+		"update " + INSTALL_TABLE
+		+ " set status='complete', bytes_total=?, completed_at=? where id=?",
 		[(stat == null ? 0 : stat.size), now, transfer_id]);
 	print("[sd_cpp] " + transfer_id + " source build complete: " + tag
 		+ "/" + backend);
 	return null;
 }
 
-export fn activate(tag: string): string {
-	let root = install_root();
-	let target = root + "/" + tag;
-	if (!exists(target)) {
-		throw "no install for tag '" + tag + "' at " + target;
-	}
-	if (find_binary_in(target) == null) {
-		throw "install dir exists but no sd-server binary inside " + target;
-	}
-	let cur = root + "/current";
-	let r = exec_argv(["ln", "-sfn", target, cur]);
-	if (r.exit_code != 0) {
-		throw "ln -sfn failed: " + (r?.stderr ?? r?.output ?? "");
-	}
-	return current_binary_path();
-}
+// ─── HTTP handlers ───────────────────────────────────────────────
 
-// HTTP handlers. Shape matches llama_cpp.make_handlers so agent.hml
-// wires them identically. rescan_caps_after re-introspects after a
-// symlink flip.
 export fn make_handlers(db, rescan_caps_after): object {
 	let do_install = fn(req): object {
 		let payload = null;
@@ -512,10 +354,6 @@ export fn make_handlers(db, rescan_caps_after): object {
 		let id = new_id(db);
 		let now = iso_now(db);
 
-		// flavor == "source": git clone + cmake build on this node
-		// (the only path that works on boxes whose glibc predates
-		// sd.cpp's Ubuntu-24.04 prebuilts). The build dir must not
-		// already exist — git clone refuses a non-empty target.
 		if (flavor == "source") {
 			if (exists(target_dir)) {
 				return { status: 409, body: stringify({
@@ -524,7 +362,7 @@ export fn make_handlers(db, rescan_caps_after): object {
 				})};
 			}
 			db_exec(db,
-				"insert into sd_cpp_installs "
+				"insert into " + INSTALL_TABLE + " "
 				+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 				+ "values (?, ?, ?, ?, ?, 'queued', ?)",
 				[id, tag, "source", SD_REPO, target_dir, now]);
@@ -537,14 +375,13 @@ export fn make_handlers(db, rescan_caps_after): object {
 		}
 
 		// Prebuilt download path. Resolve the asset URL up front so a
-		// bad tag/flavor fails the request synchronously with a clear
-		// 400 (mirrors llama_cpp's pure asset_url()).
+		// bad tag/flavor fails the request synchronously with a 400.
 		let url = null;
 		try { url = resolve_asset_url(tag, flavor); } catch (e) {
 			return { status: 400, body: stringify({ error: "" + e }) };
 		}
 		db_exec(db,
-			"insert into sd_cpp_installs "
+			"insert into " + INSTALL_TABLE + " "
 			+ "(id, tag, flavor, source_url, target_dir, status, started_at) "
 			+ "values (?, ?, ?, ?, ?, 'queued', ?)",
 			[id, tag, flavor, url, target_dir, now]);
@@ -558,8 +395,8 @@ export fn make_handlers(db, rescan_caps_after): object {
 	let do_list = fn(req): object {
 		let installs = query(db,
 			"select id, tag, flavor, status, bytes_total, error, started_at, completed_at "
-			+ "from sd_cpp_installs "
-			+ "where status in ('queued','downloading','extracting') "
+			+ "from " + INSTALL_TABLE + " "
+			+ "where status in ('queued','downloading','extracting','cloning','building') "
 			+ "   or started_at > datetime('now','-1 hour') "
 			+ "order by started_at desc",
 			[]);
