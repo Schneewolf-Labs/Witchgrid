@@ -847,70 +847,105 @@ fn service_healthy(pid: i32, binary: string): bool {
 }
 
 // Returns the number of services respawned this tick (for logging).
+//
+// Two-phase by design: phase 1 reads the running rows and classifies
+// them; phase 2 does all the inserts/updates. We must NOT write to the
+// services table while iterating a query over it — SQLite can re-yield
+// rows inserted mid-scan, which made an earlier version respawn its own
+// fresh spawns in a runaway loop (duplicate servers on every port). The
+// per-port guard is the belt to that suspenders: never start a second
+// server on a port already served by a healthy row, and respawn each
+// port at most once per tick.
 export fn reconcile_services(db, caps_ref): i32 {
 	if (!get_auto_restart(db)) {
 		// Watchdog off — plain reap so dead rows still leave 'running'.
 		return 0 - reap_zombie_services(db);   // negative = "reaped, not restarted"
 	}
+
+	// ── phase 1: read-only classification ──────────────────────────
 	let rows = query(db,
 		"select id, profile, model_path, pid, port, profile_json, gpus_json, "
 		+ "tensor_split_json, restart_count, "
 		+ "(strftime('%s','now') - strftime('%s', started_at)) as uptime_s "
 		+ "from services where state = 'running'", []);
-	let restarted = 0;
+	let dead = [];
+	let live_ports = {};   // ports already served by a healthy 'running' row
 	for (row in rows) {
 		let prof = null;
 		try { if (row.profile_json != null) { prof = parse(row.profile_json); } } catch (e) { prof = null; }
 		let binary = prof?.binary ?? "llama-server";
-		if (service_healthy(row.pid, binary)) { continue; }
+		if (service_healthy(row.pid, binary)) {
+			live_ports["" + row.port] = true;
+			continue;
+		}
+		dead.push({
+			id: row.id, profile: row.profile, model_path: row.model_path,
+			port: row.port, prof: prof, binary: binary,
+			gpus_json: row.gpus_json, tensor_split_json: row.tensor_split_json,
+			restart_count: row?.restart_count ?? 0, uptime_s: row?.uptime_s,
+		});
+	}
 
-		// Service is down. Can't rebuild it without profile + model → just
-		// soft-delete (an old pre-profile_json row, or a wiped sqlite).
-		if (prof == null || row.model_path == null) {
-			db_exec(db, "update services set state = 'dead' where id = ?", [row.id]);
-			print("[watchdog] " + row.profile
+	// ── phase 2: act (inserts/updates, no longer scanning the table) ──
+	let restarted = 0;
+	let handled_ports = {};   // ports we (re)spawned this tick
+	for (d in dead) {
+		let pkey = "" + d.port;
+		// Duplicate-row guard: this port is already served (a healthy row)
+		// or we just respawned it — retire this stale row instead of
+		// stacking a second server on the same port.
+		if (live_ports.has(pkey) || handled_ports.has(pkey)) {
+			db_exec(db, "update services set state = 'dead' where id = ?", [d.id]);
+			continue;
+		}
+
+		// Can't rebuild without profile + model → soft-delete (old
+		// pre-profile_json row, or a wiped sqlite).
+		if (d.prof == null || d.model_path == null) {
+			db_exec(db, "update services set state = 'dead' where id = ?", [d.id]);
+			print("[watchdog] " + d.profile
 				+ " down but no profile metadata to respawn — marked dead");
 			continue;
 		}
 
 		// Crash-loop accounting. uptime_s ≈ how long it actually ran
 		// (detection lag ≤ one heartbeat); a long run resets the counter.
-		let prior = row?.restart_count ?? 0;
-		let stable = (row?.uptime_s != null && row.uptime_s >= STABLE_SECONDS);
-		let next_count = stable ? 1 : (prior + 1);
+		let stable = (d.uptime_s != null && d.uptime_s >= STABLE_SECONDS);
+		let next_count = stable ? 1 : (d.restart_count + 1);
 		if (next_count > MAX_RAPID_RESTARTS) {
-			db_exec(db, "update services set state = 'failed' where id = ?", [row.id]);
-			print("[watchdog] " + row.profile + " crash-looping ("
-				+ prior + " rapid restarts) — parked in 'failed'. Fix the "
-				+ "underlying cause and re-spawn it manually.");
+			db_exec(db, "update services set state = 'failed' where id = ?", [d.id]);
+			print("[watchdog] " + d.profile + " crash-looping ("
+				+ d.restart_count + " rapid restarts) — parked in 'failed'. Fix "
+				+ "the underlying cause and re-spawn it manually.");
 			continue;
 		}
 
 		let gpus = null;
 		let tsplit = null;
-		try { if (row.gpus_json != null) { gpus = parse(row.gpus_json); } } catch (e) { }
-		try { if (row.tensor_split_json != null) { tsplit = parse(row.tensor_split_json); } } catch (e) { }
-		let caps = caps_for_binary(caps_ref, binary);
-		let bin = binpath_for_binary(binary);
+		try { if (d.gpus_json != null) { gpus = parse(d.gpus_json); } } catch (e) { }
+		try { if (d.tensor_split_json != null) { tsplit = parse(d.tensor_split_json); } } catch (e) { }
+		let caps = caps_for_binary(caps_ref, d.binary);
+		let bin = binpath_for_binary(d.binary);
 		try {
-			let svc = spawn_service(db, row.profile, prof, row.model_path,
-				i32(row.port), gpus, tsplit, caps, bin);
+			let svc = spawn_service(db, d.profile, d.prof, d.model_path,
+				i32(d.port), gpus, tsplit, caps, bin);
 			// Old row → dead; carry the climbing count onto the new row.
-			db_exec(db, "update services set state = 'dead' where id = ?", [row.id]);
+			db_exec(db, "update services set state = 'dead' where id = ?", [d.id]);
 			db_exec(db, "update services set restart_count = ? where id = ?",
 				[next_count, svc.id]);
+			handled_ports[pkey] = true;
 			restarted = restarted + 1;
-			print("[watchdog] restarted " + row.profile + " on port "
-				+ row.port + " (pid " + svc.pid + ", attempt " + next_count + ")");
+			print("[watchdog] restarted " + d.profile + " on port "
+				+ d.port + " (pid " + svc.pid + ", attempt " + next_count + ")");
 		} catch (e) {
 			// Spawn failed (port still held by the dying child, OOM, etc).
 			// Keep the row 'running' but reset started_at to now and bump
 			// the count so the next tick retries with backoff accounting —
-			// and the crash-loop guard eventually parks it in 'failed'.
+			// the crash-loop guard eventually parks it in 'failed'.
 			db_exec(db,
 				"update services set started_at = datetime('now'), restart_count = ? where id = ?",
-				[next_count, row.id]);
-			print("[watchdog] failed to restart " + row.profile
+				[next_count, d.id]);
+			print("[watchdog] failed to restart " + d.profile
 				+ " (attempt " + next_count + "): " + e);
 		}
 	}
