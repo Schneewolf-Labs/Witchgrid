@@ -2637,6 +2637,28 @@ function editNode(node_id, state) {
   }));
 }
 
+// Auto-restart watchdog toggle — per-row button in the nodes table.
+// PUTs to CP which proxies to the agent's /settings (agent owns the
+// knob). `enable` is the desired next state (bool). Refreshes the nodes
+// panel in place, like stopService.
+async function toggleAutoRestart(node_id, enable) {
+  const verb = enable ? 'enable' : 'disable';
+  if (!confirm(verb + ' auto-restart on ' + node_id + '?')) return;
+  const r = await fetch('/api/nodes/' + encodeURIComponent(node_id) + '/auto-restart', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ auto_restart: enable }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    alert('Toggle failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  const panel = document.querySelector('[hx-get=\"/ui/nodes\"]');
+  if (panel && window.htmx) { window.htmx.trigger(panel, 'load'); }
+  else { window.location.reload(); }
+}
+
 async function deleteProfile(name) {
   if (!confirm('Delete profile \"' + name + '\"?')) return;
   const r = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });

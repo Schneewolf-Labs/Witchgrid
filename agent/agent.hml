@@ -52,7 +52,7 @@ import { homedir } from "@stdlib/os";
 import { exists, make_dirs } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
@@ -218,10 +218,18 @@ fn collect_known_pids(db): array {
 // tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
                         agent_url: string, canonical_dir: string,
-                        extra_dirs, models_ref, runtime_ref, db,
+                        extra_dirs, models_ref, runtime_ref, caps_ref, db,
                         interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
+		// Supervisor tick: respawn any service that has died (when
+		// auto_restart is on) before reporting state, so the heartbeat's
+		// runtime/unmanaged snapshot reflects the freshly-restarted pids.
+		try {
+			reconcile_services(db, caps_ref);
+		} catch (e) {
+			eprint("[watchdog] reconcile error: " + e);
+		}
 		let hw = probe(canonical_dir, extra_dirs);
 		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));
 		try {
@@ -234,6 +242,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				models:    models_ref.entries,
 				runtime:   runtime_ref.value,
 				unmanaged_processes: unmanaged,
+				auto_restart: get_auto_restart(db),
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -423,6 +432,7 @@ fn main(): null {
 	// services table to know which PIDs are ours vs. the rest.
 	let db = open_db(DB_PATH);
 	init_services_schema(db);
+	init_agent_settings_schema(db);
 	init_transfers_schema(db);
 	init_llama_cpp_schema(db);
 	init_sd_cpp_schema(db);
@@ -439,24 +449,29 @@ fn main(): null {
 		runtime:   runtime_ref.value,
 		unmanaged_processes: probe_unmanaged_procs(hw.gpus,
 			collect_known_pids(db)),
+		auto_restart: get_auto_restart(db),
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
+	// caps_ref rides along so the per-tick reconcile (auto-restart
+	// watchdog) can resolve a respawned service's capabilities; it's a
+	// holder object so a llama_cpp/activate hot-swap is reflected live,
+	// same as runtime_ref/models_ref.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
 	               canonical_dir, extra_dirs, models_ref, runtime_ref,
-	               db, HEARTBEAT_SECONDS);
+	               caps_ref, db, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
-	let reaped = reap_zombie_services(db);
-	if (reaped > 0) {
-		print("[agent] reaped " + reaped + " zombie service rows from prior run");
-	}
-	// Surface any same-uid llama-servers we don't have rows for —
-	// catches the "agent's sqlite was wiped but children survived"
-	// case + cross-checks against PID recycling. No auto-adoption
-	// (we lack the original profile metadata to fabricate a row);
-	// operator decides whether to claim or kill.
+	// Boot recovery, in order:
+	//   1. discover_orphan_* — re-adopt any of our llama/sd servers that
+	//      outlived an agent crash (children reparented via setsid). These
+	//      flip matching soft-deleted rows back to 'running'.
+	//   2. reconcile_services — bring the desired set back up. After a host
+	//      reboot the pre-reboot 'running' rows have dead pids; with
+	//      auto_restart on, reconcile respawns them now (rather than
+	//      waiting for the first heartbeat tick). With it off, reconcile
+	//      reaps them. This supersedes the old standalone boot reap.
 	try {
 		let uid_r = exec_argv(["id", "-u"]);
 		if (uid_r.exit_code == 0) {
@@ -465,6 +480,15 @@ fn main(): null {
 			discover_orphan_sd_servers(db, our_uid);
 		}
 	} catch (e) { }
+	try {
+		let restarted = reconcile_services(db, caps_ref);
+		if (restarted > 0) {
+			print("[agent] auto-restarted " + restarted
+				+ " service(s) from the previous run");
+		}
+	} catch (e) {
+		eprint("[agent] boot reconcile error: " + e);
+	}
 	print("[agent] sqlite ready: " + DB_PATH);
 
 	// Introspect the local llama-server binary once at boot so CP can
@@ -535,6 +559,10 @@ fn main(): null {
 		{ method: "GET",  path: "/services",      handler: svc.list },
 		{ method: "POST", path: "/services/stop", handler: svc.stop },
 		{ method: "GET",  path: "/services/log/", prefix: true, handler: svc.log },
+		// Per-agent settings (auto-restart watchdog toggle). CP proxies
+		// these for the dashboard; default-on so a fresh agent supervises.
+		{ method: "GET",  path: "/settings",      handler: svc.get_settings },
+		{ method: "PUT",  path: "/settings",      handler: svc.put_settings },
 		// /profiles gone in v0.7 — profiles live on CP. The handler
 		// stub returns 410; route left out so 404 is the response.
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {

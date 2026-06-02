@@ -201,6 +201,26 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 		if (state == "draining") { state_class = "badge-state-draining"; }
 		else if (state == "disabled") { state_class = "badge-state-disabled"; }
 
+		// auto-restart watchdog: a second badge under the state badge, plus
+		// a toggle button in the actions cell. Tri-state: on / manual /
+		// (nothing when the agent is too old to report it).
+		let ar = n?.auto_restart;
+		let ar_badge = "";
+		let ar_btn = "";
+		if (ar == true) {
+			ar_badge = "<br><span class=\"badge badge-state-active\" "
+				+ "style=\"margin-top:4px\" title=\"dead services are respawned automatically\">⟳ auto</span>";
+			ar_btn = "<button class=\"row-action\" "
+				+ "onclick=\"toggleAutoRestart('" + esc(n.node_id) + "',false)\" "
+				+ "title=\"stop auto-restarting this node's services\">disable auto-restart</button>";
+		} else if (ar == false) {
+			ar_badge = "<br><span class=\"badge badge-state-disabled\" "
+				+ "style=\"margin-top:4px\" title=\"dead services are NOT respawned\">⟳ manual</span>";
+			ar_btn = "<button class=\"row-action\" "
+				+ "onclick=\"toggleAutoRestart('" + esc(n.node_id) + "',true)\" "
+				+ "title=\"respawn this node's services automatically on crash/reboot\">enable auto-restart</button>";
+		}
+
 		// Show llama-server build under the node name when reported
 		// (some nodes might be CPU-only with no llama-server installed).
 		let runtime_line = "";
@@ -214,7 +234,7 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 			+ "<td><strong>" + esc(n.node_id) + "</strong>"
 				+ "<br><span class=\"id\">" + esc(n.hostname) + " · " + esc(n.role) + "</span>"
 				+ runtime_line + "</td>"
-			+ "<td><span class=\"badge " + state_class + "\">" + esc(state) + "</span></td>"
+			+ "<td><span class=\"badge " + state_class + "\">" + esc(state) + "</span>" + ar_badge + "</td>"
 			+ "<td" + last_class + ">" + n.age_seconds + "s ago</td>"
 			+ "<td>";
 
@@ -341,7 +361,7 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 			+ "onclick=\"editNode('" + esc(n.node_id) + "','" + esc(state) + "')\""
 			+ ">options</button>";
 
-		html = html + "</td><td class=\"row-actions\">" + opts_btn + "</td></tr>\n";
+		html = html + "</td><td class=\"row-actions\">" + opts_btn + ar_btn + "</td></tr>\n";
 	}
 	html = html + "</tbody></table>";
 	return html;

@@ -29,6 +29,14 @@ import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
 import { sleep } from "@stdlib/time";
 import { render_argv } from "./intent";
+// Binary-path resolvers for the auto-restart watchdog (reconcile_services).
+// reconcile respawns dead services itself, so it needs to resolve a
+// profile's binary the same way agent.hml's spawn path does. No import
+// cycle: only agent.hml imports services.hml, never these engine modules.
+import { current_binary_path } from "./llama_cpp";
+import { current_binary_path as sd_current_binary_path } from "./sd_cpp";
+import { current_binary_path as wcpp_current_binary_path } from "./whisper_cpp";
+import { current_binary_path as pcpp_current_binary_path } from "./piper_cpp";
 
 // IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
 // keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
@@ -85,6 +93,54 @@ export fn init_services_schema(db): null {
 	try {
 		db_exec(db, "alter table services add column profile_json text", []);
 	} catch (e) { }
+	// gpus_json / tensor_split_json: the GPU pinning (CUDA_VISIBLE_DEVICES
+	// indices) and tensor-split weights aren't recoverable from args_json
+	// — gpus is passed via env, not argv — so the auto-restart watchdog
+	// can't faithfully respawn a pinned service without them. Persist both
+	// at spawn so reconcile_services rebuilds the exact placement.
+	try {
+		db_exec(db, "alter table services add column gpus_json text", []);
+	} catch (e) { }
+	try {
+		db_exec(db, "alter table services add column tensor_split_json text", []);
+	} catch (e) { }
+	// restart_count: crash-loop bookkeeping for the watchdog. Carried
+	// across respawns so a service that keeps dying gets parked in
+	// 'failed' instead of looping forever.
+	try {
+		db_exec(db, "alter table services add column restart_count integer not null default 0", []);
+	} catch (e) { }
+	return null;
+}
+
+// ── agent settings ──────────────────────────────────────────────────────
+// Tiny key/value store for per-agent runtime knobs, mirroring CP's
+// cp_settings pattern. Currently just `auto_restart` — the watchdog
+// toggle — which defaults to 'true' so a fresh agent supervises its
+// services (respawn on crash/reboot) without any operator setup.
+
+export fn init_agent_settings_schema(db): null {
+	db_exec(db, "create table if not exists agent_settings ("
+		+ "key text primary key,"
+		+ "value text not null"
+		+ ")", []);
+	db_exec(db,
+		"insert or ignore into agent_settings (key, value) values ('auto_restart', 'true')",
+		[]);
+	return null;
+}
+
+export fn get_auto_restart(db): bool {
+	let r = query(db, "select value from agent_settings where key = 'auto_restart'", []);
+	if (r.length == 0) { return true; }   // default-on if the row is missing
+	return r[0].value == "true";
+}
+
+export fn set_auto_restart(db, on: bool): null {
+	db_exec(db,
+		"insert into agent_settings (key, value) values ('auto_restart', ?) "
+		+ "on conflict(key) do update set value = excluded.value",
+		[on ? "true" : "false"]);
 	return null;
 }
 
@@ -126,14 +182,21 @@ export fn reap_zombie_services(db): i32 {
 			reaped = reaped + 1;
 		}
 	}
-	// Prune ancient soft-deleted rows. Keep enough recent history
-	// for adoption to work across the kinds of restart windows that
-	// happen during normal ops (CP upgrades, agent bounces).
+	prune_service_history(db);
+	return reaped;
+}
+
+// Prune ancient soft-deleted rows. Keep enough recent history for
+// adoption to work across the kinds of restart windows that happen
+// during normal ops (CP upgrades, agent bounces). Shared by
+// reap_zombie_services and reconcile_services so history is pruned on
+// whichever path is doing the per-tick cleanup.
+fn prune_service_history(db): null {
 	db_exec(db,
-		"delete from services where state in ('dead', 'stopped') "
+		"delete from services where state in ('dead', 'stopped', 'failed') "
 		+ "and started_at < datetime('now', ?)",
 		["-" + ADOPTION_HISTORY_DAYS + " days"]);
-	return reaped;
+	return null;
 }
 
 // True iff /proc/<pid>/cmdline names a llama-server binary. Used by
@@ -663,10 +726,15 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// agent restart with sqlite intact OR after sqlite wipe (when
 	// adoption falls back to log-only because no row exists at all).
 	let pjson = stringify(prof);
+	// Persist placement so the watchdog can respawn with identical GPU
+	// pinning (gpus → CUDA_VISIBLE_DEVICES, not visible in argv) and
+	// tensor-split weights. Null when unpinned/auto.
+	let gjson = (gpus != null && gpus.length > 0) ? stringify(gpus) : null;
+	let tjson = (tensor_split != null) ? stringify(tensor_split) : null;
 	db_exec(db,
-		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version, profile_json, state) "
-		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
-		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv, pjson]);
+		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version, profile_json, gpus_json, tensor_split_json, state) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
+		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv, pjson, gjson, tjson]);
 
 	return {
 		id: id,
@@ -720,6 +788,134 @@ export fn stop_service(db, id: string): bool {
 	// the previous llama-server hadn't yet exited.
 	db_exec(db, "update services set state = 'stopped' where id = ?", [id]);
 	return true;
+}
+
+// ── auto-restart watchdog ───────────────────────────────────────────────
+// reconcile_services is the supervisor tick: called once at boot and once
+// per heartbeat from agent.hml. It brings the running set back in line
+// with the desired set (every row still marked 'running' in sqlite).
+//
+//   auto_restart OFF → behave like reap_zombie_services: soft-delete any
+//     'running' row whose process is gone. The operator opted out of
+//     supervision, so we just keep /services honest.
+//   auto_restart ON  → respawn dead services from their stored
+//     profile/model/port/gpus, carrying a restart_count for crash-loop
+//     protection.
+//
+// This is also the reboot-recovery path: after a host reboot the agent
+// restarts, its sqlite still holds the pre-reboot 'running' rows, their
+// pids are dead, and reconcile respawns them. The agent-crash-children-
+// survived case is a no-op here (pids still alive + ours → healthy).
+//
+// Crash-loop guard: a service that dies again within STABLE_SECONDS of
+// its last (re)start bumps restart_count; once it exceeds
+// MAX_RAPID_RESTARTS the row is parked in 'failed' and left alone, so a
+// genuinely-broken service (bad model, missing CUDA, contended port)
+// doesn't spin forever. A service that stayed up past STABLE_SECONDS
+// resets the count — "crashed once after a day" is treated as fresh.
+let STABLE_SECONDS = 120;
+let MAX_RAPID_RESTARTS = 5;
+
+fn caps_for_binary(caps_ref, binary) {
+	if (binary == "llama-server")   { return caps_ref?.llama_server ?? {}; }
+	if (binary == "sd-server")      { return caps_ref?.sd_server ?? {}; }
+	if (binary == "whisper-server") { return caps_ref?.whisper_server ?? {}; }
+	if (binary == "piper")          { return caps_ref?.piper ?? {}; }
+	return {};
+}
+
+fn binpath_for_binary(binary: string): string {
+	if (binary == "llama-server")   { return current_binary_path(); }
+	if (binary == "sd-server")      { return sd_current_binary_path(); }
+	if (binary == "whisper-server") { return wcpp_current_binary_path(); }
+	if (binary == "piper")          { return pcpp_current_binary_path(); }
+	return binary;
+}
+
+// Is the process at `pid` still one of ours for this profile's binary?
+// Mirrors reap's liveness logic but binary-aware (sd-server vs llama).
+fn service_healthy(pid: i32, binary: string): bool {
+	if (!process_alive(pid)) { return false; }
+	if (binary == "sd-server") { return is_our_sd_server(pid); }
+	// whisper-server / piper / llama-server: treat a live pid as healthy.
+	// is_our_llama_server only matches llama; for whisper/piper we can't
+	// cheaply fingerprint, so a live pid is good enough (PID-recycle on a
+	// short-lived CPU server is vanishingly unlikely and self-heals next
+	// tick if it does).
+	if (binary == "llama-server") { return is_our_llama_server(pid); }
+	return true;
+}
+
+// Returns the number of services respawned this tick (for logging).
+export fn reconcile_services(db, caps_ref): i32 {
+	if (!get_auto_restart(db)) {
+		// Watchdog off — plain reap so dead rows still leave 'running'.
+		return 0 - reap_zombie_services(db);   // negative = "reaped, not restarted"
+	}
+	let rows = query(db,
+		"select id, profile, model_path, pid, port, profile_json, gpus_json, "
+		+ "tensor_split_json, restart_count, "
+		+ "(strftime('%s','now') - strftime('%s', started_at)) as uptime_s "
+		+ "from services where state = 'running'", []);
+	let restarted = 0;
+	for (row in rows) {
+		let prof = null;
+		try { if (row.profile_json != null) { prof = parse(row.profile_json); } } catch (e) { prof = null; }
+		let binary = prof?.binary ?? "llama-server";
+		if (service_healthy(row.pid, binary)) { continue; }
+
+		// Service is down. Can't rebuild it without profile + model → just
+		// soft-delete (an old pre-profile_json row, or a wiped sqlite).
+		if (prof == null || row.model_path == null) {
+			db_exec(db, "update services set state = 'dead' where id = ?", [row.id]);
+			print("[watchdog] " + row.profile
+				+ " down but no profile metadata to respawn — marked dead");
+			continue;
+		}
+
+		// Crash-loop accounting. uptime_s ≈ how long it actually ran
+		// (detection lag ≤ one heartbeat); a long run resets the counter.
+		let prior = row?.restart_count ?? 0;
+		let stable = (row?.uptime_s != null && row.uptime_s >= STABLE_SECONDS);
+		let next_count = stable ? 1 : (prior + 1);
+		if (next_count > MAX_RAPID_RESTARTS) {
+			db_exec(db, "update services set state = 'failed' where id = ?", [row.id]);
+			print("[watchdog] " + row.profile + " crash-looping ("
+				+ prior + " rapid restarts) — parked in 'failed'. Fix the "
+				+ "underlying cause and re-spawn it manually.");
+			continue;
+		}
+
+		let gpus = null;
+		let tsplit = null;
+		try { if (row.gpus_json != null) { gpus = parse(row.gpus_json); } } catch (e) { }
+		try { if (row.tensor_split_json != null) { tsplit = parse(row.tensor_split_json); } } catch (e) { }
+		let caps = caps_for_binary(caps_ref, binary);
+		let bin = binpath_for_binary(binary);
+		try {
+			let svc = spawn_service(db, row.profile, prof, row.model_path,
+				i32(row.port), gpus, tsplit, caps, bin);
+			// Old row → dead; carry the climbing count onto the new row.
+			db_exec(db, "update services set state = 'dead' where id = ?", [row.id]);
+			db_exec(db, "update services set restart_count = ? where id = ?",
+				[next_count, svc.id]);
+			restarted = restarted + 1;
+			print("[watchdog] restarted " + row.profile + " on port "
+				+ row.port + " (pid " + svc.pid + ", attempt " + next_count + ")");
+		} catch (e) {
+			// Spawn failed (port still held by the dying child, OOM, etc).
+			// Keep the row 'running' but reset started_at to now and bump
+			// the count so the next tick retries with backoff accounting —
+			// and the crash-loop guard eventually parks it in 'failed'.
+			db_exec(db,
+				"update services set started_at = datetime('now'), restart_count = ? where id = ?",
+				[next_count, row.id]);
+			print("[watchdog] failed to restart " + row.profile
+				+ " (attempt " + next_count + "): " + e);
+		}
+	}
+	prune_service_history(db);
+	return restarted;
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────
@@ -795,6 +991,29 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				return { status: 404, body: "{\"error\":\"not found\"}" };
 			}
 			return { status: 204, body: "" };
+		},
+		// GET /settings → { auto_restart }. Per-agent knobs; CP mirrors
+		// this into /nodes and the dashboard exposes a toggle.
+		get_settings: fn(req): object {
+			return { status: 200, body: stringify({
+				auto_restart: get_auto_restart(db),
+			})};
+		},
+		// PUT /settings  body { auto_restart: bool } — flips the watchdog
+		// on/off for this agent; effective next reconcile tick.
+		put_settings: fn(req): object {
+			let payload = null;
+			try { payload = parse(req?.body ?? "{}"); } catch (e) {
+				return { status: 400, body: "{\"error\":\"bad json\"}" };
+			}
+			let ar = payload?.auto_restart;
+			if (ar == null) {
+				return { status: 400, body: "{\"error\":\"auto_restart (bool) required\"}" };
+			}
+			set_auto_restart(db, ar == true);
+			return { status: 200, body: stringify({
+				auto_restart: get_auto_restart(db),
+			})};
 		},
 		// /profiles handler removed in v0.7 — profiles live on CP.
 		// agent.hml dropped its registration; this stub stays so the
