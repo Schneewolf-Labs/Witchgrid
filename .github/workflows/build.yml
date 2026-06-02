@@ -25,23 +25,40 @@ on:
 #           pulls of large GGUFs (agent/transfers.hml). Pre-2.3.1 had
 #           to buffer the entire response via get_binary; would pinch
 #           on 40 GB+ models. Also fixes @stdlib/http.download() which
-#           silently wrote 0 bytes in compiled binaries. v0.4 routing
-#           proxy will use stream() / read_binary() for SSE passthrough.
+#           silently wrote 0 bytes in compiled binaries.
+#   2.4.1 — file.read_binary() returns raw bytes intact (no truncation
+#           at the first NUL). agent/services.hml uses it to parse
+#           /proc/<pid>/cmdline (NUL-separated argv) without the old
+#           `tr '\0' '\n'` shellout.
+#   2.5.6 — first release with macOS arm64 binaries (hemlock-macos-arm64
+#           .tar.gz), which is what makes the macos-arm64 matrix leg below
+#           possible, plus accumulated runtime memory fixes.
+#           NOTE: the accepted-socket refcount leak (#584) and the
+#           dropped-async-task pthread leak fixes landed AFTER v2.5.6 and
+#           are not in a release yet — both matter to the long-running
+#           agent/CP daemons. Bump this pin when the next Hemlock release
+#           ships them; until then, hosts that need those fixes build from
+#           a Hemlock source checkout rather than this CI's released pin.
 env:
-  HEMLOCK_VERSION: 2.3.1
+  HEMLOCK_VERSION: 2.5.6
 
 jobs:
   build:
-    name: build cp + agent + inspect
-    runs-on: ubuntu-latest
-    permissions:
-      # Needed only for the tag-triggered release upload step below;
-      # main-branch + PR runs don't exercise it.
-      contents: write
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-14            # Apple Silicon (arm64) runner
+            target: macos-arm64
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Hemlock runtime deps
+      - name: Install Hemlock runtime deps (Linux)
+        if: runner.os == 'Linux'
         # The compiled witchgrid binaries dlopen libffi/libssl/libwebsockets/
         # libz at startup. Use -dev packages so we don't have to chase the
         # libwebsockets soname on whatever Ubuntu image GitHub is running
@@ -50,16 +67,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libffi-dev libssl-dev libwebsockets-dev zlib1g-dev
 
+      - name: Install Hemlock runtime deps (macOS)
+        if: runner.os == 'macOS'
+        # Same dlopen set, from Homebrew. brew on the arm64 runner installs
+        # into /opt/homebrew; the smoke-test step exports a fallback dylib
+        # path so the freshly built binary can resolve them at runtime.
+        run: brew install libffi openssl@3 libwebsockets
+
       - name: Install Hemlock ${{ env.HEMLOCK_VERSION }}
+        # install.sh detects os/arch (Darwin→macos, arm64) and pulls the
+        # matching hemlock-${os}-${arch}.tar.gz release asset. Install to
+        # /usr/local rather than ~/.local — install.sh puts stdlib at
+        # ${PREFIX}/lib/hemlock/stdlib, and hemlockc only searches
+        # <exe-dir>/{stdlib,../stdlib}, cwd, and the hardcoded
+        # /usr/local/lib/hemlock/stdlib. /usr/local is the path that works
+        # without symlinks on both platforms.
         run: |
-          # NOTE: install to /usr/local rather than ~/.local — install.sh
-          # puts stdlib at ${PREFIX}/lib/hemlock/stdlib, but hemlockc only
-          # searches <exe-dir>/{stdlib,../stdlib}, cwd, and the hardcoded
-          # /usr/local/lib/hemlock/stdlib. With --prefix ~/.local none of
-          # those match and every @stdlib/* import errors out as
-          # "stdlib directory not found". /usr/local is the path that works
-          # without symlinks. (Filed upstream — when hemlockc gains a
-          # <exe-dir>/../lib/hemlock/stdlib search, switch back to ~/.local.)
           curl -fsSL https://raw.githubusercontent.com/hemlang/hemlock/main/install.sh \
             | sudo bash -s -- --version "v${HEMLOCK_VERSION}" \
                               --prefix "/usr/local" \
@@ -97,16 +120,17 @@ jobs:
 
       - name: Unit tests
         # Pure-function coverage for intent translator + capabilities
-        # parser. Runs the same `hemlock tests/run.hml` an operator runs
-        # locally; exits non-zero if any test fails. See tests/README.md
-        # for the test layout.
+        # parser. Same `hemlock tests/run.hml` an operator runs locally.
         run: hemlock tests/run.hml
 
       - name: Smoke test — CP starts and answers /healthz
+        # On macOS the freshly built binary dlopens the Homebrew dylibs;
+        # point the dynamic loader at /opt/homebrew/lib (no-op on Linux,
+        # where the var is simply unused).
         run: |
+          export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
           ./cp/witchgrid-cp > /tmp/cp.log 2>&1 &
           CP_PID=$!
-          # Poll, don't sleep blindly. Fail loud if it doesn't come up.
           for i in 1 2 3 4 5; do
             if curl -fsS http://localhost:8765/healthz 2>/dev/null; then
               echo
@@ -121,40 +145,58 @@ jobs:
           kill $CP_PID 2>/dev/null
           exit 1
 
-      # No agent smoke test yet — agent's main() does a synchronous POST
-      # /register to CP at boot, so booting it without a CP would block
-      # until the HTTP timeout. When heartbeats land we can boot agent +
-      # CP together and round-trip /nodes here.
-
-      # ── release artifacts ─────────────────────────────────────────
-      # Only on tag pushes (v*). Bundles all three binaries plus a
-      # SHA256SUMS so operators can verify their downloads, attaches
-      # them to the GitHub release for the tag.
-      - name: Bundle release artifacts
+      # ── per-platform release artifacts ────────────────────────────
+      # On tag pushes, stage the three binaries with a platform suffix and
+      # upload them as workflow artifacts. The separate `release` job below
+      # collects every platform's artifacts into one GitHub release so the
+      # SHA256SUMS covers all of them and the legs don't race to create the
+      # release.
+      - name: Stage platform artifacts
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
+          mkdir -p dist
+          cp cp/witchgrid-cp        "dist/witchgrid-cp-${{ matrix.target }}"
+          cp agent/witchgrid-agent  "dist/witchgrid-agent-${{ matrix.target }}"
+          cp cp/witchgrid-inspect   "dist/witchgrid-inspect-${{ matrix.target }}"
+          ls -la dist
+
+      - name: Upload platform artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: witchgrid-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect + checksum
+        run: |
           mkdir -p release
-          cp cp/witchgrid-cp release/
-          cp agent/witchgrid-agent release/
-          cp cp/witchgrid-inspect release/
+          find artifacts -type f -exec cp {} release/ \;
           cd release
           sha256sum * > SHA256SUMS
           ls -la
           cat SHA256SUMS
 
       - name: Create / update GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
         # action-gh-release@v2 reads the tag from the ref, finds (or
         # creates) the matching release, attaches files. generate_release_notes
-        # builds a notes blob from commits since the previous tag, which
-        # the operator can edit afterwards.
+        # builds notes from commits since the previous tag.
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/witchgrid-cp
-            release/witchgrid-agent
-            release/witchgrid-inspect
-            release/SHA256SUMS
+          files: release/*
           draft: false
           generate_release_notes: true
           fail_on_unmatched_files: true
