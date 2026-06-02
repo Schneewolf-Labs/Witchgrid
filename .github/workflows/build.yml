@@ -33,14 +33,13 @@ on:
 #   2.5.6 — first release with macOS arm64 binaries (hemlock-macos-arm64
 #           .tar.gz), which is what makes the macos-arm64 matrix leg below
 #           possible, plus accumulated runtime memory fixes.
-#           NOTE: the accepted-socket refcount leak (#584) and the
-#           dropped-async-task pthread leak fixes landed AFTER v2.5.6 and
-#           are not in a release yet — both matter to the long-running
-#           agent/CP daemons. Bump this pin when the next Hemlock release
-#           ships them; until then, hosts that need those fixes build from
-#           a Hemlock source checkout rather than this CI's released pin.
+#   2.5.7 — leak fixes that matter to the long-running agent/CP daemons:
+#           task_free() now pthread_detach()es dropped async-task handles
+#           (#583, compiled runtime) and accepted per-connection sockets
+#           are refcounted/freed (#584, interpreter). These are the fixes
+#           the 2.5.6 note had flagged as still-unreleased.
 env:
-  HEMLOCK_VERSION: 2.5.6
+  HEMLOCK_VERSION: 2.5.7
 
 jobs:
   build:
