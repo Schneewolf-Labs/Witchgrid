@@ -23,7 +23,7 @@
 import { posix_spawn, kill } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
-import { open, open_fd, file_stat, list_dir } from "@stdlib/fs";
+import { open, open_fd, file_stat, list_dir, exists } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
@@ -199,24 +199,48 @@ fn prune_service_history(db): null {
 	return null;
 }
 
-// True iff /proc/<pid>/cmdline names a llama-server binary. Used by
-// reap_zombie_services to detect PID recycling (alive process at the
-// stored pid that ISN'T one of our llama-servers).
-fn is_our_llama_server(pid: i32): bool {
+// Platform probe for the process-introspection helpers below. Linux
+// exposes /proc (fast, no fork); macOS/BSD don't, so we fall back to
+// `ps`. A bare exists() stat — cheap enough to call per-helper rather
+// than caching across the spawn()-snapshot boundary of the watchdog
+// task. Without this branch the /proc reads silently return "dead" on
+// macOS, which would make the watchdog respawn every healthy service.
+fn host_has_proc(): bool {
+	return exists("/proc/self");
+}
+
+// True iff the process at <pid> is one of ours running `binary`
+// (e.g. "llama-server", "sd-server"). Used by reap/reconcile/discover
+// to detect PID recycling (a live pid that ISN'T our server). Linux:
+// argv[0] from /proc/<pid>/cmdline. macOS: the command column from ps.
+fn proc_runs_binary(pid: i32, binary: string): bool {
+	if (host_has_proc()) {
+		try {
+			let f = open("/proc/" + pid + "/cmdline", "r");
+			let content = f.read();
+			f.close();
+			if (content == null || content.length == 0) { return false; }
+			// argv[0] is the first nul-terminated string; match the name
+			// anywhere in it (covers absolute paths and bare names).
+			let nul = content.find("\0");
+			let head = nul > 0 ? content.substr(0, nul) : content;
+			return head.find(binary) >= 0;
+		} catch (e) {
+			return false;
+		}
+	}
+	// macOS / no-proc: ps -o command= gives the full command line.
 	try {
-		let f = open("/proc/" + pid + "/cmdline", "r");
-		let content = f.read();
-		f.close();
-		if (content == null || content.length == 0) { return false; }
-		// argv[0] is the first nul-terminated string. Look for either
-		// "llama-server" anywhere in the leading segment (covers both
-		// `/usr/local/bin/llama-server` absolute paths and bare names).
-		let nul = content.find("\0");
-		let head = nul > 0 ? content.substr(0, nul) : content;
-		return head.find("llama-server") >= 0;
+		let r = exec_argv(["ps", "-o", "command=", "-p", "" + pid]);
+		if (r.exit_code != 0) { return false; }
+		return r.output.find(binary) >= 0;
 	} catch (e) {
 		return false;
 	}
+}
+
+fn is_our_llama_server(pid: i32): bool {
+	return proc_runs_binary(pid, "llama-server");
 }
 
 // Walk own-uid llama-server processes and emit a log line for any
@@ -310,17 +334,7 @@ export fn discover_orphan_llama_servers(db, our_uid: i32): null {
 // matches the sd-server binary and reads the bind port from
 // --listen-port (sd-server's flag) instead of --port.
 fn is_our_sd_server(pid: i32): bool {
-	try {
-		let f = open("/proc/" + pid + "/cmdline", "r");
-		let content = f.read();
-		f.close();
-		if (content == null || content.length == 0) { return false; }
-		let nul = content.find("\0");
-		let head = nul > 0 ? content.substr(0, nul) : content;
-		return head.find("sd-server") >= 0;
-	} catch (e) {
-		return false;
-	}
+	return proc_runs_binary(pid, "sd-server");
 }
 
 export fn discover_orphan_sd_servers(db, our_uid: i32): null {
@@ -376,10 +390,18 @@ export fn discover_orphan_sd_servers(db, our_uid: i32): null {
 }
 
 fn is_our_uid(pid: i32, our_uid: i32): bool {
+	if (host_has_proc()) {
+		try {
+			let s = exec_argv(["stat", "-c", "%u", "/proc/" + pid]);
+			if (s.exit_code != 0) { return false; }
+			return i32(s.output.trim()) == our_uid;
+		} catch (e) { return false; }
+	}
+	// macOS / no-proc: ps uid column.
 	try {
-		let s = exec_argv(["stat", "-c", "%u", "/proc/" + pid]);
-		if (s.exit_code != 0) { return false; }
-		return i32(s.output.trim()) == our_uid;
+		let r = exec_argv(["ps", "-o", "uid=", "-p", "" + pid]);
+		if (r.exit_code != 0) { return false; }
+		return i32(r.output.trim()) == our_uid;
 	} catch (e) { return false; }
 }
 
@@ -392,32 +414,48 @@ fn is_our_uid(pid: i32, our_uid: i32): bool {
 // `tr '\0' '\n'` shellout because file.read() truncated at the first
 // nul byte.
 fn read_arg_after(pid: i32, name: string) {
-	try {
-		let f = open("/proc/" + pid + "/cmdline", "r");
-		let buf = f.read_binary();
-		f.close();
-		if (buf == null || buf.length == 0) { return null; }
+	if (host_has_proc()) {
+		try {
+			let f = open("/proc/" + pid + "/cmdline", "r");
+			let buf = f.read_binary();
+			f.close();
+			if (buf == null || buf.length == 0) { return null; }
 
-		// Walk bytes, slice each nul-bounded segment into argv. We only
-		// need to find one match so we could short-circuit on the first
-		// `name` hit, but a full pass is microseconds for typical
-		// cmdlines (< 1 KB) — readability wins.
-		let argv = [];
-		let start: i32 = 0;
-		let i: i32 = 0;
-		while (i < buf.length) {
-			if (buf[i] == 0) {
-				let sub = buf.slice(start, i);
-				argv.push(__string_from_bytes(sub));
-				start = i + 1;
+			// Walk bytes, slice each nul-bounded segment into argv. We only
+			// need to find one match so we could short-circuit on the first
+			// `name` hit, but a full pass is microseconds for typical
+			// cmdlines (< 1 KB) — readability wins.
+			let argv = [];
+			let start: i32 = 0;
+			let i: i32 = 0;
+			while (i < buf.length) {
+				if (buf[i] == 0) {
+					let sub = buf.slice(start, i);
+					argv.push(__string_from_bytes(sub));
+					start = i + 1;
+				}
+				i = i + 1;
 			}
-			i = i + 1;
-		}
 
-		let j: i32 = 0;
-		while (j < argv.length - 1) {
-			if (argv[j] == name) { return argv[j + 1]; }
-			j = j + 1;
+			let j: i32 = 0;
+			while (j < argv.length - 1) {
+				if (argv[j] == name) { return argv[j + 1]; }
+				j = j + 1;
+			}
+		} catch (e) { }
+		return null;
+	}
+	// macOS / no-proc: ps -o command= then split on spaces. Lossy for
+	// args containing spaces, but our flags (--port/--listen-port/-m)
+	// all take simple values.
+	try {
+		let r = exec_argv(["ps", "-o", "command=", "-p", "" + pid]);
+		if (r.exit_code != 0) { return null; }
+		let parts = r.output.trim().split(" ");
+		let k: i32 = 0;
+		while (k < parts.length - 1) {
+			if (parts[k] == name) { return parts[k + 1]; }
+			k = k + 1;
 		}
 	} catch (e) { }
 	return null;
@@ -438,22 +476,36 @@ fn iso_now(db): string {
 // agents (waitpid(pid, WNOHANG) would be the cross-platform answer
 // once Hemlock 2.2.x is settled).
 fn process_alive(pid: i32): bool {
-	try {
-		let f = open("/proc/" + pid + "/status", "r");
-		let content = f.read();
-		f.close();
-		if (content == null || content.length == 0) { return false; }
-		let idx = content.find("State:");
-		if (idx < 0) { return false; }
-		let i = idx + 6;
-		while (i < content.length) {
-			let c = content[i];
-			if (c != ' ' && c != '\t') { break; }
-			i = i + 1;
+	if (host_has_proc()) {
+		try {
+			let f = open("/proc/" + pid + "/status", "r");
+			let content = f.read();
+			f.close();
+			if (content == null || content.length == 0) { return false; }
+			let idx = content.find("State:");
+			if (idx < 0) { return false; }
+			let i = idx + 6;
+			while (i < content.length) {
+				let c = content[i];
+				if (c != ' ' && c != '\t') { break; }
+				i = i + 1;
+			}
+			if (i >= content.length) { return false; }
+			let state = content[i];
+			return state != 'Z' && state != 'X' && state != 'T';
+		} catch (e) {
+			return false;
 		}
-		if (i >= content.length) { return false; }
-		let state = content[i];
-		return state != 'Z' && state != 'X' && state != 'T';
+	}
+	// macOS / no-proc: ps state column. First char Z=zombie, T=stopped
+	// → not alive (mirrors the Linux Z/X/T exclusion; macOS ps has no X).
+	try {
+		let r = exec_argv(["ps", "-o", "state=", "-p", "" + pid]);
+		if (r.exit_code != 0) { return false; }
+		let s = r.output.trim();
+		if (s.length == 0) { return false; }
+		let c = s[0];
+		return c != 'Z' && c != 'T';
 	} catch (e) {
 		return false;
 	}
