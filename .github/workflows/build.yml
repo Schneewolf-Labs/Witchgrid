@@ -144,6 +144,15 @@ jobs:
           kill $CP_PID 2>/dev/null
           exit 1
 
+      - name: Integration tests (CP + agent + fake backend)
+        # Boots a real CP + agent and drives registration → spawn →
+        # /resolve → health-gate → /v1/llama proxy → SSE, with a fake
+        # llama-server (no GPU/model needed). Linux only: bash + the linux
+        # binary + python3 (preinstalled on ubuntu runners). This is the
+        # coverage the pure-unit tests can't reach.
+        if: runner.os == 'Linux'
+        run: bash tests/integration/run_integration.sh
+
       # ── per-platform release artifacts ────────────────────────────
       # On tag pushes, stage the three binaries with a platform suffix and
       # upload them as workflow artifacts. The separate `release` job below
