@@ -20,7 +20,7 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 
 - **Not a job queue.** Consumers bring their own (pgmq, RabbitMQ, BullMQ). Witchgrid handles "where does this request go *right now*," not "when does this job run."
 - **Not a fine-tuning harness.** Doesn't manage training runs. See [Merlina](https://github.com/Schneewolf-Labs/Merlina) for the lab's training side; the intended composition is below.
-- **Not Kubernetes.** No pod scheduling, no networking abstractions, no manifests. Single-binary control plane + lightweight node agents over plain HTTP. No auth (single operator, LAN-only).
+- **Not Kubernetes.** No pod scheduling, no networking abstractions, no manifests. Single-binary control plane + lightweight node agents over plain HTTP. Auth is an *optional* shared bearer secret (`WITCHGRID_SHARED_SECRET`); the design target is a trusted LAN — don't expose the CP to the internet.
 - **Not for single-node setups.** If you have one machine, you don't need Witchgrid — just SSH and edit your scripts. The value kicks in at ≥2 nodes or when sharing a GPU between multiple workloads.
 
 ## Architecture
@@ -56,19 +56,21 @@ CP and agent each compile to a standalone ~7 MB ELF (`witchgrid-cp`, `witchgrid-
 | Component | Responsibility |
 |---|---|
 | **Control plane** (`cp/`) | Node registry, routing API, dashboard, GGUF introspection, capacity-aware placement. Exposes `/register`, `/nodes`, `/services` (proxy to agents), `/v1/llama/{profile}/*`, `/profiles`, `/capabilities`, `/healthz`, dashboard at `/`. |
-| **Node agent** (`agent/`) | Hardware probe (nvidia-smi), capability introspection (`llama-server --help`), service supervisor (posix_spawn + setsid), heartbeat. Exposes `/services` (CRUD), `/profiles`, `/capabilities`, `/healthz`. |
-| **Profile templates** | Live in `agent/services.hml` `PROFILES`. Each profile is `{ binary, intent, extra_flags, default_port, default_model, ... }`. `intent` is a normalized map; `extra_flags` is the raw escape hatch. New profile = config not code. |
+| **Node agent** (`agent/`) | Hardware probe (nvidia-smi), capability introspection (`<engine> --help`), service supervisor (posix_spawn + setsid) + auto-restart watchdog, engine install lifecycle, heartbeat. Exposes `/services`, `/settings`, `/capabilities`, `/models`, `/{engine}_cpp/*`, `/port_check`, `/healthz`. Profiles live on the CP, not here. |
+| **Profile templates** | **CP-owned** (since v0.7) — stored + versioned in the CP's sqlite, seeded with defaults, edited via `/api/profiles` + the dashboard, and inlined into each spawn payload. Each profile is `{ binary, intent, extra_flags, default_port, default_model\|model_alias, ... }`. `intent` is a normalized map; `extra_flags` is the raw escape hatch. New profile = an API call, not a rebuild. |
 | **Intent translator** (`agent/intent.hml`) | Maps witchgrid-level intents (`flash_attention`, `kv_cache_k`, …) to the binary's actual flag form using its capability map. Handles `boolean_or_enum` for flags that changed shape between llama.cpp versions. |
 | **GGUF parser** (`cp/gguf.hml`) | Reads GGUF metadata to extract model size + KV-cache footprint for placement. Standalone CLI `witchgrid-inspect` wraps it. |
 | **Dashboard** | Static `dashboard/index.html` + `dashboard/spawn_form.js` + `dashboard/styles.css` + `assets/logo.svg`. Embedded into CP via `scripts/embed_assets.sh` → `cp/embedded_assets.hml`. HTMX polls `/ui/*` fragments; Alpine drives the spawn form. |
 
 ## Resolved design decisions
 
-- **Language: Hemlock** ([hemlang.dev](https://hemlang.dev)). Python prototype shipped through v0.3 (now in `legacy-python/`); v0.1 of the Hemlock build is what's documented here. Single ~7 MB ELF per binary, universal libs only — drops onto every box without a runtime install. The 7-issue language-evaluation writeup that informed this lives in `docs/hemlock-feedback-archive.md`; all seven items are now resolved upstream in Hemlock 2.1.x / 2.2.x.
-- **Service templating format.** Inline Hemlock map (`PROFILES` in `agent/services.hml`). YAML descriptors got skipped — at the current count (~3 profiles) they'd add a parser without earning their keep. Revisit if profile count grows past ~10 or non-ops users start authoring.
-- **Model storage.** Catalog only knows where models live on each node. Witchgrid does not push models around. Profiles currently embed host-specific GGUF paths; the planned model catalog (open) decouples profile from path via aliases.
+- **Language: Hemlock** ([hemlang.dev](https://hemlang.dev), built on 2.5.7). Python prototype shipped through v0.3 (now in `legacy-python/`); the Hemlock rewrite (v0.7 line) is what's documented here. Single ~7 MB binary each, universal libs only — drops onto every box without a runtime install. The 7-issue language-evaluation writeup that informed the rewrite lives in `docs/hemlock-feedback-archive.md`; all seven were resolved upstream. (Witchgrid has since driven further Hemlock fixes — e.g. the v2.5.7 async-task pthread + accepted-socket leak fixes that matter to the long-running daemons.)
+- **Service templating format.** Profiles are CP-owned rows in sqlite (moved off the agent in v0.7), seeded with defaults and edited via `/api/profiles` + the dashboard — versioned, so a running service keeps the argv it was spawned with even after the profile is edited. Still a normalized intent map, not raw YAML.
+- **Model storage + catalog.** Agents scan their model dirs into a per-node catalog advertised by alias, so profiles reference `model_alias` instead of host-specific paths. CP can pull models from HuggingFace and distribute them peer-to-peer between nodes (`transfers.hml`).
 - **Concurrent loading on a single GPU.** Naive VRAM accounting (free_mb − sum(claimed_mb)). Works.
-- **Auth / multi-tenancy.** Single-operator / LAN-only. **No auth.** Add API keys + per-tenant quotas if it grows beyond one operator.
+- **Auth / multi-tenancy.** Single-operator, LAN-first. Auth is an *optional* shared bearer secret (`WITCHGRID_SHARED_SECRET`, must match on CP + every agent). Per-consumer API keys + quotas are a post-1.0 item if it grows beyond one operator.
+- **Engines.** Multi-engine since v0.7: `llama-server`, `sd-server` (stable-diffusion.cpp), `whisper-server`, `piper`, each with an on-demand install/activate lifecycle. The `binary` field on a profile selects the engine.
+- **Self-healing.** An auto-restart watchdog (per-node, default on) keeps managed services as desired state — respawns on crash + reboot, with crash-loop backoff. See `agent/services.hml` `reconcile_services`.
 - **GPU sharing across non-AI workloads.** Out of scope. Witchgrid manages inference services it spawned, not arbitrary processes squatting on the GPU.
 - **Capability/intent split.** Profile templates declare what they want (intent); the agent's capability map decides how to ask for it. Same profile, different llama.cpp version, right argv.
 
@@ -98,12 +100,12 @@ Integration vectors (deferred until both projects need them):
 
 Witchgrid is **not required** for flammen.ai to ship. flammen.ai (`~/Projects/flammenai/`) runs on hardcoded inference URLs (env vars: `LLAMA_SERVER_URL`, `A1111_URL`). Swapping over to Witchgrid is a one-line config change: point those env vars at Witchgrid's routing API.
 
-flammen.ai is the **first consumer** Witchgrid was designed against. The features that mattered most for it shaped v0.1: routing for text gen (llama-server), VRAM-aware placement so multiple workloads can coexist, dashboard visibility. (Image-gen routing for A1111 is not in v0.1 — flammen.ai's FlameGen still hits A1111 directly.)
+flammen.ai is the **first consumer** Witchgrid was designed against, and now runs on it in production: FlameWorker (chat via the `chat-mahou` profile + memory via `memory-phoenix`), FlameGen (character design via `designer-cpu` + image gen via the `image-niku` `sd-server` profile, having moved off direct A1111), and FlameCaption all resolve through Witchgrid. The features that shaped the early versions: routing for text gen, VRAM-aware placement so multiple workloads coexist, and dashboard visibility — since extended with the `sd-server` image engine and the auto-restart watchdog that keeps those persistent instances alive across reboots.
 
 ## Status
 
 - **`legacy-python/`** — v0.3 Python prototype. Frozen.
-- **`cp/` + `agent/` + `dashboard/`** — v0.1 (Hemlock). Tagged `v0.1.0`. Multi-node, capacity-aware, dashboard-driven, end-to-end tested against real `llama-server` running Mahou-12B-Q5 on the lab's RTX A6000.
+- **`cp/` + `agent/` + `dashboard/`** — pre-1.0, **v0.7 line** (Hemlock 2.5.7); `main` is ahead of the `v0.7.0` tag. In daily **production** use serving flammen.ai (chat / image / caption). Multi-node, capacity-aware, multi-engine (llama / sd / whisper / piper), self-healing (auto-restart watchdog), observable (`/metrics`), with unit + integration tests in CI and multi-platform release artifacts. The 1.0 punch list is in `README.md` (version coherence, configurable CP bind, test breadth, auth posture).
 
 ## Roadmap
 
@@ -123,15 +125,18 @@ The original 9-item v0.1 priority list (`docs/flammen-as-first-consumer.md`) is 
 
 Plus operability/infra: spawn-failure visibility, port reservation, zombie reaping, UTF-8 routing fix, embedded-assets single-file deploy, build CI, intent registry.
 
-Open, in rough order:
+**Shipped since v0.1** (the original "open" list is now closed):
 
-1. **Unit test suite.** Hemlock-side tests for the pure-function layers (gguf parser, intent translator, capabilities parser). See `docs/test-cases-todo.md` for the planned cases.
-2. **Model catalog.** Each agent scans known dirs (`~/AI/gguf_models`, A1111 checkpoints) and reports what's available by alias. Profiles reference aliases (`"model_alias": "mahou-12b-q5"`) instead of host-specific paths. Unblocks Merlina integration vector #1.
-3. **`WITCHGRID_DATA_DIR` env.** Pin sqlite location so it doesn't move when the binary is launched from a different CWD.
-4. **TCP-probe `pick_port`.** Detect non-Witchgrid port contention (other workloads on the box) before spawn rather than after the EADDRINUSE crash.
-5. **Release artifacts.** CI already builds; add a release job that uploads `witchgrid-cp` + `witchgrid-agent` + `witchgrid-inspect` on tag push.
-6. **SSE / streaming proxy.** When a consumer wants `stream: true`, the routing proxy needs to forward chunks instead of buffering. Deferred until a real consumer asks.
-7. **Health checks + routing exclusion.** Liveness probe on each registered service; wedged ones drop out of the round-robin pool.
-8. **Engines beyond llama.cpp.** AUTOMATIC1111 / ComfyUI / vLLM as additional `binary` types. Intent vocabulary will need engine-specific subsets.
+- ✅ Unit test suite (gguf parser, intent translator, capabilities parser) **+ an integration harness** (real CP+agent, fake backend) in CI — `tests/`.
+- ✅ Model catalog (scan → advertise by alias) + HuggingFace pull + peer-to-peer distribute.
+- ✅ `WITCHGRID_DATA_DIR` (+ SQLite WAL / `busy_timeout`).
+- ✅ TCP-probe `pick_port` for non-Witchgrid port contention.
+- ✅ Release artifacts — tag pushes attach per-platform binaries + `SHA256SUMS`.
+- ✅ SSE / streaming proxy passthrough.
+- ✅ Health-gated routing (spawn waits for `/health` before proxying).
+- ✅ Engines beyond llama.cpp — `sd-server`, `whisper-server`, `piper`, each with an install/activate lifecycle.
+- ✅ Auto-restart watchdog + Prometheus `/metrics` (post-v0.7).
 
-Longer-term — see `docs/llama-cpp-as-managed-runtime.md` for the "Witchgrid as the llama.cpp manager" brainstorm (vendoring binaries, prebuilt download, source build, eventual auto-canary).
+**Toward 1.0** (see `README.md` for the punch list): version coherence, configurable CP bind (`:8765` is hardcoded), broader integration-test coverage, finalized auth posture, graceful shutdown.
+
+Longer-term — see `docs/llama-cpp-as-managed-runtime.md` for the "Witchgrid as the llama.cpp manager" brainstorm (vendoring binaries, prebuilt download, source build, eventual auto-canary). vLLM / ComfyUI as further `binary` types remain candidates.
