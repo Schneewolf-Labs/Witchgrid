@@ -47,7 +47,7 @@
 //                                         a launch from the wrong dir doesn't
 //                                         spin up an empty registry.
 
-import { open_db, close_db, query as db_query } from "@stdlib/sqlite";
+import { open_db, close_db, query as db_query, exec as db_exec } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
 import { getenv } from "@stdlib/env";
 import { exec_argv } from "@stdlib/process";
@@ -462,6 +462,13 @@ fn main(): null {
 			+ " — if unexpected, check CWD or set WITCHGRID_DATA_DIR");
 	}
 	let db = open_db(db_path);
+	// Concurrency + durability pragmas (see cp.hml for rationale). The
+	// detached heartbeat task runs reconcile_services writes concurrently
+	// with the HTTP loop's spawn/stop writes on this same handle, so
+	// busy_timeout + WAL keep them from colliding into "database is locked".
+	db_exec(db, "PRAGMA busy_timeout=5000", []);
+	db_exec(db, "PRAGMA journal_mode=WAL", []);
+	db_exec(db, "PRAGMA synchronous=NORMAL", []);
 	init_services_schema(db);
 	init_agent_settings_schema(db);
 	init_transfers_schema(db);

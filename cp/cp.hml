@@ -3255,6 +3255,18 @@ fn main(): null {
 			+ "(a stray fresh DB drops every node/profile/service from view)");
 	}
 	DB = open_db(DB_PATH);
+	// Concurrency + durability pragmas, set before any table work:
+	//   busy_timeout — a momentarily-locked DB waits up to 5s and retries
+	//     instead of throwing "database is locked". The detached
+	//     db_backup_loop runs `vacuum into` while the HTTP loop writes
+	//     nodes/services/samples; without this they collide.
+	//   journal_mode=WAL — readers don't block the writer and vice versa,
+	//     and it's the crash-safe journal the systemd unit already assumes
+	//     ("give sqlite time to release the WAL lock") but nothing enabled.
+	//   synchronous=NORMAL — the standard, safe WAL pairing.
+	exec(DB, "PRAGMA busy_timeout=5000", []);
+	exec(DB, "PRAGMA journal_mode=WAL", []);
+	exec(DB, "PRAGMA synchronous=NORMAL", []);
 	init_db(DB);
 	print("[cp] sqlite ready: " + DB_PATH);
 	init_auth();
