@@ -57,6 +57,26 @@ Copy a **new** binary into place with `mv`, not `cp` — a running binary can't 
 overwritten (`ETXTBSY`); `mv` swaps the directory entry and the running process
 keeps its old inode until you restart it.
 
+## Runtime dependencies
+
+As of Hemlock 2.6.0 the binaries **static-link** libwebsockets, libssl,
+libcrypto, libffi and libz — those are baked in and don't need to be on the
+box. What's left:
+
+- **`libsqlite3.so.0` — required, and invisible to `ldd`.** `@stdlib/sqlite`
+  `dlopen()`s it at startup (compile-time FFI), so it does *not* show up in
+  `ldd` and is *not* bundled. Every box that runs the CP or agent needs it:
+  ```
+  sudo apt-get install -y libsqlite3-0      # Debian/Ubuntu
+  ```
+  macOS ships libsqlite3 in the system, so nothing to install there. If it's
+  missing the process dies at startup with an FFI load error, not a link error.
+- **`libcap.so.2`, `libuv.so.1`, `libev.so.4`** (plus libc/libm) — standard,
+  present on any normal Linux; listed by `ldd <binary>`.
+
+Quick check on a fresh box: `ldd ./witchgrid-cp` (covers everything except the
+sqlite dlopen) and `ldconfig -p | grep libsqlite3`.
+
 ## Run as a service
 
 Both binaries are plain long-running processes; supervise them with whatever you

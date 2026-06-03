@@ -73,21 +73,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Hemlock runtime deps (Linux)
+      - name: Install Hemlock build/runtime deps (Linux)
         if: runner.os == 'Linux'
-        # The compiled witchgrid binaries dlopen libffi/libssl/libwebsockets/
-        # libz at startup. Use -dev packages so we don't have to chase the
-        # libwebsockets soname on whatever Ubuntu image GitHub is running
-        # this week.
+        # Two distinct roles, post Hemlock 2.6.0:
+        #  - libffi/libssl/libwebsockets/libz: as of 2.6.0 hemlockc STATIC-links
+        #    these into the compiled binary. The -dev packages are now needed at
+        #    BUILD time (they supply the static archives hemlockc links against),
+        #    NOT at runtime — they no longer appear in `ldd` of the output.
+        #  - libsqlite3: this is the one true RUNTIME dependency. @stdlib/sqlite
+        #    dlopen()s libsqlite3.so.0 at startup (compile-time FFI), so it is
+        #    invisible to `ldd` and is NOT bundled. Every box that runs the CP or
+        #    agent needs it present. Installed explicitly here so the integration
+        #    test step doesn't silently rely on the runner image shipping it.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libffi-dev libssl-dev libwebsockets-dev zlib1g-dev
+          sudo apt-get install -y libffi-dev libssl-dev libwebsockets-dev zlib1g-dev libsqlite3-0
 
-      - name: Install Hemlock runtime deps (macOS)
+      - name: Install Hemlock build deps (macOS)
         if: runner.os == 'macOS'
-        # Same dlopen set, from Homebrew. brew on the arm64 runner installs
-        # into /opt/homebrew; the smoke-test step exports a fallback dylib
-        # path so the freshly built binary can resolve them at runtime.
+        # Same static-link inputs from Homebrew (macOS links these dynamically by
+        # default, so they're also runtime deps there). libsqlite3 ships with the
+        # macOS system, so no brew install for it.
         run: brew install libffi openssl@3 libwebsockets
 
       - name: Install Hemlock ${{ env.HEMLOCK_VERSION }}
