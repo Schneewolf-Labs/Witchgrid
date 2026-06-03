@@ -38,8 +38,19 @@ on:
 #           (#583, compiled runtime) and accepted per-connection sockets
 #           are refcounted/freed (#584, interpreter). These are the fixes
 #           the 2.5.6 note had flagged as still-unreleased.
+#   2.6.0 — two fixes we care about:
+#           1. hemlockc now static-links libwebsockets/libssl/libffi by
+#              default on Linux, so the compiled witchgrid binary no longer
+#              depends on the host's libwebsockets soname at runtime. This
+#              is what fixed the 24.04 (lws 4.3) agent SIGSEGV — the pin
+#              below now stands only on the glibc-floor reason, not the lws
+#              one.
+#           2. VAL_SOCKET was missing from the interpreter's refcount
+#              fast-path, so sockets stored in arrays/objects (the CP/agent
+#              pass TcpListener sockets around) were over-released — a flaky
+#              heap use-after-free. Fixed in the runtime.
 env:
-  HEMLOCK_VERSION: 2.5.7
+  HEMLOCK_VERSION: 2.6.0
 
 jobs:
   build:
@@ -49,14 +60,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pin to 22.04 (glibc 2.35), NOT ubuntu-latest. Two reasons:
-          #  1. The Hemlock release we install is built on ubuntu-22.04; on a
-          #     24.04 (glibc 2.39) runner the agent SIGSEGVs at boot (the CP
-          #     survives, but the agent's heavier posix_spawn/async-task path
-          #     trips it). It runs clean on 2.35 everywhere — this box, prod
-          #     (schneewolf/mac-mini), and 22.04 CI.
-          #  2. Building the released linux binary on 2.35 keeps its glibc
-          #     floor low enough to run on the production boxes.
+          # Pin to 22.04 (glibc 2.35), NOT ubuntu-latest, for the glibc
+          # floor: building the released linux binary on 2.35 keeps its glibc
+          # requirement low enough to run on the production boxes (schneewolf).
+          # (Pre-2.6.0 there was a second reason — the dynamically-linked
+          # Hemlock release SIGSEGV'd against 24.04's libwebsockets 4.3 — but
+          # 2.6.0 static-links lws, so that no longer constrains the runner.)
           - os: ubuntu-22.04
             target: linux-x86_64
           - os: macos-14            # Apple Silicon (arm64) runner
