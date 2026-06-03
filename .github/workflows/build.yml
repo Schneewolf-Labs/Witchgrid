@@ -49,7 +49,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pin to 22.04 (glibc 2.35), NOT ubuntu-latest. Two reasons:
+          #  1. The Hemlock release we install is built on ubuntu-22.04; on a
+          #     24.04 (glibc 2.39) runner the agent SIGSEGVs at boot (the CP
+          #     survives, but the agent's heavier posix_spawn/async-task path
+          #     trips it). It runs clean on 2.35 everywhere — this box, prod
+          #     (schneewolf/mac-mini), and 22.04 CI.
+          #  2. Building the released linux binary on 2.35 keeps its glibc
+          #     floor low enough to run on the production boxes.
+          - os: ubuntu-22.04
             target: linux-x86_64
           - os: macos-14            # Apple Silicon (arm64) runner
             target: macos-arm64
