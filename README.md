@@ -61,8 +61,8 @@ The v0.1 priority list (`docs/flammen-as-first-consumer.md`) is fully closed. Op
 
 - **Test suite** — see `docs/test-cases-todo.md` for what's covered manually + the planned automated cases.
 - **Model catalog** — agent scans known dirs and advertises models by alias, so profiles stop pinning host-specific paths.
-- **Hardening** — TCP-probe `pick_port` for non-Witchgrid contention; `WITCHGRID_DATA_DIR` env so `witchgrid.db` doesn't dance with CWD.
+- **Hardening** — ✅ TCP-probe `pick_port` for non-Witchgrid contention; ✅ `WITCHGRID_DATA_DIR` env so the sqlite DB doesn't dance with CWD (logs the resolved path + warns before creating a fresh DB). Remaining: health-gated routing, graceful drain.
 - **SSE streaming** — deferred until a real consumer needs it.
-- **Real release artifacts** — CI builds the binaries on every push but doesn't yet attach them to tags.
+- **Real release artifacts** — ✅ tag pushes now build + attach per-platform binaries (linux-x86_64 + macos-arm64) + `SHA256SUMS` to the GitHub release.
 
 Longer-term: the [Merlina](https://github.com/Schneewolf-Labs/Merlina) pairing ("Merlina trains, Witchgrid serves") and the "Witchgrid as the llama.cpp manager" angle (vendoring binaries / source builds / canary). See `CLAUDE.md` and `docs/llama-cpp-as-managed-runtime.md` for the long form.

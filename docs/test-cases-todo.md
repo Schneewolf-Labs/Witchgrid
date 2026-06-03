@@ -54,7 +54,7 @@ llama-servers, Jupyter, A1111, ad-hoc workloads. Witchgrid is the
 
 ## Operability
 
-15. **`witchgrid.db` lives at a predictable location.** Today both CP and agent open `witchgrid.db` / `witchgrid-agent.db` relative to CWD, which means starting the binary from a different directory creates a new empty DB. Test would assert (a) location is configurable via env and (b) either default is absolute or the binary errors loudly when CWD is unexpected.
+15. ✅ **DONE (impl)**, test pending. **`witchgrid.db` lives at a predictable location.** Both CP and agent now honor `WITCHGRID_DATA_DIR` (absolute, CWD-independent, created if missing) and, on either path, log the resolved DB path + warn loudly `creating NEW database at <path>` before creating a fresh DB — catching the "started from the wrong dir → empty registry" foot-gun without hard-erroring on legit first-run. Default stays CWD-relative for back-compat. Test still worth adding (would need the data-path resolver extracted to an importable module).
 
 16. **Multiple spawn requests on the same profile pick different ports.** Already verified manually (port autoinc 8080 → 8081 when first is occupied). Lock it in.
 

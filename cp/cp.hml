@@ -45,6 +45,28 @@ let DB_PATH = "witchgrid.db";
 let HOST = "0.0.0.0";
 let PORT = 8765;
 
+// Resolve where the sqlite DB lives. WITCHGRID_DATA_DIR pins it to an
+// absolute, CWD-independent location (created if missing); unset keeps the
+// historical CWD-relative filename. main() logs the resolved path and warns
+// loudly before creating a fresh DB — the "started from the wrong directory
+// → empty registry, didn't notice" foot-gun (test-cases-todo #15). The CP
+// is especially exposed: a stray fresh DB means every node + profile +
+// running service vanishes from its view.
+fn resolve_data_path(name: string): string {
+	let dir = getenv("WITCHGRID_DATA_DIR");
+	if (dir == null || dir.length == 0) { return name; }
+	let d = dir;
+	while (d.length > 1 && d.substr(d.length - 1, 1) == "/") {
+		d = d.substr(0, d.length - 1);
+	}
+	if (!exists(d)) {
+		try { make_dirs(d); } catch (e) {
+			eprint("[cp] could not create WITCHGRID_DATA_DIR " + d + ": " + e);
+		}
+	}
+	return d + "/" + name;
+}
+
 // ── auth (slice 1: shared bearer for CP↔agent) ─────────────────────
 //
 // Single shared secret, env-injected. When set, every inbound request
@@ -3226,6 +3248,12 @@ fn handle_logo(req): object {
 // ── boot ─────────────────────────────────────────────────────────────
 
 fn main(): null {
+	DB_PATH = resolve_data_path(DB_PATH);
+	if (!exists(DB_PATH)) {
+		print("[cp] creating NEW database at " + DB_PATH
+			+ " — if unexpected, check CWD or set WITCHGRID_DATA_DIR "
+			+ "(a stray fresh DB drops every node/profile/service from view)");
+	}
 	DB = open_db(DB_PATH);
 	init_db(DB);
 	print("[cp] sqlite ready: " + DB_PATH);

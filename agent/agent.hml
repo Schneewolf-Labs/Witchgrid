@@ -40,6 +40,12 @@
 //   WITCHGRID_MODEL_DIRS_EXTRA <empty>    colon-separated extra scan dirs
 //                                         (read-only as far as Witchgrid
 //                                         is concerned; just discovered)
+//   WITCHGRID_DATA_DIR         <cwd>      dir for witchgrid-agent.db; pins
+//                                         it to an absolute, CWD-independent
+//                                         path (created if missing). Unset =
+//                                         CWD-relative (legacy). Set this so
+//                                         a launch from the wrong dir doesn't
+//                                         spin up an empty registry.
 
 import { open_db, close_db, query as db_query } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
@@ -154,6 +160,26 @@ fn env_or(name: string, default_value: string): string {
 	let v = getenv(name);
 	if (v == null || v.length == 0) { return default_value; }
 	return v;
+}
+
+// Resolve where the sqlite DB lives. WITCHGRID_DATA_DIR pins it to an
+// absolute, CWD-independent location (created if missing); unset keeps the
+// historical CWD-relative filename. The caller logs the resolved path and
+// warns loudly before creating a fresh DB — the "started from the wrong
+// directory → empty registry, didn't notice" foot-gun (test-cases-todo #15).
+fn resolve_data_path(name: string): string {
+	let dir = getenv("WITCHGRID_DATA_DIR");
+	if (dir == null || dir.length == 0) { return name; }
+	let d = dir;
+	while (d.length > 1 && d.substr(d.length - 1, 1) == "/") {
+		d = d.substr(0, d.length - 1);
+	}
+	if (!exists(d)) {
+		try { make_dirs(d); } catch (e) {
+			eprint("[agent] could not create WITCHGRID_DATA_DIR " + d + ": " + e);
+		}
+	}
+	return d + "/" + name;
 }
 
 fn detect_hostname(): string {
@@ -430,7 +456,12 @@ fn main(): null {
 	// Open db before initial register so the heartbeat (and the very
 	// first /register) can include the unmanaged-proc list — needs the
 	// services table to know which PIDs are ours vs. the rest.
-	let db = open_db(DB_PATH);
+	let db_path = resolve_data_path(DB_PATH);
+	if (!exists(db_path)) {
+		print("[agent] creating NEW database at " + db_path
+			+ " — if unexpected, check CWD or set WITCHGRID_DATA_DIR");
+	}
+	let db = open_db(db_path);
 	init_services_schema(db);
 	init_agent_settings_schema(db);
 	init_transfers_schema(db);
@@ -489,7 +520,7 @@ fn main(): null {
 	} catch (e) {
 		eprint("[agent] boot reconcile error: " + e);
 	}
-	print("[agent] sqlite ready: " + DB_PATH);
+	print("[agent] sqlite ready: " + db_path);
 
 	// Introspect the local llama-server binary once at boot so CP can
 	// ask "does this agent's binary support flash_attention?" without
