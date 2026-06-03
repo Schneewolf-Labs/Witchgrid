@@ -1136,6 +1136,95 @@ fn handle_health(req): object {
 	return { status: 200, body: "{\"status\":\"ok\"}" };
 }
 
+// GET /metrics — Prometheus text exposition. Built purely from the node
+// data CP already collects each heartbeat (nodes_for_dashboard reads the
+// DB), so a scrape never fans out to agents and stays fast + reliable
+// regardless of agent reachability. Public, like /healthz — a scrape
+// target, not a secret; lets Prometheus/Grafana watch the fleet's VRAM,
+// node liveness, and the auto-restart watchdog state.
+fn handle_metrics(req): object {
+	let nodes = nodes_for_dashboard();
+
+	// One accumulator per metric so we emit each HELP/TYPE block once and
+	// stream all its series under it (Prometheus requires series of the
+	// same name to be contiguous). Single pass over nodes/gpus.
+	let m_node_up    = "";
+	let m_last_seen  = "";
+	let m_auto       = "";
+	let m_ram_free   = "";
+	let m_ram_total  = "";
+	let m_cpu_cores  = "";
+	let m_gpu_free   = "";
+	let m_gpu_total  = "";
+	let m_gpu_used   = "";
+	let m_gpu_power  = "";
+
+	for (n in nodes) {
+		let nl = "{node=\"" + n.node_id + "\"}";
+		let up = (n.age_seconds < STALE_NODE_SECONDS) ? "1" : "0";
+		m_node_up   = m_node_up   + "witchgrid_node_up" + nl + " " + up + "\n";
+		m_last_seen = m_last_seen + "witchgrid_node_last_seen_seconds" + nl + " " + n.age_seconds + "\n";
+
+		let ar = n?.auto_restart;
+		if (ar != null) {
+			m_auto = m_auto + "witchgrid_node_auto_restart" + nl + " " + (ar == true ? "1" : "0") + "\n";
+		}
+
+		let hw = n?.hardware ?? {};
+		if (hw?.ram_free_mb != null) {
+			m_ram_free = m_ram_free + "witchgrid_node_ram_free_mb" + nl + " " + hw.ram_free_mb + "\n";
+		}
+		if (hw?.ram_total_mb != null) {
+			m_ram_total = m_ram_total + "witchgrid_node_ram_total_mb" + nl + " " + hw.ram_total_mb + "\n";
+		}
+		if (hw?.cpu_cores != null) {
+			m_cpu_cores = m_cpu_cores + "witchgrid_node_cpu_cores" + nl + " " + hw.cpu_cores + "\n";
+		}
+
+		let gpus = hw?.gpus ?? [];
+		for (g in gpus) {
+			let gl = "{node=\"" + n.node_id + "\",gpu=\"" + g.index + "\"}";
+			m_gpu_free  = m_gpu_free  + "witchgrid_gpu_free_mb"  + gl + " " + g.free_mb + "\n";
+			m_gpu_total = m_gpu_total + "witchgrid_gpu_total_mb" + gl + " " + g.total_mb + "\n";
+			m_gpu_used  = m_gpu_used  + "witchgrid_gpu_used_mb"  + gl + " " + (g.total_mb - g.free_mb) + "\n";
+			if (g?.power_draw_w != null) {
+				m_gpu_power = m_gpu_power + "witchgrid_gpu_power_watts" + gl + " " + g.power_draw_w + "\n";
+			}
+		}
+	}
+
+	let out = ""
+		+ "# HELP witchgrid_up 1 if the control plane is serving requests\n"
+		+ "# TYPE witchgrid_up gauge\n"
+		+ "witchgrid_up 1\n"
+		+ "# HELP witchgrid_nodes_total Number of registered nodes (fresh or stale)\n"
+		+ "# TYPE witchgrid_nodes_total gauge\n"
+		+ "witchgrid_nodes_total " + nodes.length + "\n"
+		+ "# HELP witchgrid_node_up 1 if the node's last heartbeat is within " + STALE_NODE_SECONDS + "s\n"
+		+ "# TYPE witchgrid_node_up gauge\n" + m_node_up
+		+ "# HELP witchgrid_node_last_seen_seconds Seconds since the node's last heartbeat\n"
+		+ "# TYPE witchgrid_node_last_seen_seconds gauge\n" + m_last_seen
+		+ "# HELP witchgrid_node_auto_restart 1 if the agent's auto-restart watchdog is enabled\n"
+		+ "# TYPE witchgrid_node_auto_restart gauge\n" + m_auto
+		+ "# HELP witchgrid_node_cpu_cores CPU cores reported by the node\n"
+		+ "# TYPE witchgrid_node_cpu_cores gauge\n" + m_cpu_cores
+		+ "# HELP witchgrid_node_ram_free_mb Free system RAM (MB)\n"
+		+ "# TYPE witchgrid_node_ram_free_mb gauge\n" + m_ram_free
+		+ "# HELP witchgrid_node_ram_total_mb Total system RAM (MB)\n"
+		+ "# TYPE witchgrid_node_ram_total_mb gauge\n" + m_ram_total
+		+ "# HELP witchgrid_gpu_free_mb Free VRAM per GPU (MB)\n"
+		+ "# TYPE witchgrid_gpu_free_mb gauge\n" + m_gpu_free
+		+ "# HELP witchgrid_gpu_total_mb Total VRAM per GPU (MB)\n"
+		+ "# TYPE witchgrid_gpu_total_mb gauge\n" + m_gpu_total
+		+ "# HELP witchgrid_gpu_used_mb Used VRAM per GPU (MB)\n"
+		+ "# TYPE witchgrid_gpu_used_mb gauge\n" + m_gpu_used
+		+ "# HELP witchgrid_gpu_power_watts Current GPU power draw (W)\n"
+		+ "# TYPE witchgrid_gpu_power_watts gauge\n" + m_gpu_power;
+
+	return { status: 200, body: out,
+		headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } };
+}
+
 // ── agent lookup ─────────────────────────────────────────────────────
 
 // Returns the agent_url for node_id, or null if the node isn't registered
@@ -3302,6 +3391,7 @@ fn main(): null {
 			return { status: 404, body: "{\"error\":\"not found\"}" };
 		} },
 		{ method: "GET",  path: "/healthz",       handler: handle_health,             public: true },
+		{ method: "GET",  path: "/metrics",       handler: handle_metrics,            public: true },
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
