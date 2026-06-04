@@ -6,7 +6,7 @@ Bugs / edge cases hit during development that don't have automated coverage yet.
 
 1. ✅ **DONE** (`tests/integration/run_integration.sh`). **CP must not crash when the spawn payload's `model` path is unreadable from CP's filesystem.** Discovered during the first sabre↔schneewolf smoke: one box had Mahou at `~/AI/models/...`, the other at `/mnt/storage/...`. Posting the path-only-valid-on-one-box to CP made `read_metadata` throw out of `pick_placement`, taking down the CP process. Now caught + returns 422 with a helpful message; assert that.
 
-2. **Cross-box agent registration round-trips hardware faithfully.** Specifically: agent on box B, CP on box A, GET /nodes from box A reflects the actual `nvidia-smi` output on box B (gpu count, names, free_mb), not box A's hardware. Caught a bug where the agent reported the *agent box's* hardware but with the *CP box's* `agent_url` if the env vars were swapped — easy to misread.
+2. ✅ **DONE** (`tests/integration/run_integration.sh`; single-host identity/round-trip slice — cross-box hardware diff needs a mocked nvidia-smi).  round-trips hardware faithfully.** Specifically: agent on box B, CP on box A, GET /nodes from box A reflects the actual `nvidia-smi` output on box B (gpu count, names, free_mb), not box A's hardware. Caught a bug where the agent reported the *agent box's* hardware but with the *CP box's* `agent_url` if the env vars were swapped — easy to misread.
 
 3. ✅ **DONE** (`tests/integration/run_integration.sh`). **Stale agent falls out of placement after `STALE_NODE_SECONDS`.** Boot CP+agent, kill agent, wait >90s, POST /services → expect 503-ish (no live placement target) not "spawned on dead agent". GET /nodes still shows the dead node with its old `last_seen_at` (visibility-only).
 

@@ -27,13 +27,17 @@ HEARTBEAT_SECS=1                                # fast agent heartbeat (liveness
 STALE_SECS=4                                    # CP evicts a silent node after ~4x heartbeat
 CP_URL="http://127.0.0.1:${CP_PORT}"
 AGENT_URL="http://127.0.0.1:${AGENT_PORT}"
+AGENT2_PORT=8767                                # 2nd agent for the multi-node test (#2)
+NODE_ID2="test-agent-2"
+AGENT2_URL="http://127.0.0.1:${AGENT2_PORT}"
 
 TMP="$(mktemp -d)"
 BIN="$TMP/bin"; mkdir -p "$BIN" "$TMP/cp" "$TMP/agent" "$TMP/models"
 cp "$FAKE" "$BIN/llama-server"; chmod +x "$BIN/llama-server"
 
-CP_PID=""; AGENT_PID=""
+CP_PID=""; AGENT_PID=""; AGENT2_PID=""
 cleanup() {
+	[ -n "$AGENT2_PID" ] && kill -9 "$AGENT2_PID" 2>/dev/null
 	[ -n "$AGENT_PID" ] && kill -9 "$AGENT_PID" 2>/dev/null
 	[ -n "$CP_PID" ] && kill -9 "$CP_PID" 2>/dev/null
 	# the agent posix_spawn'd the fake (setsid) — it outlives the agent
@@ -158,6 +162,30 @@ for _ in $(seq 1 20); do
 done
 check "heartbeat advances the node's last_seen_at (#4)" \
 	bash -c "[ $HB_ADVANCED -eq 1 ]"
+
+# #2: multi-node registration integrity. Boot a SECOND agent (distinct node_id +
+# agent_url); the CP must keep them separate — each node carries the agent_url WE
+# gave it (the bug this guards swapped one box's hardware onto another box's
+# agent_url) and its own populated hardware block. Both agents probe the same
+# host here, so this asserts identity/round-trip integrity, not cross-box
+# hardware difference (that would need a mocked nvidia-smi — tracked follow-up).
+PATH="$BIN:$PATH" HOME="$TMP" \
+	WITCHGRID_CP_URL="$CP_URL" WITCHGRID_AGENT_URL="$AGENT2_URL" \
+	WITCHGRID_AGENT_PORT="$AGENT2_PORT" WITCHGRID_NODE_ID="$NODE_ID2" \
+	WITCHGRID_DATA_DIR="$TMP/agent2" WITCHGRID_MODEL_DIR="$TMP/models" \
+	WITCHGRID_HEARTBEAT_SECONDS="$HEARTBEAT_SECS" \
+	"$AGENT_BIN" >"$TMP/agent2.log" 2>&1 &
+AGENT2_PID=$!; disown "$AGENT2_PID" 2>/dev/null || true
+for _ in $(seq 1 30); do curl -fsS "$CP_URL/nodes" 2>/dev/null | grep -q "$NODE_ID2" && break; sleep 0.3; done
+
+check "both agents register as distinct nodes (#2)" \
+	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; ids={n[\"node_id\"] for n in json.load(sys.stdin)}; sys.exit(0 if {\"$NODE_ID\",\"$NODE_ID2\"} <= ids else 1)'"
+
+check "each node round-trips its own agent_url + hardware, no swap (#2)" \
+	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; ns={n[\"node_id\"]:n for n in json.load(sys.stdin)}; a=ns.get(\"$NODE_ID\"); b=ns.get(\"$NODE_ID2\"); sys.exit(0 if (a and b and a[\"agent_url\"]==\"$AGENT_URL\" and b[\"agent_url\"]==\"$AGENT2_URL\" and a.get(\"hardware\",{}).get(\"cpu_cores\",0)>0 and b.get(\"hardware\",{}).get(\"cpu_cores\",0)>0) else 1)'"
+
+# stop the 2nd agent so the #3 staleness test runs against a clean fleet.
+kill -9 "$AGENT2_PID" 2>/dev/null; AGENT2_PID=""
 
 # #3: a silenced agent must drop out of live placement after STALE_NODE_SECONDS
 # (forced short here). Kill the agent to stop heartbeats, wait past the cutoff,
