@@ -2186,6 +2186,7 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
 }
 .wg-toast {
   pointer-events: auto;
+  cursor: pointer;
   background: var(--bg-2);
   color: var(--fg-1);
   border: 1px solid var(--border);
@@ -2991,13 +2992,13 @@ function newProfile() {
 
 // ── live state stream (SSE) ──────────────────────────────────────────
 // One EventSource per tab consumes /events. On each pushed snapshot we
-// (a) refresh this page's htmx live panels immediately and (b) raise a
-// toast for notable transitions (a service going dead). This replaces the
-// old 5s polling cadence; the htmx panels keep a slow 30s timer purely as
-// a fallback for when SSE is unavailable. EventSource auto-reconnects on
-// drop (honoring the server's `retry:`), so transient blips self-heal.
+// (a) refresh this page's htmx live panels immediately and (b) diff against
+// the previous snapshot to raise toasts for the transitions an operator
+// actually wants pushed at them — services going down/failed/recovered and
+// nodes going offline/online. This replaces the old 5s polling cadence; the
+// htmx panels keep a slow 30s fallback timer. EventSource auto-reconnects.
 (function () {
-  let prevServices = null;            // id → {profile, node, alive}
+  let prev = null;   // { services: {id:svc}, nodes: {id:node} } or null (first)
 
   function refreshLivePanels() {
     if (!window.htmx) return;
@@ -3006,21 +3007,45 @@ function newProfile() {
       .forEach((el) => { try { window.htmx.trigger(el, 'load'); } catch (e) {} });
   }
 
-  function onSnapshot(snap) {
-    refreshLivePanels();
-    // Toast on a service that flipped alive→dead. A service that simply
-    // disappeared was almost always an operator stop — don't nag on those.
-    const cur = {};
-    (snap.services || []).forEach((s) => { cur[s.id] = s; });
-    if (prevServices) {
-      for (const id in prevServices) {
-        const was = prevServices[id], now = cur[id];
-        if (now && was.alive && !now.alive) {
-          wgToast('Service died: ' + was.profile + ' on ' + was.node, 'err');
-        }
+  function index(snap) {
+    const s = {}, n = {};
+    (snap.services || []).forEach((x) => { s[x.id] = x; });
+    (snap.nodes || []).forEach((x) => { n[x.node_id] = x; });
+    return { services: s, nodes: n };
+  }
+
+  // Compare two indexed snapshots and fire one toast per meaningful change.
+  // Deliberately quiet: no toasts for operator-initiated spawn/stop (the
+  // actor already gets inline feedback), and a node going offline takes its
+  // services with it — we toast the node, not each vanished service.
+  function diffToasts(p, c) {
+    // node transitions first (they explain service disappearances)
+    for (const id in c.nodes) {
+      const was = p.nodes[id], now = c.nodes[id];
+      if (was && was.up && !now.up)        wgToast('⚠ Node offline: ' + id + ' — its services are unreachable', 'err');
+      else if (was && !was.up && now.up)   wgToast('Node back online: ' + id, 'ok');
+      else if (!was && now.up)             wgToast('Node online: ' + id, 'ok');
+    }
+    // service transitions (only for services present in both snapshots, so a
+    // service that vanished with its node doesn't double-fire)
+    for (const id in c.services) {
+      const was = p.services[id], now = c.services[id];
+      if (!was) continue;
+      if (was.alive && !now.alive) {
+        const failed = now.state === 'failed';
+        wgToast((failed ? '✗ Service failed (crash-loop): ' : '⚠ Service down: ')
+          + now.profile + ' on ' + now.node, 'err');
+      } else if (!was.alive && now.alive) {
+        wgToast('✓ Service recovered: ' + now.profile + ' on ' + now.node, 'ok');
       }
     }
-    prevServices = cur;
+  }
+
+  function onSnapshot(snap) {
+    refreshLivePanels();
+    const cur = index(snap);
+    if (prev) { try { diffToasts(prev, cur); } catch (e) {} }   // skip first paint
+    prev = cur;
     window.dispatchEvent(new CustomEvent('witchgrid:state', { detail: snap }));
   }
 
@@ -3052,11 +3077,17 @@ function wgToast(msg, kind) {
   const t = document.createElement('div');
   t.className = 'wg-toast' + (kind === 'err' ? ' wg-toast-err' : (kind === 'ok' ? ' wg-toast-ok' : ''));
   t.textContent = msg;
+  t.title = 'click to dismiss';
   host.appendChild(t);
-  setTimeout(() => {
+  let gone = false;
+  const dismiss = () => {
+    if (gone) return; gone = true;
     t.classList.add('wg-toast-out');
     setTimeout(() => t.remove(), 300);
-  }, 6000);
+  };
+  t.addEventListener('click', dismiss);
+  // Errors dwell longer (8s) than ok/info (5s) so a failure doesn't slip past.
+  setTimeout(dismiss, kind === 'err' ? 8000 : 5000);
 }
 window.wgToast = wgToast;
 

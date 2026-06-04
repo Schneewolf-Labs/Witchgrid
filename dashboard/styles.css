@@ -749,6 +749,7 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
 }
 .wg-toast {
   pointer-events: auto;
+  cursor: pointer;
   background: var(--bg-2);
   color: var(--fg-1);
   border: 1px solid var(--border);
