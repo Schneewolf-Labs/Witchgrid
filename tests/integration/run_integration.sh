@@ -19,7 +19,7 @@ AGENT_BIN="${AGENT_BIN:-$ROOT/agent/witchgrid-agent}"
 FAKE="$ROOT/tests/integration/fake_llama_server.py"
 MODEL="$ROOT/tests/fixtures/nemo_llama.gguf"   # a valid GGUF for any metadata read
 
-CP_PORT=8765                                    # CP binds 8765 (not yet env-configurable)
+CP_PORT=8765                                    # default bind (override: WITCHGRID_CP_PORT)
 AGENT_PORT=8766
 NODE_ID="test-agent"
 SVC_PORT=18950
@@ -60,7 +60,7 @@ if curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
 fi
 
 echo "[integration] booting CP ($CP_URL)…"
-( cd "$TMP/cp" && WITCHGRID_DATA_DIR="$TMP/cp" WITCHGRID_STALE_NODE_SECONDS="$STALE_SECS" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
+( cd "$TMP/cp" && WITCHGRID_DATA_DIR="$TMP/cp" WITCHGRID_STALE_NODE_SECONDS="$STALE_SECS" WITCHGRID_CP_PORT="$CP_PORT" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
 CP_PID=$!; disown "$CP_PID" 2>/dev/null || true
 for i in $(seq 1 30); do curl -fsS "$CP_URL/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
 if ! curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
@@ -92,6 +92,13 @@ echo "[integration] assertions:"
 
 check "CP /healthz ok" \
 	bash -c "curl -fsS '$CP_URL/healthz' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"status\")==\"ok\" else 1)'"
+
+# version single-source-of-truth, surfaced in /healthz + /metrics
+check "/healthz reports a version" \
+	bash -c "curl -fsS '$CP_URL/healthz' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"version\") else 1)'"
+
+check "/metrics exposes witchgrid_build_info" \
+	bash -c "curl -fsS '$CP_URL/metrics' | grep -q '^witchgrid_build_info{version='"
 
 check "agent registered + /nodes reflects it" \
 	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; ns=json.load(sys.stdin); sys.exit(0 if any(n[\"node_id\"]==\"$NODE_ID\" for n in ns) else 1)'"

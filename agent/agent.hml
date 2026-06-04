@@ -58,6 +58,7 @@ import { homedir } from "@stdlib/os";
 import { exists, make_dirs } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
+import { WITCHGRID_VERSION } from "../version";
 import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
@@ -338,6 +339,7 @@ fn ensure_canonical_dir(path: string): null {
 }
 
 fn main(): null {
+	print("[agent] witchgrid agent " + WITCHGRID_VERSION);
 	init_auth();
 	let cp_url     = require_env("WITCHGRID_CP_URL");
 	let agent_url  = require_env("WITCHGRID_AGENT_URL");

@@ -1054,3 +1054,18 @@ function profileWizard() {
     cancel() { this.open = false; },
   };
 }
+
+// ── version badge ────────────────────────────────────────────────────
+// Fill any #wg-version element from /healthz so the dashboard shows which
+// CP build it's talking to (single source of truth: version.hml).
+(function () {
+  function fill() {
+    const el = document.getElementById('wg-version');
+    if (!el) return;
+    fetch('/healthz').then((r) => r.json()).then((d) => {
+      if (d && d.version) el.textContent = 'v' + d.version;
+    }).catch(() => {});
+  }
+  if (document.readyState !== 'loading') fill();
+  else document.addEventListener('DOMContentLoaded', fill);
+})();

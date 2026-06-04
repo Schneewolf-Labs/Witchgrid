@@ -36,14 +36,20 @@ import { exists, make_dirs, list_dir, remove_file } from "@stdlib/fs";
 import { getenv } from "@stdlib/env";
 import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
+import { WITCHGRID_VERSION } from "../version";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
          OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
 let DB_PATH = "witchgrid.db";
-let HOST = "0.0.0.0";
-let PORT = 8765;
+// Bind address/port. Default 0.0.0.0:8765 (LAN-first). Override with
+// WITCHGRID_CP_HOST / WITCHGRID_CP_PORT — e.g. bind 127.0.0.1 and front it
+// with an authenticating reverse proxy for anything beyond a trusted LAN.
+let _cp_host_env = getenv("WITCHGRID_CP_HOST");
+let HOST = (_cp_host_env == null || _cp_host_env.length == 0) ? "0.0.0.0" : _cp_host_env;
+let _cp_port_env = getenv("WITCHGRID_CP_PORT");
+let PORT = (_cp_port_env == null || _cp_port_env.length == 0) ? 8765 : i32(_cp_port_env);
 
 // Resolve where the sqlite DB lives. WITCHGRID_DATA_DIR pins it to an
 // absolute, CWD-independent location (created if missing); unset keeps the
@@ -1141,7 +1147,7 @@ fn handle_patch_node(req): object {
 }
 
 fn handle_health(req): object {
-	return { status: 200, body: "{\"status\":\"ok\"}" };
+	return { status: 200, body: stringify({ status: "ok", version: WITCHGRID_VERSION }) };
 }
 
 // GET /metrics — Prometheus text exposition. Built purely from the node
@@ -1202,6 +1208,9 @@ fn handle_metrics(req): object {
 	}
 
 	let out = ""
+		+ "# HELP witchgrid_build_info Witchgrid version, value always 1\n"
+		+ "# TYPE witchgrid_build_info gauge\n"
+		+ "witchgrid_build_info{version=\"" + WITCHGRID_VERSION + "\"} 1\n"
 		+ "# HELP witchgrid_up 1 if the control plane is serving requests\n"
 		+ "# TYPE witchgrid_up gauge\n"
 		+ "witchgrid_up 1\n"
@@ -3565,6 +3574,7 @@ fn main(): null {
 	exec(DB, "PRAGMA synchronous=NORMAL", []);
 	init_db(DB);
 	print("[cp] sqlite ready: " + DB_PATH);
+	print("[cp] witchgrid control plane " + WITCHGRID_VERSION);
 	init_auth();
 
 	// Detached background task: sqlite auto-backup loop. No-op when
@@ -3673,6 +3683,13 @@ fn main(): null {
 		  prefix: true, public: true },
 	];
 
+	// NOTE: graceful WAL-checkpoint-on-SIGTERM is intentionally NOT wired up.
+	// Hemlock's async runtime (the libuv/libev event loop serve() runs on)
+	// overrides the raw sigaction disposition, so a signal handler registered
+	// here never fires once the loop is up (it works only in single-threaded
+	// programs). Needs Hemlock-side uv_signal integration. Low impact: SQLite
+	// WAL is crash-durable, so an ungraceful stop recovers + checkpoints on the
+	// next open; the periodic VACUUM-into backup also bounds WAL growth.
 	serve(HOST, PORT, routes, cp_auth_check);
 	close_db(DB);
 	return null;

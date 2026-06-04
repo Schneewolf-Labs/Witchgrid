@@ -146,8 +146,12 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid.db` (+ `-wal`/`-shm`). Absolute, created if missing. **Set this** so the DB doesn't follow CWD — a stray fresh DB drops every node/profile/service from view. The CP logs `creating NEW database at …` when it makes a fresh one. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | Bearer secret required on inbound calls + sent on outbound. Unset = no auth (LAN-trusted). Must match on CP **and every agent**. |
 | `WITCHGRID_STALE_NODE_SECONDS` | `90` | A node whose last heartbeat is older than this drops out of placement (and shows `node_up=0` in `/metrics`). Keep it ≳ 3× the agent's `WITCHGRID_HEARTBEAT_SECONDS` so one missed beat doesn't flap a node out. |
+| `WITCHGRID_CP_HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` and front it with an authenticating reverse proxy for anything beyond a trusted LAN. |
+| `WITCHGRID_CP_PORT` | `8765` | Bind port. |
 
-> The CP currently binds `0.0.0.0:8765` (not yet env-configurable — a 1.0 item).
+> The CP version is surfaced in `/healthz` (`{"status":"ok","version":…}`),
+> `/metrics` (`witchgrid_build_info{version=…}`), and the dashboard header —
+> single source of truth in `version.hml`, bumped at release.
 > Backup cadence/dir/retention are runtime settings (`PUT /api/settings`:
 > `db_backup_interval_min`, `db_backup_dir`, `db_backup_keep`).
 

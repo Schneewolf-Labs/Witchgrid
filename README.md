@@ -118,12 +118,12 @@ CI (`.github/workflows/build.yml`) builds both platforms, runs the unit + integr
 
 Capability-wise it's there; 1.0 is about coherence, deployability, and test breadth:
 
-- [ ] **Single source of truth for the version**, surfaced in `/healthz` + `/metrics` + dashboard.
-- [ ] **CP bind configurable** (`WITCHGRID_CP_HOST`/`PORT`; currently hardcoded `:8765`).
+- [x] **Single source of truth for the version** (`version.hml`), surfaced in `/healthz` + `/metrics` (`witchgrid_build_info`) + the dashboard header.
+- [x] **CP bind configurable** — `WITCHGRID_CP_HOST` / `WITCHGRID_CP_PORT`.
 - [x] **Deploy/ops documented** — see [`docs/operations.md`](docs/operations.md).
-- [ ] **Test breadth** — automate the remaining edge cases now that the integration harness exists (port-contention, stale-node drop, spawn-failure, bad-model-path).
-- [ ] **Auth posture finalized** — harden + document the shared-secret path; default-LAN bind.
-- [ ] Graceful shutdown (WAL checkpoint on SIGTERM); 2-agent cross-node integration test.
+- [x] **Test breadth** — the integration harness now covers port-contention, stale-node drop, spawn-failure, bad-model-path, multi-node registration, the CPU/GPU device override, and the live/health endpoints (26 assertions).
+- [ ] **Auth posture finalized** — shared-secret path works + is documented (LAN-first). Still open: an operator login for the dashboard (slice 2) + per-consumer `/v1/llama` tokens (slice 3). Until then: keep it on a trusted LAN or behind an authenticating reverse proxy (HTTP-only, no TLS).
+- [~] **Graceful shutdown / 2-agent test** — single-host multi-node registration is tested; WAL-checkpoint-on-SIGTERM is **blocked on Hemlock**: its async runtime (the libuv/libev loop `serve()` runs on) overrides the signal disposition, so handlers don't fire once the loop is up. SQLite WAL is crash-durable, so an ungraceful stop recovers on next open — low impact until the Hemlock fix lands.
 
 ## Related projects
 

@@ -39,6 +39,7 @@ export let INDEX_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
@@ -3423,6 +3424,21 @@ function profileWizard() {
     cancel() { this.open = false; },
   };
 }
+
+// ── version badge ────────────────────────────────────────────────────
+// Fill any #wg-version element from /healthz so the dashboard shows which
+// CP build it's talking to (single source of truth: version.hml).
+(function () {
+  function fill() {
+    const el = document.getElementById('wg-version');
+    if (!el) return;
+    fetch('/healthz').then((r) => r.json()).then((d) => {
+      if (d && d.version) el.textContent = 'v' + d.version;
+    }).catch(() => {});
+  }
+  if (document.readyState !== 'loading') fill();
+  else document.addEventListener('DOMContentLoaded', fill);
+})();
 ";
 
 export let LOGO_SVG = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>
