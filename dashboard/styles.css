@@ -792,3 +792,23 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
   gap: 0.35rem;
 }
 .health-issues li { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+
+/* ── collapsible secondary sections (Overview progressive disclosure) ── */
+.ov-collapse { margin: 0 0 1.25rem 0; }
+.ov-collapse > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+.ov-collapse > summary::-webkit-details-marker { display: none; }
+.ov-collapse > summary::before {
+  content: "▸";
+  color: var(--fg-dim);
+  font-size: 0.85em;
+}
+.ov-collapse[open] > summary::before { content: "▾"; }
+.ov-collapse > summary h2 { display: inline; margin: 0; }
+.ov-collapse > summary:hover h2 { color: var(--accent); }
+.ov-collapse > :not(summary) { margin-top: 0.75rem; }
