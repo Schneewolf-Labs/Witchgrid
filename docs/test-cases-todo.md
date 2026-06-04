@@ -8,9 +8,9 @@ Bugs / edge cases hit during development that don't have automated coverage yet.
 
 2. **Cross-box agent registration round-trips hardware faithfully.** Specifically: agent on box B, CP on box A, GET /nodes from box A reflects the actual `nvidia-smi` output on box B (gpu count, names, free_mb), not box A's hardware. Caught a bug where the agent reported the *agent box's* hardware but with the *CP box's* `agent_url` if the env vars were swapped — easy to misread.
 
-3. **Stale agent falls out of placement after `STALE_NODE_SECONDS`.** Boot CP+agent, kill agent, wait >90s, POST /services → expect 503-ish (no live placement target) not "spawned on dead agent". GET /nodes still shows the dead node with its old `last_seen_at` (visibility-only).
+3. ✅ **DONE** (`tests/integration/run_integration.sh`). **Stale agent falls out of placement after `STALE_NODE_SECONDS`.** Boot CP+agent, kill agent, wait >90s, POST /services → expect 503-ish (no live placement target) not "spawned on dead agent". GET /nodes still shows the dead node with its old `last_seen_at` (visibility-only).
 
-4. **Heartbeat advances `last_seen_at`.** Boot agent, snapshot `last_seen_at` from /nodes, wait one heartbeat tick, assert it advanced by ~heartbeat_seconds.
+4. ✅ **DONE** (`tests/integration/run_integration.sh`). **Heartbeat advances `last_seen_at`.** Boot agent, snapshot `last_seen_at` from /nodes, wait one heartbeat tick, assert it advanced by ~heartbeat_seconds.
 
 ## Auto-spawn
 

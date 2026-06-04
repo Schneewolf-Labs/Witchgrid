@@ -1240,8 +1240,11 @@ fn lookup_agent(node_id: string) {
 // 90s = 3x the agent's 30s heartbeat interval. Gives one missed
 // heartbeat of slack so a transient network blip doesn't drop a node
 // out of placement, but a genuinely-dead agent falls out within a
-// minute and a half.
-let STALE_NODE_SECONDS = 90;
+// minute and a half. Override via WITCHGRID_STALE_NODE_SECONDS (tuning,
+// or tests that need fast eviction); keep it ≳ 3x the agent's
+// WITCHGRID_HEARTBEAT_SECONDS so a single missed beat doesn't flap.
+let _stale_env = getenv("WITCHGRID_STALE_NODE_SECONDS");
+let STALE_NODE_SECONDS = (_stale_env == null || _stale_env.length == 0) ? 90 : i32(_stale_env);
 
 fn list_all_agents(): array {
 	let rows = query(DB,

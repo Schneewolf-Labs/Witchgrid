@@ -23,6 +23,8 @@ CP_PORT=8765                                    # CP binds 8765 (not yet env-con
 AGENT_PORT=8766
 NODE_ID="test-agent"
 SVC_PORT=18950
+HEARTBEAT_SECS=1                                # fast agent heartbeat (liveness tests)
+STALE_SECS=4                                    # CP evicts a silent node after ~4x heartbeat
 CP_URL="http://127.0.0.1:${CP_PORT}"
 AGENT_URL="http://127.0.0.1:${AGENT_PORT}"
 
@@ -54,7 +56,7 @@ if curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
 fi
 
 echo "[integration] booting CP ($CP_URL)…"
-( cd "$TMP/cp" && WITCHGRID_DATA_DIR="$TMP/cp" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
+( cd "$TMP/cp" && WITCHGRID_DATA_DIR="$TMP/cp" WITCHGRID_STALE_NODE_SECONDS="$STALE_SECS" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
 CP_PID=$!; disown "$CP_PID" 2>/dev/null || true
 for i in $(seq 1 30); do curl -fsS "$CP_URL/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
 if ! curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
@@ -74,6 +76,7 @@ PATH="$BIN:$PATH" \
 	WITCHGRID_NODE_ID="$NODE_ID" \
 	WITCHGRID_DATA_DIR="$TMP/agent" \
 	WITCHGRID_MODEL_DIR="$TMP/models" \
+		WITCHGRID_HEARTBEAT_SECONDS="$HEARTBEAT_SECS" \
 	"$AGENT_BIN" >"$TMP/agent.log" 2>&1 &
 AGENT_PID=$!; disown "$AGENT_PID" 2>/dev/null || true
 # wait for the node to register with the CP
@@ -139,6 +142,35 @@ python3 -c "import socket,time; s=socket.socket(); s.bind(('0.0.0.0',18085)); s.
 check "auto-port spawn avoids an OS-occupied default_port (#17)" \
 	bash -c "curl -fsS -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"memory-phoenix\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\"}' | python3 -c 'import sys,json; d=json.load(sys.stdin); p=d.get(\"port\"); sys.exit(0 if d.get(\"pid\") and p and p!=18085 else 1)'"
 kill "$SQ2" 2>/dev/null; wait "$SQ2" 2>/dev/null
+
+# #4: a live agent's heartbeat must keep advancing its last_seen_at. Snapshot,
+# then poll until it moves forward (cadence forced fast via
+# WITCHGRID_HEARTBEAT_SECONDS, but each beat refreshes hardware so real spacing
+# jitters — poll-until rather than a fixed sleep). ISO 'YYYY-MM-DD HH:MM:SS'
+# compares lexicographically = chronologically.
+node_last_seen() { curl -fsS "$CP_URL/nodes" | python3 -c 'import sys,json; n=[x for x in json.load(sys.stdin) if x["node_id"]=="'"$NODE_ID"'"][0]; print(n.get("last_seen_at",""))'; }
+LS1=$(node_last_seen)
+HB_ADVANCED=0
+for _ in $(seq 1 20); do
+	LS2=$(node_last_seen)
+	if [ -n "$LS2" ] && [ "$LS2" \> "$LS1" ]; then HB_ADVANCED=1; break; fi
+	sleep 1
+done
+check "heartbeat advances the node's last_seen_at (#4)" \
+	bash -c "[ $HB_ADVANCED -eq 1 ]"
+
+# #3: a silenced agent must drop out of live placement after STALE_NODE_SECONDS
+# (forced short here). Kill the agent to stop heartbeats, wait past the cutoff,
+# then: a spawn aimed at it is refused (503, not "spawned on a dead agent"),
+# /metrics reports node_up=0 (the cutoff fired), and /nodes still lists it
+# (visibility-only — soft-delete philosophy). This MUST be the last block: it
+# tears down the agent.
+kill -9 "$AGENT_PID" 2>/dev/null; AGENT_PID=""
+sleep $((STALE_SECS + 2))
+check "spawn aimed at a downed agent is refused (503), not falsely spawned (#3)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"designer-cpu\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"port\":18970}')\" = '503' ]"
+check "downed node is node_up=0 in /metrics yet still listed in /nodes (#3)" \
+	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; sys.exit(0 if any(n[\"node_id\"]==\"$NODE_ID\" for n in json.load(sys.stdin)) else 1)' && curl -fsS '$CP_URL/metrics' | grep -q 'witchgrid_node_up{node=\"$NODE_ID\"} 0'"
 
 echo "[integration] $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then

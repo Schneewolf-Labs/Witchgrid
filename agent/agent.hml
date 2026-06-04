@@ -73,7 +73,10 @@ let DB_PATH = "witchgrid-agent.db";
 // 30s gives CP enough resolution that placement sees current free_mb
 // without burning excessive RPC. CP's stale-node cutoff is 90s (3x
 // this) so a single missed heartbeat doesn't flap us out of placement.
-let HEARTBEAT_SECONDS = 30;
+// Override via WITCHGRID_HEARTBEAT_SECONDS (tuning, or tests that need a
+// fast cadence). Keep CP's WITCHGRID_STALE_NODE_SECONDS ≳ 3x this.
+let _hb_env = getenv("WITCHGRID_HEARTBEAT_SECONDS");
+let HEARTBEAT_SECONDS = (_hb_env == null || _hb_env.length == 0) ? 30 : i32(_hb_env);
 
 // ── auth (shared bearer; matches CP's slice-1 design) ─────────────
 //

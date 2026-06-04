@@ -145,6 +145,7 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 |-----|---------|---------|
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid.db` (+ `-wal`/`-shm`). Absolute, created if missing. **Set this** so the DB doesn't follow CWD — a stray fresh DB drops every node/profile/service from view. The CP logs `creating NEW database at …` when it makes a fresh one. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | Bearer secret required on inbound calls + sent on outbound. Unset = no auth (LAN-trusted). Must match on CP **and every agent**. |
+| `WITCHGRID_STALE_NODE_SECONDS` | `90` | A node whose last heartbeat is older than this drops out of placement (and shows `node_up=0` in `/metrics`). Keep it ≳ 3× the agent's `WITCHGRID_HEARTBEAT_SECONDS` so one missed beat doesn't flap a node out. |
 
 > The CP currently binds `0.0.0.0:8765` (not yet env-configurable — a 1.0 item).
 > Backup cadence/dir/retention are runtime settings (`PUT /api/settings`:
@@ -162,6 +163,7 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | `WITCHGRID_MODEL_DIR` | `~/.witchgrid/models` | Canonical model dir; pulls land here; reported as `canonical` disk. Created if missing. |
 | `WITCHGRID_MODEL_DIRS_EXTRA` | *(empty)* | Colon-separated extra dirs to scan read-only into the catalog. |
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid-agent.db`. Same rationale as the CP. |
+| `WITCHGRID_HEARTBEAT_SECONDS` | `30` | How often the agent re-probes hardware and heartbeats the CP (advancing its `last_seen_at`). Lower = fresher `free_mb` for placement at the cost of more RPC + `nvidia-smi` calls. Keep the CP's `WITCHGRID_STALE_NODE_SECONDS` ≳ 3× this. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | See above; must match the CP. |
 
 ## Auto-restart watchdog
