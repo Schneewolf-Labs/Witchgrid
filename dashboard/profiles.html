@@ -49,7 +49,10 @@
     <section x-data="profileEditor()">
       <div style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
         <h2 style="margin:0">Profiles</h2>
-        <button class="row-action" onclick="newProfile()">+ new profile</button>
+        <div style="display:flex; gap:0.5rem;">
+          <button class="row-action" onclick="newProfileWizard()">✨ guided setup</button>
+          <button class="row-action" onclick="newProfile()">+ blank profile</button>
+        </div>
       </div>
       <p class="meta" style="margin: 0.25rem 0 0.5rem 0">Spawn templates owned by CP. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time. Edits bump the version; running services keep their old argv.</p>
       <div hx-get="/ui/profiles" hx-trigger="load, every 30s">loading…</div>
@@ -186,6 +189,89 @@
         </div>
       </div>
     </section>
+
+    <!-- ── Guided profile wizard ─────────────────────────────────── -->
+    <div x-data="profileWizard()">
+      <div class="modal-backdrop" x-show="open" x-cloak @click.self="cancel()" style="display:none">
+        <div class="modal-card" @click.stop style="max-width:760px">
+          <h3 style="margin:0 0 0.25rem 0">New profile — guided setup</h3>
+          <p class="meta" style="margin:0 0 1rem 0">Step <span x-text="step"></span> of 3 ·
+            <span x-text="step===1 ? 'use case' : (step===2 ? 'model' : 'name &amp; review')"></span></p>
+
+          <!-- Step 1: use case -->
+          <div x-show="step===1">
+            <p class="meta" style="margin:0 0 0.75rem 0">What will this model be used for? Pick the closest — it sets sensible defaults you can tweak.</p>
+            <div class="wiz-grid">
+              <template x-for="uc in useCases" :key="uc.id">
+                <button type="button" class="wiz-card" :class="useCase &amp;&amp; useCase.id===uc.id ? 'wiz-card-sel' : ''" @click="pickUseCase(uc)">
+                  <span class="wiz-icon" x-text="uc.icon"></span>
+                  <strong x-text="uc.label"></strong>
+                  <span class="meta" x-text="uc.desc"></span>
+                </button>
+              </template>
+            </div>
+          </div>
+
+          <!-- Step 2: model -->
+          <div x-show="step===2">
+            <p class="meta" style="margin:0 0 0.5rem 0">Pick the model from the catalog (resolves to a per-node path at spawn time).</p>
+            <select x-model="alias" x-show="!useRaw" style="width:100%">
+              <option value="">— pick from catalog —</option>
+              <template x-for="m in catalog" :key="m.alias">
+                <option :value="m.alias" x-text="m.alias + ' · ' + (m.size_mb >= 1024 ? (m.size_mb/1024).toFixed(1)+' GB' : m.size_mb+' MB') + ' · on ' + m.on_nodes.length + ' node' + (m.on_nodes.length===1?'':'s')"></option>
+              </template>
+            </select>
+            <div x-show="useRaw">
+              <input type="text" x-model="rawPath" placeholder="/path/to/model.gguf" style="width:100%">
+            </div>
+            <p class="meta" style="margin:0.5rem 0 0 0">
+              <span x-show="!useRaw"><a href="/catalog">not in the catalog? pull from HuggingFace →</a> · </span>
+              <a href="#" @click.prevent="useRaw=!useRaw" x-text="useRaw ? '← back to catalog picker' : 'use a raw path instead →'"></a>
+            </p>
+          </div>
+
+          <!-- Step 3: name + review -->
+          <div x-show="step===3">
+            <div class="form-grid">
+              <div class="full">
+                <label>profile name</label>
+                <input type="text" x-model="name" placeholder="my-profile">
+              </div>
+              <div x-show="showCtx">
+                <label>context</label>
+                <input type="number" x-model="context">
+              </div>
+              <div>
+                <label>device</label>
+                <select x-model="device">
+                  <option value="auto">auto (use-case default)</option>
+                  <option value="cpu">CPU</option>
+                  <option value="gpu">GPU</option>
+                </select>
+              </div>
+              <div x-show="showKv">
+                <label>kv cache</label>
+                <select x-model="kv_type">
+                  <template x-for="q in kvQuants" :key="q"><option :value="q" x-text="q"></option></template>
+                </select>
+              </div>
+            </div>
+            <p class="meta" style="margin:0.75rem 0 0 0" x-text="summary()"></p>
+          </div>
+
+          <p class="msg err" x-show="error" x-text="error" style="margin-top:0.75rem"></p>
+
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem; flex-wrap:wrap">
+            <button type="button" class="row-action" @click="back()" x-show="step>1">← back</button>
+            <span style="flex:1"></span>
+            <button type="button" class="row-action" @click="openAdvanced()" x-show="step===3" :disabled="!useCase">customize (advanced)…</button>
+            <button type="button" @click="cancel()">cancel</button>
+            <button type="button" @click="next()" x-show="step<3" :disabled="!canNext()">next →</button>
+            <button type="button" @click="create()" x-show="step===3" :disabled="busy || !name" x-text="busy ? '…' : 'create profile'"></button>
+          </div>
+        </div>
+      </div>
+    </div>
 
     <section x-data="aliasEditor()">
       <h2>Profile aliases</h2>

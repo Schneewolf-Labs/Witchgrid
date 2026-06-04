@@ -813,3 +813,32 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
 .ov-collapse > summary h2 { display: inline; margin: 0; }
 .ov-collapse > summary:hover h2 { color: var(--accent); }
 .ov-collapse > :not(summary) { margin-top: 0.75rem; }
+
+/* ── guided profile wizard ──────────────────────────────────────────── */
+.wiz-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+.wiz-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  text-align: left;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--fg-1);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wiz-card:hover { border-color: var(--accent); }
+.wiz-card-sel {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.wiz-card .wiz-icon { font-size: 1.4rem; line-height: 1; }
+.wiz-card strong { font-size: 0.9rem; }
+.wiz-card .meta { font-size: 0.75rem; line-height: 1.3; }

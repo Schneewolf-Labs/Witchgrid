@@ -189,6 +189,8 @@ function profileEditor() {
       // Listen for synthetic events fired by the in-table buttons.
       window.addEventListener('witchgrid:edit-profile', (e) => this.openFor(e.detail.name));
       window.addEventListener('witchgrid:new-profile',  ()  => this.openNew());
+      // "customize (advanced)" hand-off from the guided wizard.
+      window.addEventListener('witchgrid:wizard-advanced', (e) => this.openFromWizard(e.detail));
       // Auto-open prefilled from a ?prefill_alias=... query string —
       // used by the catalog page's "create profile for <alias>" CTA
       // after a successful HF pull. We pop the query off the URL so a
@@ -338,6 +340,30 @@ function profileEditor() {
     },
 
     cancel() { this.open = false; this.error = ''; },
+
+    // Open the full editor pre-populated from the guided wizard's choices,
+    // so an operator can fine-tune intents/flags before saving.
+    openFromWizard(d) {
+      this.reset();
+      this.isNew = true;
+      this.open = true;
+      this.loadCatalog();
+      this.loadCapabilities();
+      const p = (d && d.profile) || {};
+      this.name = (d && d.name) || '';
+      this.binary = p.binary || 'llama-server';
+      this.default_port = p.default_port || 18080;
+      this.context = p.context || 4096;
+      this.kv_type = p.kv_type || 'f16';
+      this.default_device = p.default_device || 'auto';
+      this.model_alias = p.model_alias || '';
+      this.default_model = p.default_model || '';
+      this.useRawPath = !this.model_alias && !!this.default_model;
+      if (p.hf_source) { this.hf_repo = p.hf_source.repo || ''; this.hf_file = p.hf_source.file || ''; }
+      this.extra_flags = (p.extra_flags || []).join('\n');
+      this.intentRows = Object.entries(p.intent || {}).map(([k, v]) => ({ k, v: String(v) }));
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+    },
 
     buildPayload() {
       const intent = {};
@@ -897,3 +923,134 @@ async function wgPollReady(profile, onPhase) {
   onPhase('timeout', null);
 }
 window.wgPollReady = wgPollReady;
+
+// ── guided profile wizard ────────────────────────────────────────────
+// Use-case presets that hide the intent/flag complexity behind a sensible
+// starting point. Each maps to the same profile shape buildPayload() emits.
+// llama-server cases expose context/kv in the review step; sd/whisper/piper
+// don't (no context/KV concept), so showCtx/showKv gate those fields.
+const USE_CASES = [
+  { id:'chat', icon:'💬', label:'Chat / Roleplay',
+    desc:'Conversational & RP models. GPU, long context, KV-quantized.',
+    binary:'llama-server', device:'gpu', context:32768, kv_type:'q4_0', port:18080,
+    intent:{ context:32768, kv_cache_k:'q4_0', kv_cache_v:'q4_0', gpu_layers:99, flash_attention:true, parallel_slots:1 } },
+  { id:'assistant', icon:'🤖', label:'Assistant / Instruct',
+    desc:'General instruction-following. GPU, balanced context.',
+    binary:'llama-server', device:'gpu', context:16384, kv_type:'q8_0', port:18082,
+    intent:{ context:16384, kv_cache_k:'q8_0', kv_cache_v:'q8_0', gpu_layers:99, flash_attention:true, parallel_slots:1 } },
+  { id:'summarizer', icon:'📝', label:'Summarizer (CPU)',
+    desc:'Background summarization. CPU-only so it never competes for VRAM.',
+    binary:'llama-server', device:'cpu', context:16384, kv_type:'q4_0', port:18085,
+    intent:{ context:16384, kv_cache_k:'q4_0', kv_cache_v:'q4_0', gpu_layers:0, parallel_slots:1 } },
+  { id:'structured', icon:'🧩', label:'Structured output (JSON)',
+    desc:'Tool/JSON generation via the chat template. Adds --jinja.',
+    binary:'llama-server', device:'cpu', context:4096, kv_type:'q8_0', port:18081, extra_flags:['--jinja'],
+    intent:{ context:4096, kv_cache_k:'q8_0', kv_cache_v:'q8_0', gpu_layers:0, parallel_slots:1 } },
+  { id:'embeddings', icon:'🔢', label:'Embeddings',
+    desc:'Vector embeddings. CPU, --embedding mode.',
+    binary:'llama-server', device:'cpu', context:8192, kv_type:'f16', port:18090, extra_flags:['--embedding'],
+    intent:{ context:8192, gpu_layers:0 } },
+  { id:'image', icon:'🎨', label:'Image generation',
+    desc:'stable-diffusion.cpp server (A1111-compatible API).',
+    binary:'sd-server', device:'gpu', port:19080, intent:{} },
+  { id:'stt', icon:'🎙️', label:'Speech → text',
+    desc:'whisper.cpp transcription server.',
+    binary:'whisper-server', device:'gpu', port:19090, intent:{} },
+  { id:'tts', icon:'🔊', label:'Text → speech',
+    desc:'piper voice synthesis.',
+    binary:'piper', device:'cpu', port:19095, intent:{} },
+];
+
+function newProfileWizard() { window.dispatchEvent(new CustomEvent('witchgrid:new-wizard')); }
+
+function profileWizard() {
+  return {
+    open: false, step: 1, busy: false, error: '',
+    useCases: USE_CASES,
+    useCase: null,
+    catalog: [],
+    alias: '', useRaw: false, rawPath: '',
+    name: '', context: 4096, device: 'auto', kv_type: 'f16',
+    kvQuants: KV_QUANT_OPTIONS,
+    get showCtx() { return !!(this.useCase && this.useCase.binary === 'llama-server'); },
+    get showKv()  { return this.showCtx; },
+
+    init() { window.addEventListener('witchgrid:new-wizard', () => this.start()); },
+    async start() {
+      this.reset();
+      this.open = true;
+      try { const r = await fetch('/api/catalog'); if (r.ok) this.catalog = await r.json(); } catch (e) {}
+    },
+    reset() {
+      this.step = 1; this.useCase = null; this.alias = ''; this.useRaw = false;
+      this.rawPath = ''; this.name = ''; this.error = ''; this.busy = false;
+      this.context = 4096; this.device = 'auto'; this.kv_type = 'f16';
+    },
+    pickUseCase(uc) {
+      this.useCase = uc;
+      this.context = uc.context || 4096;
+      this.device = uc.device || 'auto';
+      this.kv_type = uc.kv_type || 'f16';
+    },
+    canNext() {
+      if (this.step === 1) return !!this.useCase;
+      if (this.step === 2) return !!(this.alias || (this.useRaw && this.rawPath));
+      return true;
+    },
+    next() { if (this.canNext() && this.step < 3) { if (this.step === 2) this.suggestName(); this.step++; } },
+    back() { if (this.step > 1) this.step--; },
+    suggestName() {
+      if (this.name) return;
+      const src = this.alias || this.rawPath.split('/').pop() || 'profile';
+      const base = src.replace(/\.q\d.*$/i, '').replace(/\.gguf$/i, '').replace(/[^a-z0-9-]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase();
+      this.name = (base || 'profile') + (this.useCase ? '-' + this.useCase.id : '');
+    },
+    summary() {
+      const uc = this.useCase; if (!uc) return '';
+      return 'Creates a ' + uc.binary + ' profile · ' + this.device.toUpperCase()
+        + (this.showCtx ? ' · ctx ' + this.context + ' · kv ' + this.kv_type : '')
+        + ' · model ' + (this.alias || this.rawPath || '—');
+    },
+    buildProfile() {
+      const uc = this.useCase;
+      const intent = Object.assign({}, uc.intent || {});
+      if ('context' in intent) intent.context = parseInt(this.context, 10);
+      const profile = {
+        binary: uc.binary,
+        intent,
+        extra_flags: (uc.extra_flags || []).slice(),
+        default_port: uc.port || 18080,
+        context: this.showCtx ? parseInt(this.context, 10) : 0,
+        kv_type: this.kv_type,
+        default_device: this.device,
+      };
+      if (this.useRaw && this.rawPath) profile.default_model = this.rawPath;
+      else if (this.alias) profile.model_alias = this.alias;
+      const m = this.catalog.find((c) => c.alias === this.alias);
+      if (m && m.hf_repo && m.hf_file) profile.hf_source = { repo: m.hf_repo, file: m.hf_file };
+      return profile;
+    },
+    async create() {
+      this.busy = true; this.error = '';
+      try {
+        const r = await fetch('/api/profiles', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name: this.name, profile: this.buildProfile() }),
+        });
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) { this.error = d.error || ('HTTP ' + r.status); this.busy = false; return; }
+        this.open = false;
+        if (window.wgToast) window.wgToast('✓ Profile created: ' + this.name, 'ok');
+        window.location.reload();
+      } catch (e) { this.error = String(e); this.busy = false; }
+    },
+    // Hand the computed profile to the full editor for fine-tuning.
+    openAdvanced() {
+      window.dispatchEvent(new CustomEvent('witchgrid:wizard-advanced', {
+        detail: { name: this.name, profile: this.buildProfile() },
+      }));
+      this.open = false;
+    },
+    cancel() { this.open = false; },
+  };
+}

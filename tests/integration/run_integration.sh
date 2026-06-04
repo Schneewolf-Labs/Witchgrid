@@ -126,6 +126,14 @@ check "/api/state snapshot reports services with alive + state" \
 check "/api/ready reports the spawned service ready" \
 	bash -c "curl -fsS '$CP_URL/api/ready/designer-cpu' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"ready\")==True else 1)'"
 
+# Guided-wizard contract: the freeform profile JSON the wizard builds (with
+# default_device + intent) must round-trip through POST /api/profiles. (Spawn-
+# ability of freeform CP profiles is already covered by the seeded-profile
+# spawn tests above; we don't re-spawn here to avoid leaving a service the
+# fast-heartbeat watchdog would churn on.)
+check "API-created freeform profile round-trips (wizard create contract)" \
+	bash -c "curl -fsS -X POST '$CP_URL/api/profiles' -H 'content-type: application/json' -d '{\"name\":\"wiz-it\",\"profile\":{\"binary\":\"llama-server\",\"intent\":{\"context\":4096,\"gpu_layers\":0},\"extra_flags\":[\"--jinja\"],\"default_port\":18098,\"context\":4096,\"kv_type\":\"q4_0\",\"default_device\":\"cpu\",\"default_model\":\"$MODEL\"}}' >/dev/null && curl -fsS '$CP_URL/api/profiles/wiz-it' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"binary\")==\"llama-server\" and d.get(\"default_device\")==\"cpu\" and d.get(\"intent\",{}).get(\"gpu_layers\")==0 and \"--jinja\" in d.get(\"extra_flags\",[]) else 1)'"
+
 check "non-stream /v1/llama proxy returns JSON" \
 	bash -c "curl -fsS -X POST '$CP_URL/v1/llama/designer-cpu/completion' -H 'content-type: application/json' -d '{\"prompt\":\"hi\",\"n_predict\":4}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if \"content\" in d else 1)'"
 
