@@ -246,9 +246,20 @@
               this.msgError = true;
               this.msg = d.error || ('HTTP ' + r.status);
             } else {
-              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + (d.device ? ' (' + d.device.toUpperCase() + ')' : '') + ' — see Services below';
+              const where = d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port
+                + (d.device ? ' (' + d.device.toUpperCase() + ')' : '');
+              this.msg = 'spawned ' + where + ' — loading model…';
               const panel = document.querySelector('[hx-get="/ui/services"]');
               if (panel && window.htmx) window.htmx.trigger(panel, 'load');
+              this.busy = false;
+              const prof = this.profile;
+              if (window.wgPollReady) {
+                window.wgPollReady(prof, (phase) => {
+                  if (phase === 'ready')        this.msg = '✓ ready — ' + prof + ' is serving on port ' + d.port;
+                  else if (phase === 'timeout') this.msg = 'spawned ' + where + ' — still loading, see Services below';
+                });
+              }
+              return;
             }
           } catch (e) {
             this.msgError = true;

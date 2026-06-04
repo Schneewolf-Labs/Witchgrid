@@ -232,7 +232,10 @@ change instead of on a fixed poll — and a service dying raises a toast. Each
 connection runs in its own task (no blocking), and the htmx panels keep a slow
 30s timer purely as a fallback if SSE is unavailable (EventSource auto-reconnects
 otherwise). `GET /api/state` returns the same snapshot as a one-shot JSON for
-scripts or first paint. Nothing to configure.
+scripts or first paint. `GET /api/ready/{profile}` reports `{ready, phase}`
+for a service's `/health` — the spawn UI polls it to show **loading model… →
+ready** instead of a bare "spawned" while the model loads (`POST /services`
+returns when the process is up, ~10–15s before it answers). Nothing to configure.
 
 **Health banner.** The overview shows a failure-first banner: calm/green when
 everything's nominal, loud/red when a node is offline or a service is **down**

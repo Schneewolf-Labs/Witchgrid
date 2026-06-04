@@ -1916,6 +1916,39 @@ fn handle_resolve(req): object {
 	}) };
 }
 
+// GET /api/ready/{profile-or-alias} — one-shot readiness probe so the spawn
+// UI can show "loading model… → ready" instead of a bare "spawned" while a
+// freshly-spawned model is still loading (POST /services returns once the
+// process is up, ~10–15s before the model answers /health). Resolves the
+// live service and does a single health probe (path per binary). Public —
+// it's a status, not a secret.
+fn handle_service_ready(req): object {
+	let prefix = "/api/ready/";
+	if (req.path.length <= prefix.length) {
+		return { status: 400, body: "{\"error\":\"profile required: /api/ready/{profile}\"}" };
+	}
+	let raw = req.path.substr(prefix.length, req.path.length - prefix.length);
+	let slash = raw.find("/");
+	let alias = raw;
+	if (slash >= 0) { alias = raw.substr(0, slash); }
+	let profile_name = resolve_profile_name(alias);
+	let target = find_service_for_profile(profile_name);
+	if (target == null) {
+		return { status: 200, body: stringify({ ready: false, phase: "no-service" }) };
+	}
+	let profile = fetch_profile_by_name(profile_name);
+	let url = "http://" + target.agent_host + ":" + target.port
+		+ health_path_for(profile?.binary);
+	let ready = false;
+	try { let r = get(url, null); if (r.status_code == 200) { ready = true; } } catch (e) { }
+	return { status: 200, body: stringify({
+		ready: ready,
+		phase: (ready ? "ready" : "loading"),
+		host:  target.agent_host,
+		port:  target.port,
+	}) };
+}
+
 // Wait for a freshly-spawned llama-server to flip from "Loading model" to
 // 200 on /health. Returns true on ready, false on timeout. 60s ceiling
 // covers a 12B model on a fast GPU; bigger models on slower disks may
@@ -3595,6 +3628,7 @@ fn main(): null {
 		// dashboard updates without polling. Public, like the /ui fragments.
 		{ method: "GET",  path: "/events",          handler: handle_events,           public: true },
 		{ method: "GET",  path: "/api/state",        handler: handle_state,            public: true },
+		{ method: "GET",  path: "/api/ready/",       prefix: true, handler: handle_service_ready, public: true },
 		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, public: true },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles

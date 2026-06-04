@@ -121,6 +121,11 @@ check "the spawned backend answers /health" \
 check "/api/state snapshot reports services with alive + state" \
 	bash -c "curl -fsS '$CP_URL/api/state' | python3 -c 'import sys,json; d=json.load(sys.stdin); svc=d.get(\"services\",[]); sys.exit(0 if isinstance(d.get(\"nodes\"),list) and any(s.get(\"state\")==\"running\" and s.get(\"alive\") for s in svc) else 1)'"
 
+# /api/ready is the spawn-progress probe: reports a running service's health
+# (ready=true once it answers /health) so the UI shows loading → ready.
+check "/api/ready reports the spawned service ready" \
+	bash -c "curl -fsS '$CP_URL/api/ready/designer-cpu' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"ready\")==True else 1)'"
+
 check "non-stream /v1/llama proxy returns JSON" \
 	bash -c "curl -fsS -X POST '$CP_URL/v1/llama/designer-cpu/completion' -H 'content-type: application/json' -d '{\"prompt\":\"hi\",\"n_predict\":4}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if \"content\" in d else 1)'"
 

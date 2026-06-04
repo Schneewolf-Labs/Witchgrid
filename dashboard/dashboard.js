@@ -106,10 +106,20 @@ function spawnForm() {
         const d = await r.json();
         this.isError = !r.ok;
         if (r.ok) {
-          this.message = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port;
-        } else {
-          this.message = d.error || ('HTTP ' + r.status);
+          const where = d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port
+            + (d.device ? ' (' + d.device.toUpperCase() + ')' : '');
+          this.message = 'spawned ' + where + ' — loading model…';
+          this.busy = false;
+          const prof = this.profileName;
+          if (window.wgPollReady) {
+            window.wgPollReady(prof, (phase) => {
+              if (phase === 'ready')        this.message = '✓ ready — ' + prof + ' is serving on port ' + d.port;
+              else if (phase === 'timeout') this.message = 'spawned ' + where + ' — still loading, see Services';
+            });
+          }
+          return;
         }
+        this.message = d.error || ('HTTP ' + r.status);
       } catch (e) {
         this.isError = true;
         this.message = 'request failed: ' + e;
@@ -838,3 +848,22 @@ function healthBanner() {
     stop(d) { if (window.stopService)    window.stopService(d.id, d.profile, d.node); },
   };
 }
+
+// ── spawn readiness polling ──────────────────────────────────────────
+// POST /services returns once the process is up, but the model is still
+// loading for ~10–15s. Poll /api/ready/{profile} so the spawn UI can show
+// "loading model… → ready" instead of a misleading bare "spawned".
+// onPhase(phase, info) is called with 'loading' | 'ready' | 'timeout'.
+async function wgPollReady(profile, onPhase) {
+  const deadlineMs = Date.now() + 60000;
+  while (Date.now() < deadlineMs) {
+    await new Promise((r) => setTimeout(r, 1500));
+    let d = null;
+    try { d = await (await fetch('/api/ready/' + encodeURIComponent(profile))).json(); }
+    catch (e) { continue; }
+    if (d && d.ready) { onPhase('ready', d); return; }
+    onPhase('loading', d || {});
+  }
+  onPhase('timeout', null);
+}
+window.wgPollReady = wgPollReady;
