@@ -107,6 +107,39 @@ check "non-stream /v1/llama proxy returns JSON" \
 check "SSE /v1/llama proxy streams text/event-stream data: frames" \
 	bash -c "curl -fsS --no-buffer -X POST '$CP_URL/v1/llama/designer-cpu/completion' -H 'content-type: application/json' -d '{\"prompt\":\"hi\",\"stream\":true}' | grep -q '^data: '"
 
+# ── robustness assertions (lock in v0.8.0 behavior; test-cases-todo.md) ──
+
+# #10: a node's role and its hardware.gpus must agree — cpu ⇒ no GPUs, gpu ⇒ ≥1.
+# Portable across a CPU-only CI runner and a real GPU box.
+check "node role is consistent with hardware.gpus (#10)" \
+	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; n=[x for x in json.load(sys.stdin) if x[\"node_id\"]==\"$NODE_ID\"][0]; r=n.get(\"role\"); g=n.get(\"hardware\",{}).get(\"gpus\"); sys.exit(0 if r in (\"cpu\",\"gpu\") and isinstance(g,list) and ((g==[]) if r==\"cpu\" else len(g)>0) else 1)'"
+
+# #7: auto-spawn via the proxy must refuse cleanly (503) when the profile has no
+# resolvable model (default_model null + alias not in any catalog), not hang/500.
+check "auto-spawn refuses with 503 when no model is resolvable (#7)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/v1/llama/memory-phoenix/completion' -H 'content-type: application/json' -d '{\"prompt\":\"hi\"}')\" = '503' ]"
+
+# #1: a model path unreadable from the CP must return 422 (not crash the CP).
+# Assert the 422 AND that the CP is still answering afterwards.
+check "unreadable model path returns 422 and CP survives (#1)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"memory-phoenix\",\"node_id\":\"$NODE_ID\",\"model\":\"/nonexistent/nope.gguf\",\"port\":18960}')\" = '422' ] && curl -fsS '$CP_URL/healthz' >/dev/null"
+
+# #19: spawning onto an OS-occupied port — the backend can't bind and dies within
+# the grace window — must surface as a 502 'spawn died immediately', not a false
+# 201 that leaves the CP routing at a dead service.
+python3 -c "import socket,time; s=socket.socket(); s.bind(('0.0.0.0',18961)); s.listen(1); time.sleep(20)" & SQ=$!; sleep 0.5
+check "spawn onto an OS-occupied port surfaces 502, not false success (#19)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"memory-phoenix\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"port\":18961}')\" = '502' ]"
+kill "$SQ" 2>/dev/null; wait "$SQ" 2>/dev/null
+
+# #17: with the profile's default_port (18085) held by a foreign process, an
+# auto-port spawn (no explicit port) must detect the OS-level contention and pick
+# the next free port — and the backend must actually come up there.
+python3 -c "import socket,time; s=socket.socket(); s.bind(('0.0.0.0',18085)); s.listen(1); time.sleep(20)" & SQ2=$!; sleep 0.5
+check "auto-port spawn avoids an OS-occupied default_port (#17)" \
+	bash -c "curl -fsS -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"memory-phoenix\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\"}' | python3 -c 'import sys,json; d=json.load(sys.stdin); p=d.get(\"port\"); sys.exit(0 if d.get(\"pid\") and p and p!=18085 else 1)'"
+kill "$SQ2" 2>/dev/null; wait "$SQ2" 2>/dev/null
+
 echo "[integration] $PASS passed, $FAIL failed"
 if [ "$FAIL" -ne 0 ]; then
 	echo "--- cp.log (tail) ---"; tail -n 20 "$TMP/cp.log"
