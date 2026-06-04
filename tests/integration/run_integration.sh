@@ -99,6 +99,13 @@ check "agent registered + /nodes reflects it" \
 check "node reports auto_restart (watchdog) state" \
 	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; ns=json.load(sys.stdin); n=[x for x in ns if x[\"node_id\"]==\"$NODE_ID\"][0]; sys.exit(0 if n.get(\"auto_restart\") in (True,False) else 1)'"
 
+# /events is the live-state SSE stream the dashboard consumes. It must emit
+# an initial 'event: state' snapshot frame on connect. The stream never ends,
+# so we time-box curl and capture (not pipe — the timeout exit would trip
+# pipefail) then grep the body.
+check "/events SSE emits an initial state frame" \
+	bash -c "out=\$(curl -sN --max-time 4 '$CP_URL/events'); echo \"\$out\" | grep -q '^event: state'"
+
 check "spawn a service (designer-cpu, fake backend) via POST /services" \
 	bash -c "curl -fsS -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"designer-cpu\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"port\":$SVC_PORT}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"pid\") else 1)'"
 

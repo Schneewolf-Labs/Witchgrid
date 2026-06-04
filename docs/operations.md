@@ -225,6 +225,14 @@ curl -X POST http://<cp>:8765/services -H 'content-type: application/json' \
 
 ## Observability
 
+**Live dashboard.** `GET /events` (CP, public) is a Server-Sent Events stream:
+the dashboard opens one `EventSource` per tab and the CP pushes a fleet snapshot
+(services + nodes) whenever it changes, so tables update within ~2s of a real
+change instead of on a fixed poll — and a service dying raises a toast. Each
+connection runs in its own task (no blocking), and the htmx panels keep a slow
+30s timer purely as a fallback if SSE is unavailable (EventSource auto-reconnects
+otherwise). Nothing to configure.
+
 `GET /metrics` (CP, public, Prometheus text format) — built from the registry,
 so a scrape never fans out to agents:
 

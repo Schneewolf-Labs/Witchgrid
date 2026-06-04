@@ -734,3 +734,33 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
   .hw-row { grid-template-columns: 1fr 88px; font-size: 0.68rem; }
   .gpu-mem { font-size: 0.7rem; }
 }
+
+/* ── toasts (live event notifications) ──────────────────────────────── */
+#wg-toasts {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: min(360px, calc(100vw - 2rem));
+  pointer-events: none;
+}
+.wg-toast {
+  pointer-events: auto;
+  background: var(--bg-2);
+  color: var(--fg-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.wg-toast-err { border-left-color: var(--err); }
+.wg-toast-ok  { border-left-color: var(--ok); }
+.wg-toast-out { opacity: 0; transform: translateY(6px); }

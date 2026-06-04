@@ -725,3 +725,74 @@ function newProfile() {
     save(state);
   }, true);
 })();
+
+// ── live state stream (SSE) ──────────────────────────────────────────
+// One EventSource per tab consumes /events. On each pushed snapshot we
+// (a) refresh this page's htmx live panels immediately and (b) raise a
+// toast for notable transitions (a service going dead). This replaces the
+// old 5s polling cadence; the htmx panels keep a slow 30s timer purely as
+// a fallback for when SSE is unavailable. EventSource auto-reconnects on
+// drop (honoring the server's `retry:`), so transient blips self-heal.
+(function () {
+  let prevServices = null;            // id → {profile, node, alive}
+
+  function refreshLivePanels() {
+    if (!window.htmx) return;
+    document
+      .querySelectorAll('[hx-get="/ui/services"],[hx-get="/ui/nodes"],[hx-get="/ui/stats"]')
+      .forEach((el) => { try { window.htmx.trigger(el, 'load'); } catch (e) {} });
+  }
+
+  function onSnapshot(snap) {
+    refreshLivePanels();
+    // Toast on a service that flipped alive→dead. A service that simply
+    // disappeared was almost always an operator stop — don't nag on those.
+    const cur = {};
+    (snap.services || []).forEach((s) => { cur[s.id] = s; });
+    if (prevServices) {
+      for (const id in prevServices) {
+        const was = prevServices[id], now = cur[id];
+        if (now && was.alive && !now.alive) {
+          wgToast('Service died: ' + was.profile + ' on ' + was.node, 'err');
+        }
+      }
+    }
+    prevServices = cur;
+    window.dispatchEvent(new CustomEvent('witchgrid:state', { detail: snap }));
+  }
+
+  function connect() {
+    let es;
+    try { es = new EventSource('/events'); } catch (e) { return; }
+    es.addEventListener('state', (e) => {
+      try { onSnapshot(JSON.parse(e.data)); } catch (_) {}
+    });
+    // No explicit onerror handler needed: EventSource reconnects itself.
+  }
+
+  if (document.readyState !== 'loading') connect();
+  else document.addEventListener('DOMContentLoaded', connect);
+})();
+
+// Minimal toast system: bottom-right stack, auto-dismiss, screen-reader
+// announced via aria-live. Exposed as window.wgToast(msg, kind) so any
+// component (spawn/stop flows, the SSE stream) can use it.
+function wgToast(msg, kind) {
+  let host = document.getElementById('wg-toasts');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'wg-toasts';
+    host.setAttribute('aria-live', 'polite');
+    host.setAttribute('role', 'status');
+    document.body.appendChild(host);
+  }
+  const t = document.createElement('div');
+  t.className = 'wg-toast' + (kind === 'err' ? ' wg-toast-err' : (kind === 'ok' ? ' wg-toast-ok' : ''));
+  t.textContent = msg;
+  host.appendChild(t);
+  setTimeout(() => {
+    t.classList.add('wg-toast-out');
+    setTimeout(() => t.remove(), 300);
+  }, 6000);
+}
+window.wgToast = wgToast;

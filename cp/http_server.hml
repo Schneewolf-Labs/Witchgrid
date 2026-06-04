@@ -243,7 +243,16 @@ export fn serve(host: string, port: i32, routes, auth_check): null {
 		try {
 			let req = parse_request(stream);
 			let resp = dispatch(req, routes, auth_check);
-			write_response(stream, resp);
+			// Server-generated streaming (SSE): the handler returns an
+			// sse_handler fn that OWNS the connection — it writes the status
+			// line + headers itself and then loops emitting frames until the
+			// client disconnects. Used by /events for live dashboard state.
+			// Everything else takes the normal buffered/upstream path.
+			if (resp?.sse_handler != null) {
+				resp.sse_handler(stream);
+			} else {
+				write_response(stream, resp);
+			}
 		} catch (e) {
 			eprint("[server] " + e);
 		}

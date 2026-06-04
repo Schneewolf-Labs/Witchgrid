@@ -54,7 +54,7 @@ export let INDEX_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -108,7 +108,7 @@ export let INDEX_HTML = "<!doctype html>
 
     <section x-data=\"nodeEditor()\">
       <h2>Nodes</h2>
-      <div hx-get=\"/ui/nodes\" hx-trigger=\"load, every 5s\">loading…</div>
+      <div hx-get=\"/ui/nodes\" hx-trigger=\"load, every 30s\">loading…</div>
 
       <!-- ── Node editor modal ─────────────────────────────────── -->
       <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"cancel()\" style=\"display:none\">
@@ -188,7 +188,7 @@ export let INDEX_HTML = "<!doctype html>
 
     <section x-data=\"serviceLogModal()\">
       <h2>Services</h2>
-      <div hx-get=\"/ui/services\" hx-trigger=\"load, every 5s\">loading…</div>
+      <div hx-get=\"/ui/services\" hx-trigger=\"load, every 30s\">loading…</div>
 
       <!-- Service log modal — opens via showServiceLog() from the
            rendered table's \"logs\" button. Polls every 3s while open. -->
@@ -303,7 +303,7 @@ export let CATALOG_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -551,7 +551,7 @@ export let TRANSFERS_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -609,7 +609,7 @@ export let PROFILES_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -621,7 +621,7 @@ export let PROFILES_HTML = "<!doctype html>
         <button class=\"row-action\" onclick=\"newProfile()\">+ new profile</button>
       </div>
       <p class=\"meta\" style=\"margin: 0.25rem 0 0.5rem 0\">Spawn templates owned by CP. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time. Edits bump the version; running services keep their old argv.</p>
-      <div hx-get=\"/ui/profiles\" hx-trigger=\"load, every 5s\">loading…</div>
+      <div hx-get=\"/ui/profiles\" hx-trigger=\"load, every 30s\">loading…</div>
 
       <!-- ── Profile editor modal ─────────────────────────────────── -->
       <div class=\"modal-backdrop\" x-show=\"open\" x-cloak @click.self=\"cancel()\" style=\"display:none\">
@@ -902,7 +902,7 @@ export let BENCH_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -1047,7 +1047,7 @@ export let DEPLOY_HTML = "<!doctype html>
       </button>
     </div>
 
-    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 5s\" class=\"stats-wrap\">
+    <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
       </div>
@@ -1150,8 +1150,8 @@ export let DEPLOY_HTML = "<!doctype html>
 
     <section>
       <h2>Services</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Live services across the fleet — refreshes every 5s.</p>
-      <div hx-get=\"/ui/services\" hx-trigger=\"load, every 5s\">loading…</div>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Live services across the fleet — updates live.</p>
+      <div hx-get=\"/ui/services\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
 
@@ -2130,6 +2130,36 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
   .hw-row { grid-template-columns: 1fr 88px; font-size: 0.68rem; }
   .gpu-mem { font-size: 0.7rem; }
 }
+
+/* ── toasts (live event notifications) ──────────────────────────────── */
+#wg-toasts {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: min(360px, calc(100vw - 2rem));
+  pointer-events: none;
+}
+.wg-toast {
+  pointer-events: auto;
+  background: var(--bg-2);
+  color: var(--fg-1);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 0.6rem 0.8rem;
+  font-size: 0.85rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.wg-toast-err { border-left-color: var(--err); }
+.wg-toast-ok  { border-left-color: var(--ok); }
+.wg-toast-out { opacity: 0; transform: translateY(6px); }
 ";
 
 export let DASHBOARD_JS = "// Witchgrid dashboard JS — Alpine.js components + small UX glue.
@@ -2859,6 +2889,77 @@ function newProfile() {
     save(state);
   }, true);
 })();
+
+// ── live state stream (SSE) ──────────────────────────────────────────
+// One EventSource per tab consumes /events. On each pushed snapshot we
+// (a) refresh this page's htmx live panels immediately and (b) raise a
+// toast for notable transitions (a service going dead). This replaces the
+// old 5s polling cadence; the htmx panels keep a slow 30s timer purely as
+// a fallback for when SSE is unavailable. EventSource auto-reconnects on
+// drop (honoring the server's `retry:`), so transient blips self-heal.
+(function () {
+  let prevServices = null;            // id → {profile, node, alive}
+
+  function refreshLivePanels() {
+    if (!window.htmx) return;
+    document
+      .querySelectorAll('[hx-get=\"/ui/services\"],[hx-get=\"/ui/nodes\"],[hx-get=\"/ui/stats\"]')
+      .forEach((el) => { try { window.htmx.trigger(el, 'load'); } catch (e) {} });
+  }
+
+  function onSnapshot(snap) {
+    refreshLivePanels();
+    // Toast on a service that flipped alive→dead. A service that simply
+    // disappeared was almost always an operator stop — don't nag on those.
+    const cur = {};
+    (snap.services || []).forEach((s) => { cur[s.id] = s; });
+    if (prevServices) {
+      for (const id in prevServices) {
+        const was = prevServices[id], now = cur[id];
+        if (now && was.alive && !now.alive) {
+          wgToast('Service died: ' + was.profile + ' on ' + was.node, 'err');
+        }
+      }
+    }
+    prevServices = cur;
+    window.dispatchEvent(new CustomEvent('witchgrid:state', { detail: snap }));
+  }
+
+  function connect() {
+    let es;
+    try { es = new EventSource('/events'); } catch (e) { return; }
+    es.addEventListener('state', (e) => {
+      try { onSnapshot(JSON.parse(e.data)); } catch (_) {}
+    });
+    // No explicit onerror handler needed: EventSource reconnects itself.
+  }
+
+  if (document.readyState !== 'loading') connect();
+  else document.addEventListener('DOMContentLoaded', connect);
+})();
+
+// Minimal toast system: bottom-right stack, auto-dismiss, screen-reader
+// announced via aria-live. Exposed as window.wgToast(msg, kind) so any
+// component (spawn/stop flows, the SSE stream) can use it.
+function wgToast(msg, kind) {
+  let host = document.getElementById('wg-toasts');
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'wg-toasts';
+    host.setAttribute('aria-live', 'polite');
+    host.setAttribute('role', 'status');
+    document.body.appendChild(host);
+  }
+  const t = document.createElement('div');
+  t.className = 'wg-toast' + (kind === 'err' ? ' wg-toast-err' : (kind === 'ok' ? ' wg-toast-ok' : ''));
+  t.textContent = msg;
+  host.appendChild(t);
+  setTimeout(() => {
+    t.classList.add('wg-toast-out');
+    setTimeout(() => t.remove(), 300);
+  }, 6000);
+}
+window.wgToast = wgToast;
 ";
 
 export let LOGO_SVG = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>

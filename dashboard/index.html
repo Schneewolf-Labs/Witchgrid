@@ -40,7 +40,7 @@
       </button>
     </div>
 
-    <div hx-get="/ui/stats" hx-trigger="load, every 5s" class="stats-wrap">
+    <div hx-get="/ui/stats" hx-trigger="load, every 30s" class="stats-wrap">
       <div class="stats">
         <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>
       </div>
@@ -94,7 +94,7 @@
 
     <section x-data="nodeEditor()">
       <h2>Nodes</h2>
-      <div hx-get="/ui/nodes" hx-trigger="load, every 5s">loading…</div>
+      <div hx-get="/ui/nodes" hx-trigger="load, every 30s">loading…</div>
 
       <!-- ── Node editor modal ─────────────────────────────────── -->
       <div class="modal-backdrop" x-show="open" x-cloak @click.self="cancel()" style="display:none">
@@ -174,7 +174,7 @@
 
     <section x-data="serviceLogModal()">
       <h2>Services</h2>
-      <div hx-get="/ui/services" hx-trigger="load, every 5s">loading…</div>
+      <div hx-get="/ui/services" hx-trigger="load, every 30s">loading…</div>
 
       <!-- Service log modal — opens via showServiceLog() from the
            rendered table's "logs" button. Polls every 3s while open. -->

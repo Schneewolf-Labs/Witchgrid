@@ -2257,6 +2257,83 @@ fn handle_ui_services(req): object {
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
+// ── live state stream (SSE) ──────────────────────────────────────────
+// /events holds a connection open and pushes a compact snapshot of fleet
+// state (services + nodes) whenever it changes, so the dashboard updates
+// in near-real-time instead of polling every 5s. serve() runs each
+// connection in its own detached task, so this loop doesn't block other
+// requests; a failed write (client/tab gone) ends the loop and frees the
+// task. Cheap by design: re-snapshot every SSE_POLL_SECONDS, push only on
+// change, keepalive comment otherwise.
+let SSE_POLL_SECONDS: f64 = 2.0;
+let SSE_KEEPALIVE_TICKS = 8;            // ~16s without a change → keepalive
+
+// Compact, hashable view of what the dashboard renders: per-service
+// (id, profile, node, port, alive, device) and per-node (id, role, up).
+fn events_snapshot(): object {
+	let agents = list_all_agents();
+	let svcs = [];
+	for (a in agents) {
+		try {
+			let resp = cp_get(a.agent_url + "/services");
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				for (e in parse(resp.body)) {
+					svcs.push({ id: e.id, profile: e.profile, node: a.node_id,
+						port: e.port, alive: e.alive, device: e?.device });
+				}
+			}
+		} catch (e) { }
+	}
+	let nrows = query(DB,
+		"select node_id, role, (last_seen_at > datetime('now', ?)) as up from nodes",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
+	let nodes = [];
+	for (r in nrows) {
+		nodes.push({ node_id: r.node_id, role: r.role, up: (r.up == 1) });
+	}
+	return { services: svcs, nodes: nodes };
+}
+
+fn handle_events(req): object {
+	let emit = fn(stream): null {
+		// We own the connection: write the SSE preamble ourselves. No
+		// Content-Length (open-ended); x-accel-buffering off so reverse
+		// proxies don't sit on frames.
+		try {
+			stream.write("HTTP/1.1 200 OK\r\n");
+			stream.write("content-type: text/event-stream\r\n");
+			stream.write("cache-control: no-cache\r\n");
+			stream.write("connection: keep-alive\r\n");
+			stream.write("x-accel-buffering: no\r\n");
+			stream.write("\r\n");
+			stream.write("retry: 3000\n\n");
+		} catch (e) { return null; }
+
+		let last_payload = "";
+		let ticks = 0;
+		loop {
+			let payload = stringify(events_snapshot());
+			let ok = true;
+			if (payload != last_payload) {
+				last_payload = payload;
+				ticks = 0;
+				try { stream.write("event: state\ndata: " + payload + "\n\n"); }
+				catch (e) { ok = false; }
+			} else {
+				ticks = ticks + 1;
+				if (ticks >= SSE_KEEPALIVE_TICKS) {
+					ticks = 0;
+					try { stream.write(": keepalive\n\n"); } catch (e) { ok = false; }
+				}
+			}
+			if (!ok) { break; }      // client/tab gone
+			sleep(SSE_POLL_SECONDS);
+		}
+		return null;
+	};
+	return { sse_handler: emit };
+}
+
 // Profiles live in CP's table since v0.7. all_profiles_map() (defined
 // near the CRUD handlers below) returns the same shape that the
 // agent-fan-out used to return — name → profile object.
@@ -3505,6 +3582,9 @@ fn main(): null {
 		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      public: true },
 		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      public: true },
 		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  public: true },
+		// Live state stream (SSE) — pushes fleet snapshots on change so the
+		// dashboard updates without polling. Public, like the /ui fragments.
+		{ method: "GET",  path: "/events",          handler: handle_events,           public: true },
 		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, public: true },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles

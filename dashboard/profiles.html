@@ -40,7 +40,7 @@
       </button>
     </div>
 
-    <div hx-get="/ui/stats" hx-trigger="load, every 5s" class="stats-wrap">
+    <div hx-get="/ui/stats" hx-trigger="load, every 30s" class="stats-wrap">
       <div class="stats">
         <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>
       </div>
@@ -52,7 +52,7 @@
         <button class="row-action" onclick="newProfile()">+ new profile</button>
       </div>
       <p class="meta" style="margin: 0.25rem 0 0.5rem 0">Spawn templates owned by CP. <code>model_alias</code> resolves to a per-node path via the catalog at spawn time. Edits bump the version; running services keep their old argv.</p>
-      <div hx-get="/ui/profiles" hx-trigger="load, every 5s">loading…</div>
+      <div hx-get="/ui/profiles" hx-trigger="load, every 30s">loading…</div>
 
       <!-- ── Profile editor modal ─────────────────────────────────── -->
       <div class="modal-backdrop" x-show="open" x-cloak @click.self="cancel()" style="display:none">
