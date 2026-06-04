@@ -2279,7 +2279,8 @@ fn events_snapshot(): object {
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				for (e in parse(resp.body)) {
 					svcs.push({ id: e.id, profile: e.profile, node: a.node_id,
-						port: e.port, alive: e.alive, device: e?.device });
+						port: e.port, alive: e.alive, device: e?.device,
+						state: e?.state });
 				}
 			}
 		} catch (e) { }
@@ -2292,6 +2293,14 @@ fn events_snapshot(): object {
 		nodes.push({ node_id: r.node_id, role: r.role, up: (r.up == 1) });
 	}
 	return { services: svcs, nodes: nodes };
+}
+
+// One-shot snapshot (same shape /events streams). Lets the dashboard paint
+// the health banner immediately on load without waiting for the first SSE
+// frame; also handy for scripts that want fleet state without a stream.
+fn handle_state(req): object {
+	return { status: 200, body: stringify(events_snapshot()),
+		headers: { "content-type": "application/json" } };
 }
 
 fn handle_events(req): object {
@@ -3585,6 +3594,7 @@ fn main(): null {
 		// Live state stream (SSE) — pushes fleet snapshots on change so the
 		// dashboard updates without polling. Public, like the /ui fragments.
 		{ method: "GET",  path: "/events",          handler: handle_events,           public: true },
+		{ method: "GET",  path: "/api/state",        handler: handle_state,            public: true },
 		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, public: true },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles

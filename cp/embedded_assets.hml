@@ -54,6 +54,36 @@ export let INDEX_HTML = "<!doctype html>
       </button>
     </div>
 
+    <!-- Failure-first health banner: pure function of the live SSE snapshot.
+         Calm when healthy, loud (with one-click triage) when something's wrong. -->
+    <div x-data=\"healthBanner()\" x-show=\"ready\" x-cloak
+         class=\"health-banner\" :class=\"ok ? 'health-ok' : 'health-bad'\">
+      <template x-if=\"ok\">
+        <div class=\"health-line\"><span class=\"health-dot\"></span> All systems nominal · <span class=\"meta\" x-text=\"summary\"></span></div>
+      </template>
+      <template x-if=\"!ok\">
+        <div>
+          <div class=\"health-line\"><span class=\"health-dot\"></span> <strong x-text=\"headline\"></strong></div>
+          <ul class=\"health-issues\">
+            <template x-for=\"d in dead\" :key=\"d.id\">
+              <li>
+                <span class=\"badge badge-state-draining\" x-text=\"d.state === 'failed' ? 'failed' : 'down'\"></span>
+                <code x-text=\"d.profile\"></code> on <code x-text=\"d.node\"></code> · port <code x-text=\"d.port\"></code>
+                <button class=\"row-action\" @click=\"logs(d)\">logs</button>
+                <button class=\"row-action row-action-danger\" @click=\"stop(d)\">stop</button>
+              </li>
+            </template>
+            <template x-for=\"n in offline\" :key=\"n.node_id\">
+              <li>
+                <span class=\"badge\">offline</span>
+                node <code x-text=\"n.node_id\"></code> — no recent heartbeat (services there are unreachable)
+              </li>
+            </template>
+          </ul>
+        </div>
+      </template>
+    </div>
+
     <div hx-get=\"/ui/stats\" hx-trigger=\"load, every 30s\" class=\"stats-wrap\">
       <div class=\"stats\">
         <div class=\"stat\"><p class=\"stat-label\">loading</p><p class=\"stat-value\">·</p></div>
@@ -2160,6 +2190,34 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
 .wg-toast-err { border-left-color: var(--err); }
 .wg-toast-ok  { border-left-color: var(--ok); }
 .wg-toast-out { opacity: 0; transform: translateY(6px); }
+
+/* ── failure-first health banner (Overview) ─────────────────────────── */
+.health-banner {
+  border-radius: 8px;
+  padding: 0.7rem 0.95rem;
+  margin: 0 0 1rem 0;
+  border: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+.health-line { display: flex; align-items: center; gap: 0.5rem; }
+.health-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  flex: 0 0 auto; display: inline-block;
+}
+.health-ok  { background: var(--ok-soft);  border-color: var(--ok); color: var(--fg-1); }
+.health-ok  .health-dot  { background: var(--ok); }
+.health-bad { background: var(--err-soft); border-color: var(--err); color: var(--fg-1); }
+.health-bad .health-dot  { background: var(--err); animation: health-pulse 1.6s ease-in-out infinite; }
+@keyframes health-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+.health-issues {
+  list-style: none;
+  margin: 0.5rem 0 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+.health-issues li { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
 ";
 
 export let DASHBOARD_JS = "// Witchgrid dashboard JS — Alpine.js components + small UX glue.
@@ -2960,6 +3018,48 @@ function wgToast(msg, kind) {
   }, 6000);
 }
 window.wgToast = wgToast;
+
+// ── failure-first health banner (Overview) ───────────────────────────
+// A pure function of the live snapshot: calm when healthy, loud when a
+// service is down or a node is offline — each with one-click triage that
+// reuses the existing log/stop helpers. Fed by the /events SSE stream
+// (witchgrid:state), with a one-shot /api/state fetch for instant first
+// paint before the first SSE frame arrives.
+function healthBanner() {
+  return {
+    ready: false,
+    dead: [],
+    offline: [],
+    _svcCount: 0,
+    _nodeUp: 0,
+    get ok() { return this.dead.length === 0 && this.offline.length === 0; },
+    get summary() {
+      const s = this._svcCount, n = this._nodeUp;
+      return s + ' service' + (s === 1 ? '' : 's') + ' live on '
+        + n + ' node' + (n === 1 ? '' : 's');
+    },
+    get headline() {
+      const parts = [];
+      if (this.dead.length)    parts.push(this.dead.length + ' service' + (this.dead.length === 1 ? '' : 's') + ' down');
+      if (this.offline.length) parts.push(this.offline.length + ' node' + (this.offline.length === 1 ? '' : 's') + ' offline');
+      return parts.join(' · ');
+    },
+    apply(snap) {
+      const svcs = snap.services || [], nodes = snap.nodes || [];
+      this.dead = svcs.filter((s) => !s.alive);
+      this.offline = nodes.filter((n) => !n.up);
+      this._svcCount = svcs.filter((s) => s.alive).length;
+      this._nodeUp = nodes.filter((n) => n.up).length;
+      this.ready = true;
+    },
+    init() {
+      window.addEventListener('witchgrid:state', (e) => this.apply(e.detail));
+      fetch('/api/state').then((r) => r.json()).then((s) => this.apply(s)).catch(() => {});
+    },
+    logs(d) { if (window.showServiceLog) window.showServiceLog(d.id, d.profile, d.node); },
+    stop(d) { if (window.stopService)    window.stopService(d.id, d.profile, d.node); },
+  };
+}
 ";
 
 export let LOGO_SVG = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>

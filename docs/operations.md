@@ -231,7 +231,16 @@ the dashboard opens one `EventSource` per tab and the CP pushes a fleet snapshot
 change instead of on a fixed poll — and a service dying raises a toast. Each
 connection runs in its own task (no blocking), and the htmx panels keep a slow
 30s timer purely as a fallback if SSE is unavailable (EventSource auto-reconnects
-otherwise). Nothing to configure.
+otherwise). `GET /api/state` returns the same snapshot as a one-shot JSON for
+scripts or first paint. Nothing to configure.
+
+**Health banner.** The overview shows a failure-first banner: calm/green when
+everything's nominal, loud/red when a node is offline or a service is **down**
+(crashed) or **failed** (crash-loop guard gave up after repeated restarts), with
+per-issue *logs*/*stop* buttons. It's a pure function of the live snapshot, so it
+updates in real time. Failed services also show as `✗ failed` in the Services
+table (they're surfaced specifically because a transient crash gets respawned by
+the watchdog within a tick — only the durable `failed` state needs a human).
 
 `GET /metrics` (CP, public, Prometheus text format) — built from the registry,
 so a scrape never fans out to agents:

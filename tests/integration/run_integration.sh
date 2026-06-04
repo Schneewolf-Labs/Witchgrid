@@ -115,6 +115,12 @@ check "/resolve/designer-cpu returns the running service base_url" \
 check "the spawned backend answers /health" \
 	bash -c "curl -fsS 'http://127.0.0.1:$SVC_PORT/health' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"status\")==\"ok\" else 1)'"
 
+# /api/state is the one-shot snapshot the health banner paints from (same
+# shape /events streams). Must report nodes + services, each service tagged
+# with alive + state (running/failed) so the banner can triage.
+check "/api/state snapshot reports services with alive + state" \
+	bash -c "curl -fsS '$CP_URL/api/state' | python3 -c 'import sys,json; d=json.load(sys.stdin); svc=d.get(\"services\",[]); sys.exit(0 if isinstance(d.get(\"nodes\"),list) and any(s.get(\"state\")==\"running\" and s.get(\"alive\") for s in svc) else 1)'"
+
 check "non-stream /v1/llama proxy returns JSON" \
 	bash -c "curl -fsS -X POST '$CP_URL/v1/llama/designer-cpu/completion' -H 'content-type: application/json' -d '{\"prompt\":\"hi\",\"n_predict\":4}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if \"content\" in d else 1)'"
 

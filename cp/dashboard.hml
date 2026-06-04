@@ -587,6 +587,7 @@ export fn render_services(services_data, live_profiles): string {
 		let alive_class = "alive-no";
 		let alive_text = "✗ dead";
 		if (s.alive) { alive_class = "alive-yes"; alive_text = "● live"; }
+		else if (s?.state == "failed") { alive_text = "✗ failed"; }
 		// Stale badge: this service was spawned against an older
 		// version of the profile than the one currently saved. Operator
 		// should restart for the new args to take effect.

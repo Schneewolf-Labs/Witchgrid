@@ -796,3 +796,45 @@ function wgToast(msg, kind) {
   }, 6000);
 }
 window.wgToast = wgToast;
+
+// ── failure-first health banner (Overview) ───────────────────────────
+// A pure function of the live snapshot: calm when healthy, loud when a
+// service is down or a node is offline — each with one-click triage that
+// reuses the existing log/stop helpers. Fed by the /events SSE stream
+// (witchgrid:state), with a one-shot /api/state fetch for instant first
+// paint before the first SSE frame arrives.
+function healthBanner() {
+  return {
+    ready: false,
+    dead: [],
+    offline: [],
+    _svcCount: 0,
+    _nodeUp: 0,
+    get ok() { return this.dead.length === 0 && this.offline.length === 0; },
+    get summary() {
+      const s = this._svcCount, n = this._nodeUp;
+      return s + ' service' + (s === 1 ? '' : 's') + ' live on '
+        + n + ' node' + (n === 1 ? '' : 's');
+    },
+    get headline() {
+      const parts = [];
+      if (this.dead.length)    parts.push(this.dead.length + ' service' + (this.dead.length === 1 ? '' : 's') + ' down');
+      if (this.offline.length) parts.push(this.offline.length + ' node' + (this.offline.length === 1 ? '' : 's') + ' offline');
+      return parts.join(' · ');
+    },
+    apply(snap) {
+      const svcs = snap.services || [], nodes = snap.nodes || [];
+      this.dead = svcs.filter((s) => !s.alive);
+      this.offline = nodes.filter((n) => !n.up);
+      this._svcCount = svcs.filter((s) => s.alive).length;
+      this._nodeUp = nodes.filter((n) => n.up).length;
+      this.ready = true;
+    },
+    init() {
+      window.addEventListener('witchgrid:state', (e) => this.apply(e.detail));
+      fetch('/api/state').then((r) => r.json()).then((s) => this.apply(s)).catch(() => {});
+    },
+    logs(d) { if (window.showServiceLog) window.showServiceLog(d.id, d.profile, d.node); },
+    stop(d) { if (window.stopService)    window.stopService(d.id, d.profile, d.node); },
+  };
+}

@@ -40,6 +40,36 @@
       </button>
     </div>
 
+    <!-- Failure-first health banner: pure function of the live SSE snapshot.
+         Calm when healthy, loud (with one-click triage) when something's wrong. -->
+    <div x-data="healthBanner()" x-show="ready" x-cloak
+         class="health-banner" :class="ok ? 'health-ok' : 'health-bad'">
+      <template x-if="ok">
+        <div class="health-line"><span class="health-dot"></span> All systems nominal · <span class="meta" x-text="summary"></span></div>
+      </template>
+      <template x-if="!ok">
+        <div>
+          <div class="health-line"><span class="health-dot"></span> <strong x-text="headline"></strong></div>
+          <ul class="health-issues">
+            <template x-for="d in dead" :key="d.id">
+              <li>
+                <span class="badge badge-state-draining" x-text="d.state === 'failed' ? 'failed' : 'down'"></span>
+                <code x-text="d.profile"></code> on <code x-text="d.node"></code> · port <code x-text="d.port"></code>
+                <button class="row-action" @click="logs(d)">logs</button>
+                <button class="row-action row-action-danger" @click="stop(d)">stop</button>
+              </li>
+            </template>
+            <template x-for="n in offline" :key="n.node_id">
+              <li>
+                <span class="badge">offline</span>
+                node <code x-text="n.node_id"></code> — no recent heartbeat (services there are unreachable)
+              </li>
+            </template>
+          </ul>
+        </div>
+      </template>
+    </div>
+
     <div hx-get="/ui/stats" hx-trigger="load, every 30s" class="stats-wrap">
       <div class="stats">
         <div class="stat"><p class="stat-label">loading</p><p class="stat-value">·</p></div>

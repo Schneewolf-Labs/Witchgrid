@@ -801,13 +801,15 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 }
 
 export fn list_services(db): array {
-	// Filter to running rows so the dashboard doesn't show every
-	// historical spawn. Adoption-history rows (state in 'dead' /
-	// 'stopped') are kept around for the discovery path but not
-	// surfaced to operators.
+	// Surface running services + crash-loop-exhausted ones (state='failed').
+	// 'failed' rows are the durable "needs a human" signal — the watchdog
+	// respawns transient crashes, so anything left as 'failed' gave up after
+	// the crash-loop guard tripped. The dashboard health banner keys off
+	// these (a just-crashed 'running' row gets reaped within ~1 tick, too
+	// fleeting to rely on). Adoption-history ('dead'/'stopped') stays hidden.
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json "
-		+ "from services where state = 'running' order by started_at desc", []);
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state "
+		+ "from services where state in ('running', 'failed') order by started_at desc", []);
 	let out = [];
 	for (row in rows) {
 		// device reflects where the service actually runs: gpus_json is the
@@ -828,6 +830,7 @@ export fn list_services(db): array {
 			started_at: row.started_at,
 			profile_version: row?.profile_version,
 			device: device,
+			state: row?.state,
 			alive: process_alive(row.pid),
 		});
 	}
