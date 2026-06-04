@@ -806,10 +806,18 @@ export fn list_services(db): array {
 	// 'stopped') are kept around for the discovery path but not
 	// surfaced to operators.
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at, profile_version "
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json "
 		+ "from services where state = 'running' order by started_at desc", []);
 	let out = [];
 	for (row in rows) {
+		// device reflects where the service actually runs: gpus_json is the
+		// pinned GPU index list at spawn time — empty/null means it was
+		// placed CPU-only (gpu_layers=0, CUDA_VISIBLE_DEVICES="").
+		let device = "cpu";
+		let gj = row?.gpus_json;
+		if (gj != null && gj != "" && gj != "[]") {
+			try { if (parse(gj).length > 0) { device = "gpu"; } } catch (e) { }
+		}
 		out.push({
 			id: row.id,
 			profile: row.profile,
@@ -819,6 +827,7 @@ export fn list_services(db): array {
 			log_path: row.log_path,
 			started_at: row.started_at,
 			profile_version: row?.profile_version,
+			device: device,
 			alive: process_alive(row.pid),
 		});
 	}

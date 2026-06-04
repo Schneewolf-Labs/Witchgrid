@@ -654,6 +654,7 @@ fn seed_default_profiles(db): null {
 				// modern path that doesn't pin to a filesystem
 				// layout.
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -685,6 +686,7 @@ fn seed_default_profiles(db): null {
 					file: "FlameDesigner-Qwen2.5-3B-v1.Q8_0.gguf",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -714,6 +716,7 @@ fn seed_default_profiles(db): null {
 					file: "Phoenix-Qwen2.5-7B-v1.Q3_K_M.gguf",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -736,6 +739,7 @@ fn seed_default_profiles(db): null {
 				model_alias: "nikumixxl4.q8_0",
 				hf_source: null,
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -760,6 +764,7 @@ fn seed_default_profiles(db): null {
 					file: "en/en_US/lessac/medium/en_US-lessac-medium.onnx",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -786,6 +791,7 @@ fn seed_default_profiles(db): null {
 					file: "ggml-base.en-q5_1.bin",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -814,6 +820,7 @@ fn seed_default_profiles(db): null {
 					file: "nomic-embed-text-v1.5.Q8_0.gguf",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 		{
@@ -843,6 +850,7 @@ fn seed_default_profiles(db): null {
 					file: "Qwen2.5-VL-7B-Instruct-Q8_0.gguf",
 				},
 				default_model: null,
+				default_device: "auto",
 			},
 		},
 	];
@@ -1586,6 +1594,58 @@ fn pick_port(agent_url: string, default_port: i32): i32 {
 	return default_port;
 }
 
+// ── device (CPU/GPU) selection ───────────────────────────────────────
+// First-class CPU/GPU toggle. CPU vs GPU is otherwise implicit in a
+// profile's intent.gpu_layers (0 = CPU, >0 = offload). Rather than add a
+// parallel placement path, we resolve a device choice and OVERRIDE
+// gpu_layers before placement + spawn — both pick_placement*() and the
+// agent's spawn_service() already branch on gpu_layers == 0, so the
+// override flows through end to end.
+//
+// Resolution order: explicit spawn-request `device` > profile.default_device
+// > "auto". "auto" respects the profile's declared gpu_layers (legacy
+// behavior). Returns "cpu" | "gpu" | "auto".
+fn resolve_device(req_device, profile): string {
+	let d = req_device;
+	if (d == null || d == "") { d = profile?.default_device; }
+	if (d == null || d == "") { d = "auto"; }
+	return d;
+}
+
+// True for an accepted device token. Used to 400 on garbage from the API.
+fn is_valid_device(d): bool {
+	return d == "cpu" || d == "gpu" || d == "auto";
+}
+
+// Returns a profile with intent.gpu_layers forced per the chosen device.
+// fetch_profile_by_name() hands back a fresh parse each call, so mutating
+// in place is safe (no shared/cached object to corrupt).
+//   cpu  → 0          (no offload; placement skips GPU fit, CVD="")
+//   gpu  → keep the profile's layers if it already offloads, else 99
+//   auto → unchanged
+fn apply_device(profile, device) {
+	if (device == "auto" || device == null) { return profile; }
+	let intent = profile?.intent;
+	if (intent == null) { intent = {}; }
+	let layers = intent?.gpu_layers ?? 0;
+	if (device == "cpu") {
+		intent["gpu_layers"] = 0;
+	} else {
+		intent["gpu_layers"] = (layers > 0) ? layers : 99;
+	}
+	profile["intent"] = intent;
+	return profile;
+}
+
+// Where a profile will actually run, given its (already device-applied)
+// intent: "cpu" if no offload, else "gpu". Used to surface placement to
+// clients/dashboard without re-deriving from gpu_indices.
+fn device_label(profile): string {
+	let layers = profile?.intent?.gpu_layers ?? 0;
+	if (layers == 0) { return "cpu"; }
+	return "gpu";
+}
+
 // ── service proxy ────────────────────────────────────────────────────
 
 fn handle_spawn_proxy(req): object {
@@ -1618,6 +1678,18 @@ fn handle_spawn_proxy(req): object {
 				+ " (PUT /api/profiles/" + profile_name + " to create)",
 		})};
 	}
+
+	// First-class CPU/GPU override. Resolve (request > profile default >
+	// auto) and rewrite intent.gpu_layers so placement + the agent spawn
+	// both honor it. Reject garbage device tokens up front.
+	let req_device = payload?.device;
+	if (req_device != null && req_device != "" && !is_valid_device(req_device)) {
+		return { status: 400, body: stringify({
+			error: "invalid device '" + req_device + "' (expected auto|cpu|gpu)",
+		})};
+	}
+	let device = resolve_device(req_device, profile);
+	profile = apply_device(profile, device);
 
 	// If the operator didn't pin (node_id, gpus), do capacity-aware
 	// placement. Try alias-driven first (catalog → no FS access on CP);
@@ -1694,6 +1766,7 @@ fn handle_spawn_proxy(req): object {
 			let body = parse(resp.body);
 			body["node_id"] = node_id;
 			body["placed_by"] = "cp";
+			body["device"] = device_label(profile);
 			return { status: resp.status_code, body: stringify(body) };
 		}
 		return { status: resp.status_code, body: resp.body };
@@ -1907,6 +1980,10 @@ fn auto_spawn(profile_name: string) {
 			error: "no agent advertises profile: " + profile_name,
 		})}};
 	}
+
+	// Honor the profile's default_device on the auto-spawn path (no request
+	// override exists here — /v1/llama/* is profile-derived).
+	profile = apply_device(profile, resolve_device(null, profile));
 
 	// Same priority ladder as handle_spawn_proxy: alias-driven first,
 	// then default_model fallback. The /v1/llama/* path has no operator-
@@ -2584,6 +2661,14 @@ fn handle_placement_preview(req): object {
 		return { status: 404, body: stringify({
 			ok: false, reason: "no profile named " + profile_name }) };
 	}
+
+	// Honor the device selector so the preview matches what a spawn would do.
+	let req_device = payload?.device;
+	if (req_device != null && req_device != "" && !is_valid_device(req_device)) {
+		return { status: 400, body: stringify({
+			error: "invalid device '" + req_device + "' (expected auto|cpu|gpu)" }) };
+	}
+	profile = apply_device(profile, resolve_device(req_device, profile));
 
 	// Alias path — same logic as auto_spawn() takes. Only previews the
 	// alias case; default_model fallback would need pick_placement which

@@ -580,7 +580,7 @@ export fn render_services(services_data, live_profiles): string {
 	}
 	let html = "<table>\n"
 		+ "<thead><tr>"
-		+ "<th>profile</th><th>node</th><th>port</th>"
+		+ "<th>profile</th><th>node</th><th>device</th><th>port</th>"
 		+ "<th>alive</th><th>model</th><th>id</th><th></th>"
 		+ "</tr></thead>\n<tbody>\n";
 	for (s in services_data) {
@@ -615,9 +615,20 @@ export fn render_services(services_data, live_profiles): string {
 			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
 		let log_js  = "showServiceLog('" + esc(s.id) + "','"
 			+ esc(s.profile) + "','" + esc(s.node_id) + "')";
+		// device badge: where this service actually runs (cpu vs gpu).
+		let dev = s?.device ?? "";
+		let dev_badge = "";
+		if (dev == "gpu") {
+			dev_badge = "<span class=\"badge badge-state-active\">GPU</span>";
+		} else if (dev == "cpu") {
+			dev_badge = "<span class=\"badge\">CPU</span>";
+		} else {
+			dev_badge = "<span class=\"meta\">—</span>";
+		}
 		html = html + "<tr>"
 			+ "<td><strong>" + esc(s.profile) + "</strong>" + stale_badge + "</td>"
 			+ "<td>" + esc(s.node_id) + "</td>"
+			+ "<td>" + dev_badge + "</td>"
 			+ "<td><code>" + s.port + "</code></td>"
 			+ "<td class=\"" + alive_class + "\">" + alive_text + "</td>"
 			+ "<td><code>" + esc(model) + "</code></td>"

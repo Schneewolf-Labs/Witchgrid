@@ -85,6 +85,14 @@
                 </template>
               </select>
             </div>
+            <div>
+              <label>default device</label>
+              <select x-model="default_device">
+                <option value="auto">auto (gpu_layers)</option>
+                <option value="cpu">CPU</option>
+                <option value="gpu">GPU</option>
+              </select>
+            </div>
             <div class="full">
               <label>
                 model

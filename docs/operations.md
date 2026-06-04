@@ -166,6 +166,29 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | `WITCHGRID_HEARTBEAT_SECONDS` | `30` | How often the agent re-probes hardware and heartbeats the CP (advancing its `last_seen_at`). Lower = fresher `free_mb` for placement at the cost of more RPC + `nvidia-smi` calls. Keep the CP's `WITCHGRID_STALE_NODE_SECONDS` ≳ 3× this. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | See above; must match the CP. |
 
+## Device selection (CPU/GPU)
+
+Whether a service runs on GPU or CPU is a first-class choice, resolved at
+spawn time in this order:
+
+1. **Per-spawn** — `device` in `POST /services` (and the deploy page's device
+   dropdown): `auto` | `cpu` | `gpu`.
+2. **Per-profile** — a profile's `default_device` (set in the profile editor),
+   used when the spawn request doesn't specify one.
+3. **`auto`** — honor the profile's `intent.gpu_layers` (0 ⇒ CPU, >0 ⇒ GPU).
+   This is the historical behavior.
+
+`cpu` forces `gpu_layers=0` (no offload; placement skips the VRAM-fit search,
+`CUDA_VISIBLE_DEVICES=""`). `gpu` forces offload (the profile's layer count, or
+99 if it was a CPU profile) and a normal VRAM-fit placement. The chosen device
+comes back on the spawn response (`"device"`) and shows as a badge per service
+in the dashboard's Services table and `/ui/services`.
+
+Tip: keep latency-insensitive, low-traffic services (summarizers, embeddings,
+designer) on CPU so they don't compete with chat for VRAM — ship them as CPU
+profiles (`gpu_layers: 0`) or set their `default_device` to `cpu`, and promote
+to GPU per-spawn only when you need the throughput.
+
 ## Auto-restart watchdog
 
 Each agent keeps its managed services as **desired state**. With `auto_restart`

@@ -654,6 +654,14 @@ export let PROFILES_HTML = "<!doctype html>
                 </template>
               </select>
             </div>
+            <div>
+              <label>default device</label>
+              <select x-model=\"default_device\">
+                <option value=\"auto\">auto (gpu_layers)</option>
+                <option value=\"cpu\">CPU</option>
+                <option value=\"gpu\">GPU</option>
+              </select>
+            </div>
             <div class=\"full\">
               <label>
                 model
@@ -1125,6 +1133,14 @@ export let DEPLOY_HTML = "<!doctype html>
           <strong>spawn</strong>
         </div>
         <div class=\"deploy-step-body\" x-show=\"profile\">
+          <label class=\"meta\" style=\"display:block; margin:0 0 0.5rem 0\">
+            device
+            <select x-model=\"device\" @change=\"refreshPreview()\" style=\"margin-left:0.4rem\">
+              <option value=\"auto\">auto (profile default)</option>
+              <option value=\"cpu\">CPU</option>
+              <option value=\"gpu\">GPU</option>
+            </select>
+          </label>
           <p class=\"meta\" x-show=\"preview\" x-text=\"preview\" style=\"margin: 0 0 0.5rem 0\"></p>
           <button type=\"button\" @click=\"spawn()\" :disabled=\"busy || !profile\" x-text=\"busy ? '…' : 'spawn'\"></button>
           <p class=\"msg\" :class=\"msgError ? 'err' : 'ok'\" x-show=\"msg\" x-text=\"msg\" style=\"margin-top:0.5rem\"></p>
@@ -1148,6 +1164,7 @@ export let DEPLOY_HTML = "<!doctype html>
         alias: '',
         node: '',
         profile: '',
+        device: 'auto',
         preview: '',
         busy: false,
         msg: '',
@@ -1202,7 +1219,7 @@ export let DEPLOY_HTML = "<!doctype html>
             const r = await fetch('/api/placement_preview', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ profile_name: this.profile }),
+              body: JSON.stringify({ profile_name: this.profile, device: this.device }),
             });
             const d = await r.json();
             const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
@@ -1224,6 +1241,7 @@ export let DEPLOY_HTML = "<!doctype html>
           this.busy = true; this.msg = ''; this.msgError = false;
           const body = { profile: this.profile };
           if (this.node) body.node_id = this.node;
+          if (this.device) body.device = this.device;
           try {
             const r = await fetch('/services', {
               method: 'POST',
@@ -1235,7 +1253,7 @@ export let DEPLOY_HTML = "<!doctype html>
               this.msgError = true;
               this.msg = d.error || ('HTTP ' + r.status);
             } else {
-              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + ' — see Services below';
+              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + (d.device ? ' (' + d.device.toUpperCase() + ')' : '') + ' — see Services below';
               const panel = document.querySelector('[hx-get=\"/ui/services\"]');
               if (panel && window.htmx) window.htmx.trigger(panel, 'load');
             }
@@ -2280,6 +2298,7 @@ function profileEditor() {
     kv_type: 'f16',
     model_alias: '',
     default_model: '',
+    default_device: 'auto',   // auto = honor intent.gpu_layers; cpu/gpu override
     useRawPath: false,        // toggle catalog-dropdown vs raw default_model text
     hf_repo: '',
     hf_file: '',
@@ -2391,6 +2410,7 @@ function profileEditor() {
       this.name = ''; this.binary = 'llama-server';
       this.default_port = 18080; this.context = 4096; this.kv_type = 'f16';
       this.model_alias = ''; this.default_model = '';
+      this.default_device = 'auto';
       this.useRawPath = false;
       this.hf_repo = ''; this.hf_file = '';
       this.extra_flags = '';
@@ -2424,6 +2444,7 @@ function profileEditor() {
         this.kv_type = p.kv_type || 'f16';
         this.model_alias = p.model_alias || '';
         this.default_model = p.default_model || '';
+        this.default_device = p.default_device || 'auto';
         // Pre-open the raw-path toggle when the profile already uses
         // default_model without an alias — operator clearly wanted raw.
         this.useRawPath = !this.model_alias && !!this.default_model;
@@ -2462,6 +2483,7 @@ function profileEditor() {
         default_port: parseInt(this.default_port, 10),
         context: parseInt(this.context, 10),
         kv_type: this.kv_type,
+        default_device: this.default_device || 'auto',
       };
       // useRawPath gates which model field saves: catalog picker → model_alias,
       // raw textbox → default_model. We never save both — that hides bugs

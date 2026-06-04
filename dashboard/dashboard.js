@@ -164,6 +164,7 @@ function profileEditor() {
     kv_type: 'f16',
     model_alias: '',
     default_model: '',
+    default_device: 'auto',   // auto = honor intent.gpu_layers; cpu/gpu override
     useRawPath: false,        // toggle catalog-dropdown vs raw default_model text
     hf_repo: '',
     hf_file: '',
@@ -275,6 +276,7 @@ function profileEditor() {
       this.name = ''; this.binary = 'llama-server';
       this.default_port = 18080; this.context = 4096; this.kv_type = 'f16';
       this.model_alias = ''; this.default_model = '';
+      this.default_device = 'auto';
       this.useRawPath = false;
       this.hf_repo = ''; this.hf_file = '';
       this.extra_flags = '';
@@ -308,6 +310,7 @@ function profileEditor() {
         this.kv_type = p.kv_type || 'f16';
         this.model_alias = p.model_alias || '';
         this.default_model = p.default_model || '';
+        this.default_device = p.default_device || 'auto';
         // Pre-open the raw-path toggle when the profile already uses
         // default_model without an alias — operator clearly wanted raw.
         this.useRawPath = !this.model_alias && !!this.default_model;
@@ -346,6 +349,7 @@ function profileEditor() {
         default_port: parseInt(this.default_port, 10),
         context: parseInt(this.context, 10),
         kv_type: this.kv_type,
+        default_device: this.default_device || 'auto',
       };
       // useRawPath gates which model field saves: catalog picker → model_alias,
       // raw textbox → default_model. We never save both — that hides bugs

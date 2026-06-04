@@ -126,6 +126,14 @@
           <strong>spawn</strong>
         </div>
         <div class="deploy-step-body" x-show="profile">
+          <label class="meta" style="display:block; margin:0 0 0.5rem 0">
+            device
+            <select x-model="device" @change="refreshPreview()" style="margin-left:0.4rem">
+              <option value="auto">auto (profile default)</option>
+              <option value="cpu">CPU</option>
+              <option value="gpu">GPU</option>
+            </select>
+          </label>
           <p class="meta" x-show="preview" x-text="preview" style="margin: 0 0 0.5rem 0"></p>
           <button type="button" @click="spawn()" :disabled="busy || !profile" x-text="busy ? '…' : 'spawn'"></button>
           <p class="msg" :class="msgError ? 'err' : 'ok'" x-show="msg" x-text="msg" style="margin-top:0.5rem"></p>
@@ -149,6 +157,7 @@
         alias: '',
         node: '',
         profile: '',
+        device: 'auto',
         preview: '',
         busy: false,
         msg: '',
@@ -203,7 +212,7 @@
             const r = await fetch('/api/placement_preview', {
               method: 'POST',
               headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ profile_name: this.profile }),
+              body: JSON.stringify({ profile_name: this.profile, device: this.device }),
             });
             const d = await r.json();
             const fmt = mb => mb >= 1024 ? (mb/1024).toFixed(1) + ' GB' : Math.round(mb) + ' MB';
@@ -225,6 +234,7 @@
           this.busy = true; this.msg = ''; this.msgError = false;
           const body = { profile: this.profile };
           if (this.node) body.node_id = this.node;
+          if (this.device) body.device = this.device;
           try {
             const r = await fetch('/services', {
               method: 'POST',
@@ -236,7 +246,7 @@
               this.msgError = true;
               this.msg = d.error || ('HTTP ' + r.status);
             } else {
-              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + ' — see Services below';
+              this.msg = 'spawned ' + d.id.slice(0, 8) + ' on ' + d.node_id + ' port ' + d.port + (d.device ? ' (' + d.device.toUpperCase() + ')' : '') + ' — see Services below';
               const panel = document.querySelector('[hx-get="/ui/services"]');
               if (panel && window.htmx) window.htmx.trigger(panel, 'load');
             }

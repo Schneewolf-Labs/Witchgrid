@@ -147,6 +147,16 @@ check "auto-port spawn avoids an OS-occupied default_port (#17)" \
 	bash -c "curl -fsS -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"memory-phoenix\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\"}' | python3 -c 'import sys,json; d=json.load(sys.stdin); p=d.get(\"port\"); sys.exit(0 if d.get(\"pid\") and p and p!=18085 else 1)'"
 kill "$SQ2" 2>/dev/null; wait "$SQ2" 2>/dev/null
 
+# device toggle: the first-class CPU/GPU override. Forcing a GPU profile
+# (chat-mahou, gpu_layers 99) onto CPU must place + spawn regardless of GPUs
+# and report device=cpu. Portable: on a CPU-only runner chat-mahou would
+# otherwise 503 (no GPU); device=cpu is exactly what makes it run.
+check "device=cpu forces a GPU profile onto CPU (first-class toggle)" \
+	bash -c "curl -fsS -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"chat-mahou\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"device\":\"cpu\",\"port\":18805}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"pid\") and d.get(\"device\")==\"cpu\" else 1)'"
+
+check "invalid device value is rejected with 400" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"designer-cpu\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"device\":\"banana\",\"port\":18806}')\" = '400' ]"
+
 # #4: a live agent's heartbeat must keep advancing its last_seen_at. Snapshot,
 # then poll until it moves forward (cadence forced fast via
 # WITCHGRID_HEARTBEAT_SECONDS, but each beat refreshes hardware so real spacing
