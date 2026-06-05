@@ -144,7 +144,7 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid.db` (+ `-wal`/`-shm`). Absolute, created if missing. **Set this** so the DB doesn't follow CWD — a stray fresh DB drops every node/profile/service from view. The CP logs `creating NEW database at …` when it makes a fresh one. |
-| `WITCHGRID_SHARED_SECRET` | *(unset)* | Bearer secret required on inbound calls + sent on outbound. Unset = no auth (LAN-trusted). Must match on CP **and every agent**. |
+| `WITCHGRID_SHARED_SECRET` | *(unset)* | Bearer secret required on inbound calls + sent on outbound. Unset = no auth (LAN-trusted). Must match on CP **and every agent**. See [`security.md`](security.md) for the full model (public vs protected routes, reverse-proxy guidance). |
 | `WITCHGRID_STALE_NODE_SECONDS` | `90` | A node whose last heartbeat is older than this drops out of placement (and shows `node_up=0` in `/metrics`). Keep it ≳ 3× the agent's `WITCHGRID_HEARTBEAT_SECONDS` so one missed beat doesn't flap a node out. |
 | `WITCHGRID_CP_HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` and front it with an authenticating reverse proxy for anything beyond a trusted LAN. |
 | `WITCHGRID_CP_PORT` | `8765` | Bind port. |

@@ -122,7 +122,7 @@ Capability-wise it's there; 1.0 is about coherence, deployability, and test brea
 - [x] **CP bind configurable** — `WITCHGRID_CP_HOST` / `WITCHGRID_CP_PORT`.
 - [x] **Deploy/ops documented** — see [`docs/operations.md`](docs/operations.md).
 - [x] **Test breadth** — the integration harness now covers port-contention, stale-node drop, spawn-failure, bad-model-path, multi-node registration, the CPU/GPU device override, and the live/health endpoints (26 assertions).
-- [ ] **Auth posture finalized** — shared-secret path works + is documented (LAN-first). Still open: an operator login for the dashboard (slice 2) + per-consumer `/v1/llama` tokens (slice 3). Until then: keep it on a trusted LAN or behind an authenticating reverse proxy (HTTP-only, no TLS).
+- [x] **Auth posture finalized** — LAN-first shared-secret model, documented in [`docs/security.md`](docs/security.md) (what's public vs protected, reverse-proxy guidance for exposure). Deferred to post-1.0: a dashboard login (slice 2) + per-consumer `/v1/llama` tokens (slice 3) + native TLS.
 - [~] **Graceful shutdown / 2-agent test** — single-host multi-node registration is tested; WAL-checkpoint-on-SIGTERM is **blocked on Hemlock**: its async runtime (the libuv/libev loop `serve()` runs on) overrides the signal disposition, so handlers don't fire once the loop is up. SQLite WAL is crash-durable, so an ungraceful stop recovers on next open — low impact until the Hemlock fix lands.
 
 ## Related projects
