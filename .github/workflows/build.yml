@@ -119,10 +119,16 @@ jobs:
         run: |
           hemlock --version
           hemlockc --version
-          # Fail fast if install grabbed the wrong version (e.g. install.sh
-          # silently fell back to "latest").
-          hemlockc --version | grep -q "${HEMLOCK_VERSION}" \
-            || { echo "Wrong Hemlock version installed"; exit 1; }
+          # Sanity-check the install (catch a gross fallback, e.g. install.sh
+          # dropping to a different major.minor). NOTE: Hemlock's version.h
+          # isn't bumped per patch tag — the 2.6.1/2.6.2 release binaries still
+          # self-report "2.6.0" — so we can't grep the exact patch. install.sh
+          # pulls assets BY TAG (v${HEMLOCK_VERSION}), so the right (fixed)
+          # build is installed regardless of the stale self-report; we just
+          # verify the major.minor line matches.
+          MM="$(echo "${HEMLOCK_VERSION}" | cut -d. -f1,2)"
+          hemlockc --version | grep -q "${MM}\." \
+            || { echo "Wrong Hemlock major.minor installed (wanted ${MM}.x)"; exit 1; }
 
       - name: Build cp
         run: |
