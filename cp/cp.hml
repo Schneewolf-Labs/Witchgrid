@@ -37,6 +37,8 @@ import { getenv } from "@stdlib/env";
 import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { WITCHGRID_VERSION } from "../version";
+import { on_shutdown } from "@stdlib/signal";
+import { exit } from "@stdlib/process";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
          OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
@@ -3683,13 +3685,20 @@ fn main(): null {
 		  prefix: true, public: true },
 	];
 
-	// NOTE: graceful WAL-checkpoint-on-SIGTERM is intentionally NOT wired up.
-	// Hemlock's async runtime (the libuv/libev event loop serve() runs on)
-	// overrides the raw sigaction disposition, so a signal handler registered
-	// here never fires once the loop is up (it works only in single-threaded
-	// programs). Needs Hemlock-side uv_signal integration. Low impact: SQLite
-	// WAL is crash-durable, so an ungraceful stop recovers + checkpoints on the
-	// next open; the periodic VACUUM-into backup also bounds WAL growth.
+	// Graceful shutdown: on a termination signal, checkpoint the WAL (TRUNCATE
+	// empties the -wal file) and exit cleanly, so the next start is from a
+	// compact, fully-merged DB. Requires the Hemlock signal fix (async runtime
+	// now masks signals on worker threads + delivers to the main thread, and
+	// runs 0-/1-arg handlers; ≥ the build with hemlang/hemlock#587). WAL is
+	// crash-durable regardless, so an incomplete checkpoint only ever falls
+	// back to today's recover-on-next-open behavior.
+	on_shutdown(fn(sig) {
+		print("[cp] signal " + sig + " — checkpointing WAL and exiting");
+		try { exec(DB, "PRAGMA wal_checkpoint(TRUNCATE)", []); } catch (e) { }
+		try { close_db(DB); } catch (e) { }
+		exit(0);
+	});
+
 	serve(HOST, PORT, routes, cp_auth_check);
 	close_db(DB);
 	return null;

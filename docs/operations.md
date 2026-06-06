@@ -118,6 +118,13 @@ sudo systemctl enable --now witchgrid-cp
 journalctl -u witchgrid-cp -f
 ```
 
+On stop (`systemctl stop` → SIGTERM) the CP checkpoints the WAL (`TRUNCATE`)
+and exits cleanly, so the next start is from a compact, fully-merged DB —
+provided it was built against a Hemlock with the signal fix
+([hemlang/hemlock#587](https://github.com/hemlang/hemlock/pull/587)). On an
+older toolchain it falls back to default termination; SQLite WAL is
+crash-durable, so the DB still recovers + checkpoints on the next open.
+
 ### pm2 (no-sudo agent supervision)
 
 When you can't (or don't want to) write a system unit, pm2 with its boot hook

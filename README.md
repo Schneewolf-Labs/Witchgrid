@@ -123,7 +123,7 @@ Capability-wise it's there; 1.0 is about coherence, deployability, and test brea
 - [x] **Deploy/ops documented** — see [`docs/operations.md`](docs/operations.md).
 - [x] **Test breadth** — the integration harness now covers port-contention, stale-node drop, spawn-failure, bad-model-path, multi-node registration, the CPU/GPU device override, and the live/health endpoints (26 assertions).
 - [x] **Auth posture finalized** — LAN-first shared-secret model, documented in [`docs/security.md`](docs/security.md) (what's public vs protected, reverse-proxy guidance for exposure). Deferred to post-1.0: a dashboard login (slice 2) + per-consumer `/v1/llama` tokens (slice 3) + native TLS.
-- [~] **Graceful shutdown / 2-agent test** — single-host multi-node registration is tested; WAL-checkpoint-on-SIGTERM is **blocked on Hemlock**: its async runtime (the libuv/libev loop `serve()` runs on) overrides the signal disposition, so handlers don't fire once the loop is up. SQLite WAL is crash-durable, so an ungraceful stop recovers on next open — low impact until the Hemlock fix lands.
+- [x] **Graceful shutdown** — on SIGINT/TERM/HUP the CP checkpoints the WAL (TRUNCATE) and exits cleanly. Needs the Hemlock signal fix ([hemlang/hemlock#587](https://github.com/hemlang/hemlock/pull/587): async runtime now masks signals on worker threads + delivers to main). Implemented + verified; **activates once the pinned `HEMLOCK_VERSION` includes the fix** (on 2.6.0 it degrades to default termination — WAL recovers on next open, so it's safe either way). Single-host multi-node registration is tested; a cross-node 2-agent test (mocked `nvidia-smi`) is the remaining test nicety.
 
 ## Related projects
 
