@@ -49,8 +49,13 @@ on:
 #              fast-path, so sockets stored in arrays/objects (the CP/agent
 #              pass TcpListener sockets around) were over-released — a flaky
 #              heap use-after-free. Fixed in the runtime.
+#   2.6.2 — async-runtime signal delivery fix (#587): spawned worker threads
+#           now mask signals so SIGTERM/INT/HUP reach the main thread, and
+#           0-/1-arg handlers both run. Activates the CP's graceful
+#           WAL-checkpoint-on-shutdown (dormant on 2.6.0/2.6.1). (2.6.1 was
+#           released before the fix landed; skip straight to 2.6.2.)
 env:
-  HEMLOCK_VERSION: 2.6.0
+  HEMLOCK_VERSION: 2.6.2
 
 jobs:
   build:
