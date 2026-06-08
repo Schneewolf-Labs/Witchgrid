@@ -4,7 +4,7 @@ Orchestration + dashboard for self-hosted AI inference. The control plane that l
 
 For the case where you have a small fleet of CPU/GPU boxes and want to manage what's running where, what's loaded, and what's available — without hand-wiring each consumer to a hardcoded inference URL.
 
-> **Status: pre-1.0 (v0.7 line).** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a live dashboard, and a self-healing service supervisor all work. `main` is ahead of the `v0.7.0` tag (auto-restart watchdog, `/metrics`, SQLite WAL, `WITCHGRID_DATA_DIR`, unit + integration tests). See [the 1.0 punch list](#roadmap-to-10).
+> **Status: v0.9.0 — 1.0 candidate.** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a real-time dashboard (SSE-pushed, failure-first), a self-healing service supervisor, a first-class CPU/GPU toggle, a guided profile wizard, and graceful WAL-checkpoint shutdown all work. The whole [1.0 punch list](#roadmap-to-10) is checked; 0.9.0 is the soak-before-1.0 cut.
 
 Built in [Hemlock](https://hemlang.dev) (2.5.7). Each binary is a single ~7 MB ELF with universal dynamic deps (`libm`, `libffi`, `libcrypto`, `libwebsockets`, `libc`) — deploy is `scp` + a service unit.
 
