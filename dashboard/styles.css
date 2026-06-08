@@ -103,7 +103,11 @@ html, body {
 
 main {
   padding: 1.5rem 2rem 4rem;
-  max-width: 1280px;
+  /* Stretch to the full window (was capped at 1280px → crammed on wide
+     monitors). margin:0 overrides Pico's centering so it fills edge to edge. */
+  max-width: none;
+  width: auto;
+  margin: 0;
 }
 
 /* Tighter than Pico defaults — more density, less whitespace */
