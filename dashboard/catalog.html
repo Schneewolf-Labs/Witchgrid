@@ -146,8 +146,24 @@
     <section x-data="catalogBrowser()">
       <h2>Catalog</h2>
       <p class="meta note">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
-      <input type="text" x-model="q" placeholder="filter by alias, architecture, or name…"
-             style="width:100%; max-width:480px; margin-bottom:0.6rem">
+      <div class="catalog-controls">
+        <input type="text" x-model="q" placeholder="filter by alias, architecture, or name…">
+        <label class="meta">arch
+          <select x-model="archFilter">
+            <option value="">all</option>
+            <template x-for="a in architectures" :key="a"><option :value="a" x-text="a"></option></template>
+          </select>
+        </label>
+        <label class="meta">sort
+          <select x-model="sortBy">
+            <option value="alias">alias A→Z</option>
+            <option value="size">size ↓</option>
+            <option value="arch">architecture</option>
+            <option value="nodes">on nodes ↓</option>
+          </select>
+        </label>
+        <span class="meta" x-show="!loading" x-text="filtered.length + ' / ' + models.length"></span>
+      </div>
 
       <details class="ov-collapse" style="margin:0 0 1rem">
         <summary><h2>scan directories</h2> <span class="meta">edit where a node looks for models</span></summary>
@@ -393,7 +409,7 @@
     // each model expands to its metadata and a copy-to-node control.
     function catalogBrowser() {
       return {
-        models: [], nodes: [], profiles: {}, q: '', loading: true,
+        models: [], nodes: [], profiles: {}, q: '', sortBy: 'alias', archFilter: '', loading: true,
         copyTo: {}, msg: {}, spawnSel: {}, spawnMsg: {},
         async init() {
           await this.load();
@@ -437,13 +453,28 @@
           } catch (e) { this.spawnMsg[m.alias] = 'error: ' + e; }
         },
         profileCreateUrl(m) { return '/profiles?prefill_alias=' + encodeURIComponent(m.alias); },
+        get architectures() {
+          const s = new Set();
+          this.models.forEach(m => { if (m.architecture) s.add(m.architecture); });
+          return [...s].sort();
+        },
         get filtered() {
           const q = this.q.trim().toLowerCase();
-          if (!q) return this.models;
-          return this.models.filter(m =>
-            (m.alias || '').toLowerCase().includes(q) ||
-            (m.architecture || '').toLowerCase().includes(q) ||
-            (m.general_name || '').toLowerCase().includes(q));
+          let list = this.models.filter(m => {
+            if (this.archFilter && (m.architecture || '') !== this.archFilter) return false;
+            if (!q) return true;
+            return (m.alias || '').toLowerCase().includes(q)
+                || (m.architecture || '').toLowerCase().includes(q)
+                || (m.general_name || '').toLowerCase().includes(q);
+          });
+          const by = this.sortBy;
+          return list.slice().sort((a, b) => {
+            if (by === 'size')  return (b.size_mb || 0) - (a.size_mb || 0);
+            if (by === 'nodes') return ((b.on_nodes || []).length) - ((a.on_nodes || []).length);
+            if (by === 'arch')  return (a.architecture || '').localeCompare(b.architecture || '')
+                                     || (a.alias || '').localeCompare(b.alias || '');
+            return (a.alias || '').localeCompare(b.alias || '');   // alias A→Z (default)
+          });
         },
         copyTargets(m) {
           const have = new Set((m.on_nodes || []).map(o => o.node_id));
