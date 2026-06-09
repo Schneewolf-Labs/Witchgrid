@@ -131,7 +131,7 @@ export let INDEX_HTML = "<!doctype html>
           <hr style=\"margin:1.25rem 0; border:none; border-top:1px solid var(--border-soft)\">
 
           <h3 style=\"margin:0 0 0.5rem 0\">llama.cpp</h3>
-          <p class=\"meta\" style=\"margin:0 0 0.75rem 0\">
+          <p class=\"meta note-lg\">
             current: <code x-text=\"currentPath || '—'\"></code>
           </p>
 
@@ -181,11 +181,11 @@ export let INDEX_HTML = "<!doctype html>
           <h3 style=\"margin:0 0 0.25rem 0\">
             <span x-text=\"profile\"></span> · <span class=\"meta\" x-text=\"node + ' · ' + id.slice(0,8) + '…'\"></span>
           </h3>
-          <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+          <p class=\"meta note\">
             Last 32 KB of <code>/tmp/witchgrid-&lt;id&gt;.log</code> on <span x-text=\"node\"></span>. Refreshes every 3s.
           </p>
           <p class=\"msg err\" x-show=\"err\" x-text=\"err\"></p>
-          <pre id=\"service-log-body\" style=\"background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.78rem; white-space:pre-wrap; word-break:break-word; max-height:60vh; overflow-y:auto\" x-text=\"body || '(empty — service may not have written anything yet)'\"></pre>
+          <pre id=\"service-log-body\" class=\"code-block\" style=\"max-height:60vh\" x-text=\"body || '(empty — service may not have written anything yet)'\"></pre>
           <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem\">
             <button type=\"button\" class=\"row-action\" @click=\"refresh()\">refresh</button>
             <button type=\"button\" @click=\"close()\">close</button>
@@ -243,7 +243,7 @@ export let INDEX_HTML = "<!doctype html>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 </body>
 </html>
@@ -308,7 +308,7 @@ export let CATALOG_HTML = "<!doctype html>
     <div x-show=\"tab==='missing'\">
     <section>
       <h2>Missing</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
+      <p class=\"meta note\">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
       <div hx-get=\"/ui/missing\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
     </div>
@@ -316,7 +316,7 @@ export let CATALOG_HTML = "<!doctype html>
     <div x-show=\"tab==='hf'\">
     <section x-data=\"hfPull()\">
       <h2>Pull from HuggingFace</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.75rem 0\">
+      <p class=\"meta note-lg\">
         Search HF for a GGUF, pick a quant, send it to a node. Files land
         in the agent's canonical model dir and the catalog rescans
         automatically once the transfer completes.
@@ -396,7 +396,7 @@ export let CATALOG_HTML = "<!doctype html>
     <div x-show=\"tab==='catalog'\">
     <section x-data=\"catalogBrowser()\">
       <h2>Catalog</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
+      <p class=\"meta note\">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
       <input type=\"text\" x-model=\"q\" placeholder=\"filter by alias, architecture, or name…\"
              style=\"width:100%; max-width:480px; margin-bottom:0.6rem\">
 
@@ -412,7 +412,7 @@ export let CATALOG_HTML = "<!doctype html>
             <p class=\"meta\" style=\"margin:0 0 0.5rem\">canonical (pulls land here; set via env, read-only): <code x-text=\"sd.canonical || '—'\"></code></p>
             <label>extra scan dirs <span class=\"meta\">(one path per line)</span></label>
             <textarea x-model=\"sd.extra\" rows=\"3\" placeholder=\"/mnt/models&#10;/data/gguf\"
-                      style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.82rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
+                      class=\"ta-mono\"></textarea>
             <div style=\"display:flex; gap:0.6rem; align-items:center; margin-top:0.5rem\">
               <button type=\"button\" @click=\"saveScanDirs()\" :disabled=\"sd.busy\" x-text=\"sd.busy ? '…' : 'save + rescan'\"></button>
               <span class=\"meta\" x-text=\"sd.msg\"></span>
@@ -491,7 +491,7 @@ export let CATALOG_HTML = "<!doctype html>
       <div class=\"modal-backdrop\" x-show=\"del.open\" x-cloak @click.self=\"cancelDelete()\" style=\"display:none\">
         <div class=\"modal-card\" @click.stop style=\"max-width:560px\">
           <h3 style=\"margin:0 0 0.5rem 0\">Delete model?</h3>
-          <p class=\"meta\" style=\"margin:0 0 0.75rem 0\">
+          <p class=\"meta note-lg\">
             Permanently removes this file from disk on <strong x-text=\"del.node\"></strong>. This cannot be undone.
           </p>
           <div class=\"detail-grid\" style=\"padding-left:0\">
@@ -511,7 +511,7 @@ export let CATALOG_HTML = "<!doctype html>
     <div x-show=\"tab==='transfers'\">
     <section>
       <h2>Transfers</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
+      <p class=\"meta note\">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
       <div hx-get=\"/ui/transfers\" hx-trigger=\"load, every 5s\">loading…</div>
     </section>
     </div>
@@ -519,7 +519,7 @@ export let CATALOG_HTML = "<!doctype html>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 
   <script>
@@ -835,13 +835,13 @@ export let TRANSFERS_HTML = "<!doctype html>
 
     <section>
       <h2>Transfers</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">In-flight + recent (last hour) model pulls across the fleet.</p>
+      <p class=\"meta note\">In-flight + recent (last hour) model pulls across the fleet.</p>
       <div hx-get=\"/ui/transfers\" hx-trigger=\"load, every 3s\">loading…</div>
     </section>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 </body>
 </html>
@@ -1057,7 +1057,7 @@ export let PROFILES_HTML = "<!doctype html>
 
           <!-- Step 1: use case -->
           <div x-show=\"step===1\">
-            <p class=\"meta\" style=\"margin:0 0 0.75rem 0\">What will this model be used for? Pick the closest — it sets sensible defaults you can tweak.</p>
+            <p class=\"meta note-lg\">What will this model be used for? Pick the closest — it sets sensible defaults you can tweak.</p>
             <div class=\"wiz-grid\">
               <template x-for=\"uc in useCases\" :key=\"uc.id\">
                 <button type=\"button\" class=\"wiz-card\" :class=\"useCase &amp;&amp; useCase.id===uc.id ? 'wiz-card-sel' : ''\" @click=\"pickUseCase(uc)\">
@@ -1132,7 +1132,7 @@ export let PROFILES_HTML = "<!doctype html>
 
     <section x-data=\"aliasEditor()\">
       <h2>Profile aliases</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+      <p class=\"meta note\">
         Public-facing names that resolve to a profile at routing time. Lets you rename internal profiles without breaking consumer URLs:
         <code>POST /v1/llama/&lt;alias&gt;/completion</code> hits the alias's target.
         Many aliases can point at one profile.
@@ -1176,13 +1176,13 @@ export let PROFILES_HTML = "<!doctype html>
 
     <section>
       <h2>Capabilities</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">What flags each agent's binaries actually support — refreshed when the agent restarts.</p>
+      <p class=\"meta note\">What flags each agent's binaries actually support — refreshed when the agent restarts.</p>
       <div hx-get=\"/ui/capabilities\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 
   <script>
@@ -1288,7 +1288,7 @@ export let BENCH_HTML = "<!doctype html>
 
     <section x-data=\"benchPage()\">
       <h2>Bench</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.75rem 0\">
+      <p class=\"meta note-lg\">
         Pin-spawn a profile on a target node, fire N timed completion requests,
         record median ttft + tok/s + total. Stop when done. Bench rows pin to
         the build that ran them so you can compare across llama.cpp upgrades.
@@ -1315,7 +1315,7 @@ export let BENCH_HTML = "<!doctype html>
         </div>
         <div style=\"grid-column: 1 / -1\">
           <label for=\"bpr\">prompt</label>
-          <textarea id=\"bpr\" x-model=\"prompt\" rows=\"3\" style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
+          <textarea id=\"bpr\" x-model=\"prompt\" rows=\"3\" class=\"ta-mono\"></textarea>
         </div>
         <div>
           <label for=\"bnp\">n_predict</label>
@@ -1332,13 +1332,13 @@ export let BENCH_HTML = "<!doctype html>
 
     <section>
       <h2>Results</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Last 100, newest first. Polls every 5s.</p>
+      <p class=\"meta note\">Last 100, newest first. Polls every 5s.</p>
       <div hx-get=\"/ui/bench\" hx-trigger=\"load, every 5s\">loading…</div>
     </section>
 
     <section x-data=\"testPrompt()\">
       <h2>Test prompt</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+      <p class=\"meta note\">
         Send a single completion request through <code>/v1/llama/{profile}/completion</code>
         to verify a service responds. Shows tokens, ttft, and tok/s from the response timings.
       </p>
@@ -1359,7 +1359,7 @@ export let BENCH_HTML = "<!doctype html>
         <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'send'\"></button>
         <div style=\"grid-column: 1 / -1\">
           <label for=\"tp-prompt\">prompt</label>
-          <textarea id=\"tp-prompt\" x-model=\"prompt\" rows=\"4\" style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
+          <textarea id=\"tp-prompt\" x-model=\"prompt\" rows=\"4\" class=\"ta-mono\"></textarea>
         </div>
         <p class=\"msg err\" x-show=\"error\" x-text=\"error\"></p>
       </form>
@@ -1379,13 +1379,13 @@ export let BENCH_HTML = "<!doctype html>
             <span x-text=\"elapsedMs\"></span>ms wall
           </span>
         </div>
-        <pre style=\"background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.82rem; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto\" x-text=\"result?.content || '(no content)'\"></pre>
+        <pre class=\"code-block\" style=\"max-height:400px\" x-text=\"result?.content || '(no content)'\"></pre>
       </div>
     </section>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 
   <script>
@@ -1484,7 +1484,7 @@ export let DEPLOY_HTML = "<!doctype html>
 
     <section x-data=\"deployFlow()\">
       <h2>Deploy</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.75rem 0\">
+      <p class=\"meta note-lg\">
         Linear flow: pick a model → pick a node → pick a profile → spawn.
         Each step filters the next so you can't pick combinations that won't work.
       </p>
@@ -1579,13 +1579,13 @@ export let DEPLOY_HTML = "<!doctype html>
 
     <section>
       <h2>Services</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Live services across the fleet — updates live.</p>
+      <p class=\"meta note\">Live services across the fleet — updates live.</p>
       <div hx-get=\"/ui/services\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 
   <script>
@@ -1759,7 +1759,7 @@ export let SETTINGS_HTML = "<!doctype html>
     <div x-data=\"settingsPage()\">
       <section>
         <h2>sqlite auto-backup</h2>
-        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+        <p class=\"meta note\">
           Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
           Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
           Changes take effect on the next interval boundary — no CP restart needed.
@@ -1791,7 +1791,7 @@ export let SETTINGS_HTML = "<!doctype html>
 
       <section>
         <h2>Runtime config</h2>
-        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+        <p class=\"meta note\">
           Read-only — set via environment on the CP (systemd unit / <code>cp.env</code>). Shown here for visibility.
         </p>
         <dl class=\"hw-dl\" style=\"max-width:520px\">
@@ -1807,7 +1807,7 @@ export let SETTINGS_HTML = "<!doctype html>
 
       <section>
         <h2>Import / export</h2>
-        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+        <p class=\"meta note\">
           Download the editable config as JSON to back it up or copy to another CP, or upload one to apply it.
           Import applies recognized keys and skips the rest.
         </p>
@@ -1824,7 +1824,7 @@ export let SETTINGS_HTML = "<!doctype html>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
     made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
-    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+    <div id=\"wg-footer-info\" class=\"meta\"></div>
   </footer>
 
   <script>
@@ -3003,6 +3003,67 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
 .wiz-card .wiz-icon { font-size: 1.4rem; line-height: 1; }
 .wiz-card strong { font-size: 0.9rem; }
 .wiz-card .meta { font-size: 0.75rem; line-height: 1.3; }
+
+/* ═══ consistency pass: form controls, code blocks, helpers ═══════════ */
+
+/* Unify text inputs — consistent radius + a cohesive accent focus ring. */
+input:not([type=\"checkbox\"]):not([type=\"radio\"]),
+select,
+textarea {
+  border-radius: 6px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+input:not([type=\"checkbox\"]):not([type=\"radio\"]):focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+/* Keyboard focus ring for the custom buttons (consistency + a11y). */
+button:focus-visible,
+.row-action:focus-visible,
+.chip:focus-visible,
+.tab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Monospace textarea — was duplicated inline on bench / catalog / utilities. */
+.ta-mono {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, \"JetBrains Mono\", \"Menlo\", monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 0.55rem 0.65rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg-1);
+  resize: vertical;
+}
+
+/* Read-only code / log block — was duplicated inline on <pre> elements. */
+.code-block {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  color: var(--fg-1);
+}
+
+/* Section description paragraphs — was repeated inline margin one-offs. */
+p.note    { margin: 0 0 0.5rem; }
+p.note-lg { margin: 0 0 0.75rem; }
+
+/* Footer build-info line. */
+#wg-footer-info { margin-top: 0.3rem; font-size: 0.72rem; }
 ";
 
 export let DASHBOARD_JS = "// Witchgrid dashboard JS — Alpine.js components + small UX glue.

@@ -48,7 +48,7 @@
 
     <section x-data="benchPage()">
       <h2>Bench</h2>
-      <p class="meta" style="margin: 0 0 0.75rem 0">
+      <p class="meta note-lg">
         Pin-spawn a profile on a target node, fire N timed completion requests,
         record median ttft + tok/s + total. Stop when done. Bench rows pin to
         the build that ran them so you can compare across llama.cpp upgrades.
@@ -75,7 +75,7 @@
         </div>
         <div style="grid-column: 1 / -1">
           <label for="bpr">prompt</label>
-          <textarea id="bpr" x-model="prompt" rows="3" style="width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+          <textarea id="bpr" x-model="prompt" rows="3" class="ta-mono"></textarea>
         </div>
         <div>
           <label for="bnp">n_predict</label>
@@ -92,13 +92,13 @@
 
     <section>
       <h2>Results</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Last 100, newest first. Polls every 5s.</p>
+      <p class="meta note">Last 100, newest first. Polls every 5s.</p>
       <div hx-get="/ui/bench" hx-trigger="load, every 5s">loading…</div>
     </section>
 
     <section x-data="testPrompt()">
       <h2>Test prompt</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">
+      <p class="meta note">
         Send a single completion request through <code>/v1/llama/{profile}/completion</code>
         to verify a service responds. Shows tokens, ttft, and tok/s from the response timings.
       </p>
@@ -119,7 +119,7 @@
         <button type="submit" :disabled="busy" x-text="busy ? '…' : 'send'"></button>
         <div style="grid-column: 1 / -1">
           <label for="tp-prompt">prompt</label>
-          <textarea id="tp-prompt" x-model="prompt" rows="4" style="width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+          <textarea id="tp-prompt" x-model="prompt" rows="4" class="ta-mono"></textarea>
         </div>
         <p class="msg err" x-show="error" x-text="error"></p>
       </form>
@@ -139,13 +139,13 @@
             <span x-text="elapsedMs"></span>ms wall
           </span>
         </div>
-        <pre style="background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.82rem; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto" x-text="result?.content || '(no content)'"></pre>
+        <pre class="code-block" style="max-height:400px" x-text="result?.content || '(no content)'"></pre>
       </div>
     </section>
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 
   <script>

@@ -57,7 +57,7 @@
     <div x-show="tab==='missing'">
     <section>
       <h2>Missing</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
+      <p class="meta note">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
       <div hx-get="/ui/missing" hx-trigger="load, every 30s">loading…</div>
     </section>
     </div>
@@ -65,7 +65,7 @@
     <div x-show="tab==='hf'">
     <section x-data="hfPull()">
       <h2>Pull from HuggingFace</h2>
-      <p class="meta" style="margin: 0 0 0.75rem 0">
+      <p class="meta note-lg">
         Search HF for a GGUF, pick a quant, send it to a node. Files land
         in the agent's canonical model dir and the catalog rescans
         automatically once the transfer completes.
@@ -145,7 +145,7 @@
     <div x-show="tab==='catalog'">
     <section x-data="catalogBrowser()">
       <h2>Catalog</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
+      <p class="meta note">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
       <input type="text" x-model="q" placeholder="filter by alias, architecture, or name…"
              style="width:100%; max-width:480px; margin-bottom:0.6rem">
 
@@ -161,7 +161,7 @@
             <p class="meta" style="margin:0 0 0.5rem">canonical (pulls land here; set via env, read-only): <code x-text="sd.canonical || '—'"></code></p>
             <label>extra scan dirs <span class="meta">(one path per line)</span></label>
             <textarea x-model="sd.extra" rows="3" placeholder="/mnt/models&#10;/data/gguf"
-                      style="width:100%; font-family:ui-monospace,monospace; font-size:0.82rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+                      class="ta-mono"></textarea>
             <div style="display:flex; gap:0.6rem; align-items:center; margin-top:0.5rem">
               <button type="button" @click="saveScanDirs()" :disabled="sd.busy" x-text="sd.busy ? '…' : 'save + rescan'"></button>
               <span class="meta" x-text="sd.msg"></span>
@@ -240,7 +240,7 @@
       <div class="modal-backdrop" x-show="del.open" x-cloak @click.self="cancelDelete()" style="display:none">
         <div class="modal-card" @click.stop style="max-width:560px">
           <h3 style="margin:0 0 0.5rem 0">Delete model?</h3>
-          <p class="meta" style="margin:0 0 0.75rem 0">
+          <p class="meta note-lg">
             Permanently removes this file from disk on <strong x-text="del.node"></strong>. This cannot be undone.
           </p>
           <div class="detail-grid" style="padding-left:0">
@@ -260,7 +260,7 @@
     <div x-show="tab==='transfers'">
     <section>
       <h2>Transfers</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
+      <p class="meta note">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
       <div hx-get="/ui/transfers" hx-trigger="load, every 5s">loading…</div>
     </section>
     </div>
@@ -268,7 +268,7 @@
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 
   <script>

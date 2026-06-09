@@ -1087,3 +1087,64 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
 .wiz-card .wiz-icon { font-size: 1.4rem; line-height: 1; }
 .wiz-card strong { font-size: 0.9rem; }
 .wiz-card .meta { font-size: 0.75rem; line-height: 1.3; }
+
+/* ═══ consistency pass: form controls, code blocks, helpers ═══════════ */
+
+/* Unify text inputs — consistent radius + a cohesive accent focus ring. */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  border-radius: 6px;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+}
+input:not([type="checkbox"]):not([type="radio"]):focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+
+/* Keyboard focus ring for the custom buttons (consistency + a11y). */
+button:focus-visible,
+.row-action:focus-visible,
+.chip:focus-visible,
+.tab-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Monospace textarea — was duplicated inline on bench / catalog / utilities. */
+.ta-mono {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", "Menlo", monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  padding: 0.55rem 0.65rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--fg-1);
+  resize: vertical;
+}
+
+/* Read-only code / log block — was duplicated inline on <pre> elements. */
+.code-block {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  color: var(--fg-1);
+}
+
+/* Section description paragraphs — was repeated inline margin one-offs. */
+p.note    { margin: 0 0 0.5rem; }
+p.note-lg { margin: 0 0 0.75rem; }
+
+/* Footer build-info line. */
+#wg-footer-info { margin-top: 0.3rem; font-size: 0.72rem; }

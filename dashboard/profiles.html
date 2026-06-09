@@ -208,7 +208,7 @@
 
           <!-- Step 1: use case -->
           <div x-show="step===1">
-            <p class="meta" style="margin:0 0 0.75rem 0">What will this model be used for? Pick the closest — it sets sensible defaults you can tweak.</p>
+            <p class="meta note-lg">What will this model be used for? Pick the closest — it sets sensible defaults you can tweak.</p>
             <div class="wiz-grid">
               <template x-for="uc in useCases" :key="uc.id">
                 <button type="button" class="wiz-card" :class="useCase &amp;&amp; useCase.id===uc.id ? 'wiz-card-sel' : ''" @click="pickUseCase(uc)">
@@ -283,7 +283,7 @@
 
     <section x-data="aliasEditor()">
       <h2>Profile aliases</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">
+      <p class="meta note">
         Public-facing names that resolve to a profile at routing time. Lets you rename internal profiles without breaking consumer URLs:
         <code>POST /v1/llama/&lt;alias&gt;/completion</code> hits the alias's target.
         Many aliases can point at one profile.
@@ -327,13 +327,13 @@
 
     <section>
       <h2>Capabilities</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">What flags each agent's binaries actually support — refreshed when the agent restarts.</p>
+      <p class="meta note">What flags each agent's binaries actually support — refreshed when the agent restarts.</p>
       <div hx-get="/ui/capabilities" hx-trigger="load, every 30s">loading…</div>
     </section>
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 
   <script>

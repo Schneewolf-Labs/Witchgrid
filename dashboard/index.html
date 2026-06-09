@@ -117,7 +117,7 @@
           <hr style="margin:1.25rem 0; border:none; border-top:1px solid var(--border-soft)">
 
           <h3 style="margin:0 0 0.5rem 0">llama.cpp</h3>
-          <p class="meta" style="margin:0 0 0.75rem 0">
+          <p class="meta note-lg">
             current: <code x-text="currentPath || '—'"></code>
           </p>
 
@@ -167,11 +167,11 @@
           <h3 style="margin:0 0 0.25rem 0">
             <span x-text="profile"></span> · <span class="meta" x-text="node + ' · ' + id.slice(0,8) + '…'"></span>
           </h3>
-          <p class="meta" style="margin: 0 0 0.5rem 0">
+          <p class="meta note">
             Last 32 KB of <code>/tmp/witchgrid-&lt;id&gt;.log</code> on <span x-text="node"></span>. Refreshes every 3s.
           </p>
           <p class="msg err" x-show="err" x-text="err"></p>
-          <pre id="service-log-body" style="background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.78rem; white-space:pre-wrap; word-break:break-word; max-height:60vh; overflow-y:auto" x-text="body || '(empty — service may not have written anything yet)'"></pre>
+          <pre id="service-log-body" class="code-block" style="max-height:60vh" x-text="body || '(empty — service may not have written anything yet)'"></pre>
           <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem">
             <button type="button" class="row-action" @click="refresh()">refresh</button>
             <button type="button" @click="close()">close</button>
@@ -229,7 +229,7 @@
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 </body>
 </html>

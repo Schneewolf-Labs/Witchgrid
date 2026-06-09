@@ -48,7 +48,7 @@
 
     <section x-data="deployFlow()">
       <h2>Deploy</h2>
-      <p class="meta" style="margin: 0 0 0.75rem 0">
+      <p class="meta note-lg">
         Linear flow: pick a model → pick a node → pick a profile → spawn.
         Each step filters the next so you can't pick combinations that won't work.
       </p>
@@ -143,13 +143,13 @@
 
     <section>
       <h2>Services</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Live services across the fleet — updates live.</p>
+      <p class="meta note">Live services across the fleet — updates live.</p>
       <div hx-get="/ui/services" hx-trigger="load, every 30s">loading…</div>
     </section>
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 
   <script>

@@ -43,7 +43,7 @@
     <div x-data="settingsPage()">
       <section>
         <h2>sqlite auto-backup</h2>
-        <p class="meta" style="margin: 0 0 0.5rem 0">
+        <p class="meta note">
           Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
           Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
           Changes take effect on the next interval boundary — no CP restart needed.
@@ -75,7 +75,7 @@
 
       <section>
         <h2>Runtime config</h2>
-        <p class="meta" style="margin: 0 0 0.5rem 0">
+        <p class="meta note">
           Read-only — set via environment on the CP (systemd unit / <code>cp.env</code>). Shown here for visibility.
         </p>
         <dl class="hw-dl" style="max-width:520px">
@@ -91,7 +91,7 @@
 
       <section>
         <h2>Import / export</h2>
-        <p class="meta" style="margin: 0 0 0.5rem 0">
+        <p class="meta note">
           Download the editable config as JSON to back it up or copy to another CP, or upload one to apply it.
           Import applies recognized keys and skips the rest.
         </p>
@@ -108,7 +108,7 @@
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
     made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
-    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+    <div id="wg-footer-info" class="meta"></div>
   </footer>
 
   <script>
