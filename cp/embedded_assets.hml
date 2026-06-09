@@ -44,9 +44,8 @@ export let INDEX_HTML = "<!doctype html>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -241,53 +240,11 @@ export let INDEX_HTML = "<!doctype html>
       </form>
     </details>
 
-    <details class=\"ov-collapse\" data-detail-key=\"ov-test\" x-data=\"testPrompt()\">
-      <summary><h2>Test prompt</h2></summary>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
-        Send a single completion request through <code>/v1/llama/{profile}/completion</code>
-        to verify a service responds. Shows tokens, ttft, and tok/s from the response timings.
-      </p>
-      <form class=\"spawn\" @submit.prevent=\"send()\">
-        <div>
-          <label for=\"tp-prof\">profile</label>
-          <select id=\"tp-prof\" x-model=\"profile\" required>
-            <option value=\"\">— select —</option>
-            <template x-for=\"name in Object.keys(profiles)\" :key=\"name\">
-              <option :value=\"name\" x-text=\"name\"></option>
-            </template>
-          </select>
-        </div>
-        <div>
-          <label for=\"tp-np\">n_predict</label>
-          <input id=\"tp-np\" type=\"number\" x-model=\"n_predict\" min=\"1\" max=\"2048\">
-        </div>
-        <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'send'\"></button>
-        <div style=\"grid-column: 1 / -1\">
-          <label for=\"tp-prompt\">prompt</label>
-          <textarea id=\"tp-prompt\" x-model=\"prompt\" rows=\"4\" style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
-        </div>
-        <p class=\"msg err\" x-show=\"error\" x-text=\"error\"></p>
-      </form>
-
-      <div x-show=\"result\" style=\"margin-top:1rem\">
-        <div style=\"display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.5rem\">
-          <span class=\"badge badge-canonical\" x-show=\"result?.timings?.predicted_per_second != null\">
-            <span x-text=\"(result?.timings?.predicted_per_second || 0).toFixed(1)\"></span> tok/s
-          </span>
-          <span class=\"badge badge-scan\" x-show=\"result?.timings?.prompt_ms != null\">
-            ttft <span x-text=\"Math.round(result?.timings?.prompt_ms || 0)\"></span>ms
-          </span>
-          <span class=\"badge\" x-show=\"result?.tokens_predicted != null\">
-            <span x-text=\"result?.tokens_predicted\"></span> tokens
-          </span>
-          <span class=\"badge\" x-show=\"elapsedMs\">
-            <span x-text=\"elapsedMs\"></span>ms wall
-          </span>
-        </div>
-        <pre style=\"background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.82rem; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto\" x-text=\"result?.content || '(no content)'\"></pre>
-      </div>
-    </details>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 </body>
 </html>
 ";
@@ -319,13 +276,13 @@ export let CATALOG_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -340,12 +297,23 @@ export let CATALOG_HTML = "<!doctype html>
       </div>
     </div>
 
+    <div x-data=\"{ tab: 'catalog' }\" @wg-find-quants.window=\"tab='hf'\">
+      <div class=\"tabbar\">
+        <button type=\"button\" class=\"tab-btn\" :class=\"tab==='catalog' ? 'active' : ''\" @click=\"tab='catalog'\">catalog</button>
+        <button type=\"button\" class=\"tab-btn\" :class=\"tab==='hf' ? 'active' : ''\" @click=\"tab='hf'\">huggingface</button>
+        <button type=\"button\" class=\"tab-btn\" :class=\"tab==='transfers' ? 'active' : ''\" @click=\"tab='transfers'\">transfers</button>
+        <button type=\"button\" class=\"tab-btn\" :class=\"tab==='missing' ? 'active' : ''\" @click=\"tab='missing'\">missing</button>
+      </div>
+
+    <div x-show=\"tab==='missing'\">
     <section>
       <h2>Missing</h2>
       <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
       <div hx-get=\"/ui/missing\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
+    </div>
 
+    <div x-show=\"tab==='hf'\">
     <section x-data=\"hfPull()\">
       <h2>Pull from HuggingFace</h2>
       <p class=\"meta\" style=\"margin: 0 0 0.75rem 0\">
@@ -385,7 +353,7 @@ export let CATALOG_HTML = "<!doctype html>
       <div x-show=\"files.length > 0\" style=\"margin-top:1rem\">
         <h3 style=\"margin:0 0 0.5rem 0\">files in <code x-text=\"selectedRepo\"></code></h3>
         <table>
-          <thead><tr><th>file</th><th>size</th><th>alias</th><th>node</th><th></th></tr></thead>
+          <thead><tr><th>file</th><th>quant</th><th>size</th><th>alias</th><th>node</th><th></th></tr></thead>
           <tbody>
             <template x-for=\"f in files\" :key=\"f.path\">
               <tr>
@@ -393,6 +361,7 @@ export let CATALOG_HTML = "<!doctype html>
                   <code x-text=\"f.path\"></code>
                   <span x-show=\"f.sharded\" class=\"badge badge-scan\" style=\"margin-left:0.4rem\">sharded</span>
                 </td>
+                <td><span class=\"badge badge-state-active\" x-text=\"ggufQuant(f.path)\"></span></td>
                 <td><span class=\"meta\" x-text=\"formatSize(f.size)\"></span></td>
                 <td><code class=\"meta\" x-text=\"aliasFor(f.path)\"></code></td>
                 <td>
@@ -419,16 +388,139 @@ export let CATALOG_HTML = "<!doctype html>
             + create profile for <code x-text=\"lastPulled?.alias\"></code>
           </a>
         </p>
-        <p class=\"meta\" style=\"margin-top:0.5rem\">Once started, watch progress on <a href=\"/transfers\">/transfers</a>.</p>
+        <p class=\"meta\" style=\"margin-top:0.5rem\">Once started, watch progress in <strong>Transfers</strong> below.</p>
       </div>
     </section>
+    </div>
 
-    <section>
+    <div x-show=\"tab==='catalog'\">
+    <section x-data=\"catalogBrowser()\">
       <h2>Catalog</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time. Use the per-row picker to copy a model to another node.</p>
-      <div hx-get=\"/ui/catalog\" hx-trigger=\"load, every 10s\">loading…</div>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
+      <input type=\"text\" x-model=\"q\" placeholder=\"filter by alias, architecture, or name…\"
+             style=\"width:100%; max-width:480px; margin-bottom:0.6rem\">
+
+      <details class=\"ov-collapse\" style=\"margin:0 0 1rem\">
+        <summary><h2>scan directories</h2> <span class=\"meta\">edit where a node looks for models</span></summary>
+        <div style=\"background:var(--bg-1); border:1px solid var(--border); border-radius:8px; padding:1rem; max-width:640px\">
+          <label>node</label>
+          <select x-model=\"sd.node\" @change=\"loadScanDirs()\" style=\"max-width:320px\">
+            <option value=\"\">— select node —</option>
+            <template x-for=\"n in nodes\" :key=\"n.node_id\"><option :value=\"n.node_id\" x-text=\"n.node_id\"></option></template>
+          </select>
+          <div x-show=\"sd.node\" style=\"margin-top:0.75rem\">
+            <p class=\"meta\" style=\"margin:0 0 0.5rem\">canonical (pulls land here; set via env, read-only): <code x-text=\"sd.canonical || '—'\"></code></p>
+            <label>extra scan dirs <span class=\"meta\">(one path per line)</span></label>
+            <textarea x-model=\"sd.extra\" rows=\"3\" placeholder=\"/mnt/models&#10;/data/gguf\"
+                      style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.82rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
+            <div style=\"display:flex; gap:0.6rem; align-items:center; margin-top:0.5rem\">
+              <button type=\"button\" @click=\"saveScanDirs()\" :disabled=\"sd.busy\" x-text=\"sd.busy ? '…' : 'save + rescan'\"></button>
+              <span class=\"meta\" x-text=\"sd.msg\"></span>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <p class=\"meta\" x-show=\"loading\">loading…</p>
+      <p class=\"empty\" x-show=\"!loading && filtered.length === 0\"
+         x-text=\"q ? 'no models match “' + q + '”' : 'No models in any node catalog. Set WITCHGRID_MODEL_DIR on an agent.'\"></p>
+      <div class=\"node-card-procs\" style=\"border-top:none; margin-top:0; padding-top:0\" x-show=\"filtered.length > 0\">
+        <template x-for=\"m in filtered\" :key=\"m.alias\">
+          <details class=\"proc-item\">
+            <summary class=\"proc-summary\">
+              <strong class=\"proc-name\" x-text=\"m.alias\"></strong>
+              <span class=\"badge badge-scan\" x-text=\"m.architecture || '?'\"></span>
+              <code class=\"proc-port\" x-text=\"fmtSize(m.size_mb)\"></code>
+              <span class=\"meta proc-model\" x-text=\"(m.on_nodes ? m.on_nodes.length : 0) + ' node' + ((m.on_nodes && m.on_nodes.length === 1) ? '' : 's')\"></span>
+              <span class=\"proc-chevron\">›</span>
+            </summary>
+            <div class=\"detail-grid\">
+              <div><span class=\"dk\">name</span><span x-text=\"m.general_name || '—'\"></span></div>
+              <div><span class=\"dk\">arch</span><code x-text=\"m.architecture || '—'\"></code></div>
+              <div><span class=\"dk\">context</span><code x-text=\"m.claimed_context ? Number(m.claimed_context).toLocaleString() : '—'\"></code></div>
+              <div><span class=\"dk\">size</span><span x-text=\"fmtSize(m.size_mb)\"></span></div>
+              <div class=\"detail-wide\"><span class=\"dk\">source</span>
+                <template x-if=\"m.source_url\"><a :href=\"m.source_url\" target=\"_blank\" x-text=\"m.source_url\"></a></template>
+                <template x-if=\"!m.source_url\"><span class=\"meta\">—</span></template>
+              </div>
+              <div class=\"detail-wide\"><span class=\"dk\">quants</span>
+                <button type=\"button\" class=\"row-action\" @click=\"findQuants(m)\">⊕ find other quants / sources</button>
+                <span class=\"meta\" style=\"margin-left:0.4rem\">searches HuggingFace for other quantizations of this model</span>
+              </div>
+              <div class=\"detail-wide\"><span class=\"dk\">spawn</span>
+                <template x-if=\"matchingProfiles(m).length > 0\">
+                  <span style=\"display:inline-flex; gap:0.4rem; align-items:center; flex-wrap:wrap\">
+                    <select x-model=\"spawnSel[m.alias]\" style=\"font-family:ui-monospace,monospace; font-size:0.8rem\">
+                      <option value=\"\">profile…</option>
+                      <template x-for=\"pn in matchingProfiles(m)\" :key=\"pn\"><option :value=\"pn\" x-text=\"pn\"></option></template>
+                    </select>
+                    <button type=\"button\" class=\"row-action\" @click=\"spawnModel(m)\" :disabled=\"!spawnSel[m.alias]\">spawn</button>
+                    <span class=\"meta\" x-show=\"spawnMsg[m.alias]\" x-text=\"spawnMsg[m.alias]\"></span>
+                  </span>
+                </template>
+                <template x-if=\"matchingProfiles(m).length === 0\">
+                  <a class=\"row-action\" :href=\"profileCreateUrl(m)\" style=\"text-decoration:none; display:inline-block\">+ create a profile to spawn this</a>
+                </template>
+              </div>
+              <div class=\"detail-wide\"><span class=\"dk\">on nodes</span>
+                <div>
+                  <template x-for=\"on in m.on_nodes\" :key=\"on.node_id\">
+                    <div class=\"catalog-node\" style=\"display:flex; gap:0.5rem; align-items:center; padding:0.15rem 0\">
+                      <strong x-text=\"on.node_id\"></strong>
+                      <code class=\"meta\" style=\"flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis\" x-text=\"on.path\"></code>
+                      <button type=\"button\" class=\"row-action row-action-danger\" @click=\"askDelete(m.alias, on.node_id, on.path)\">delete</button>
+                    </div>
+                  </template>
+                </div>
+              </div>
+              <div class=\"detail-wide\" x-show=\"copyTargets(m).length > 0\">
+                <span class=\"dk\">copy to</span>
+                <select x-model=\"copyTo[m.alias]\" style=\"font-family:ui-monospace,monospace; font-size:0.8rem\">
+                  <option value=\"\">target node…</option>
+                  <template x-for=\"nid in copyTargets(m)\" :key=\"nid\"><option :value=\"nid\" x-text=\"nid\"></option></template>
+                </select>
+                <button type=\"button\" class=\"row-action\" @click=\"distribute(m)\" :disabled=\"!copyTo[m.alias]\">pull</button>
+                <span class=\"meta\" x-show=\"msg[m.alias]\" x-text=\"msg[m.alias]\" style=\"margin-left:0.5rem\"></span>
+              </div>
+            </div>
+          </details>
+        </template>
+      </div>
+
+      <!-- delete confirmation modal -->
+      <div class=\"modal-backdrop\" x-show=\"del.open\" x-cloak @click.self=\"cancelDelete()\" style=\"display:none\">
+        <div class=\"modal-card\" @click.stop style=\"max-width:560px\">
+          <h3 style=\"margin:0 0 0.5rem 0\">Delete model?</h3>
+          <p class=\"meta\" style=\"margin:0 0 0.75rem 0\">
+            Permanently removes this file from disk on <strong x-text=\"del.node\"></strong>. This cannot be undone.
+          </p>
+          <div class=\"detail-grid\" style=\"padding-left:0\">
+            <div><span class=\"dk\">alias</span><code x-text=\"del.alias\"></code></div>
+            <div class=\"detail-wide\"><span class=\"dk\">path</span><code x-text=\"del.path\"></code></div>
+          </div>
+          <p class=\"msg err\" x-show=\"del.err\" x-text=\"del.err\" style=\"margin-top:0.5rem\"></p>
+          <div style=\"display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem\">
+            <button type=\"button\" class=\"row-action\" @click=\"cancelDelete()\" :disabled=\"del.busy\">cancel</button>
+            <button type=\"button\" class=\"row-action row-action-danger\" @click=\"confirmDelete()\" :disabled=\"del.busy\" x-text=\"del.busy ? '…' : 'delete'\"></button>
+          </div>
+        </div>
+      </div>
     </section>
+    </div>
+
+    <div x-show=\"tab==='transfers'\">
+    <section>
+      <h2>Transfers</h2>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
+      <div hx-get=\"/ui/transfers\" hx-trigger=\"load, every 5s\">loading…</div>
+    </section>
+    </div>
+    </div>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 
   <script>
     function hfPull() {
@@ -443,6 +535,17 @@ export let CATALOG_HTML = "<!doctype html>
             const r = await fetch('/nodes');
             this.nodes = (await r.json()).filter(n => (n.state || 'active') !== 'disabled');
           } catch (e) { /* nodes optional for search */ }
+          // \"find other quants\" hand-off from a catalog model: prefill the
+          // search with the base model name and run it (repos = sources).
+          window.addEventListener('wg-find-quants', (e) => {
+            this.q = (e.detail && e.detail.base) || '';
+            if (this.q) this.search();
+          });
+        },
+        // Extract the quant tag from a GGUF filename (Q4_K_M, IQ4_XS, F16…).
+        ggufQuant(path) {
+          const m = (path || '').match(/(IQ\\d+[A-Z0-9_]*|Q\\d+_K_[SML]|Q\\d+_K|Q\\d+_\\d+|Q\\d+|BF16|F16|F32)/i);
+          return m ? m[1].toUpperCase() : '—';
         },
         async search() {
           if (!this.q.trim()) return;
@@ -535,6 +638,148 @@ export let CATALOG_HTML = "<!doctype html>
         },
       };
     }
+
+    // Searchable, expandable catalog browser (replaces the static table).
+    // Pulls /api/catalog (full GGUF metadata) + /nodes (copy-to targets);
+    // each model expands to its metadata and a copy-to-node control.
+    function catalogBrowser() {
+      return {
+        models: [], nodes: [], profiles: {}, q: '', loading: true,
+        copyTo: {}, msg: {}, spawnSel: {}, spawnMsg: {},
+        async init() {
+          await this.load();
+          setInterval(() => this.load(), 15000);
+        },
+        async load() {
+          try {
+            const [rc, rn, rp] = await Promise.all([fetch('/api/catalog'), fetch('/nodes'), fetch('/api/profiles')]);
+            if (rc.ok) this.models = await rc.json();
+            if (rn.ok) this.nodes = await rn.json();
+            if (rp.ok) this.profiles = await rp.json();
+          } catch (e) { /* keep last good data */ }
+          this.loading = false;
+        },
+        // Profiles that resolve to this catalog model (so it can be spawned
+        // directly). Matched on model_alias.
+        matchingProfiles(m) {
+          return Object.keys(this.profiles).filter(n => this.profiles[n] && this.profiles[n].model_alias === m.alias);
+        },
+        async spawnModel(m) {
+          const prof = this.spawnSel[m.alias];
+          if (!prof) return;
+          this.spawnMsg[m.alias] = 'spawning…';
+          try {
+            const r = await fetch('/services', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ profile: prof }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.spawnMsg[m.alias] = 'error: ' + (d.error || ('HTTP ' + r.status)); return; }
+            const where = d.node_id + ' :' + d.port + (d.device ? ' (' + d.device.toUpperCase() + ')' : '');
+            this.spawnMsg[m.alias] = '✓ spawned on ' + where + ' — loading model…';
+            // Poll readiness (same helper the overview spawn uses) so the
+            // operator sees loading → ready without leaving the catalog.
+            if (window.wgPollReady) {
+              window.wgPollReady(prof, (phase) => {
+                if (phase === 'ready')        this.spawnMsg[m.alias] = '✓ ready — ' + prof + ' serving on :' + d.port;
+                else if (phase === 'timeout') this.spawnMsg[m.alias] = 'spawned on ' + where + ' — still loading (see Overview)';
+              });
+            }
+          } catch (e) { this.spawnMsg[m.alias] = 'error: ' + e; }
+        },
+        profileCreateUrl(m) { return '/profiles?prefill_alias=' + encodeURIComponent(m.alias); },
+        get filtered() {
+          const q = this.q.trim().toLowerCase();
+          if (!q) return this.models;
+          return this.models.filter(m =>
+            (m.alias || '').toLowerCase().includes(q) ||
+            (m.architecture || '').toLowerCase().includes(q) ||
+            (m.general_name || '').toLowerCase().includes(q));
+        },
+        copyTargets(m) {
+          const have = new Set((m.on_nodes || []).map(o => o.node_id));
+          return this.nodes.map(n => n.node_id).filter(id => !have.has(id));
+        },
+        async distribute(m) {
+          const target = this.copyTo[m.alias];
+          if (!target) return;
+          this.msg[m.alias] = 'queuing…';
+          try {
+            const r = await fetch('/models/distribute', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ alias: m.alias, target_node: target }),
+            });
+            const d = await r.json();
+            this.msg[m.alias] = d.error ? ('error: ' + d.error) : ('queued ' + d.transfer_id + ' → ' + target);
+          } catch (e) { this.msg[m.alias] = 'error: ' + e; }
+        },
+        fmtSize(mb) {
+          if (mb == null) return '—';
+          return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
+        },
+
+        // ── quant suggestions: strip the quant tag to a base model name,
+        // then hand off to the HF browser (repos = sources, files = quants). ──
+        findQuants(m) {
+          const base = (m.general_name || m.alias || '')
+            .replace(/[-_. ]?(iq\\d+[a-z0-9_]*|q\\d+_k_[sml]|q\\d+_k|q\\d+_\\d+|q\\d+|f16|f32|bf16)\\b.*$/i, '')
+            .replace(/[-_. ]?gguf$/i, '')
+            .trim();
+          window.dispatchEvent(new CustomEvent('wg-find-quants', { detail: { base: base || m.alias } }));
+        },
+
+        // ── delete model (with confirmation modal) ──
+        del: { open: false, alias: '', node: '', path: '', busy: false, err: '' },
+        askDelete(alias, node, path) { this.del = { open: true, alias, node, path, busy: false, err: '' }; },
+        cancelDelete() { this.del.open = false; },
+        async confirmDelete() {
+          this.del.busy = true; this.del.err = '';
+          try {
+            const r = await fetch('/models/delete', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.del.node, path: this.del.path }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { this.del.err = d.error || ('HTTP ' + r.status); this.del.busy = false; return; }
+            this.del.open = false; this.del.busy = false;
+            await this.load();
+          } catch (e) { this.del.err = String(e); this.del.busy = false; }
+        },
+
+        // ── per-node scan-dir editor ──
+        sd: { node: '', canonical: '', extra: '', msg: '', busy: false },
+        async loadScanDirs() {
+          if (!this.sd.node) { this.sd.canonical = ''; this.sd.extra = ''; this.sd.msg = ''; return; }
+          this.sd.msg = 'loading…';
+          try {
+            const r = await fetch('/api/scan-dirs', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.sd.node }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.sd.msg = 'error: ' + (d.error || r.status); return; }
+            this.sd.canonical = d.canonical || '';
+            this.sd.extra = (d.extra || []).join('\\n');
+            this.sd.msg = '';
+          } catch (e) { this.sd.msg = 'error: ' + e; }
+        },
+        async saveScanDirs() {
+          this.sd.busy = true; this.sd.msg = '';
+          const extra = this.sd.extra.split(/\\r?\\n/).map(s => s.trim()).filter(Boolean);
+          try {
+            const r = await fetch('/api/scan-dirs', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.sd.node, extra }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.sd.msg = 'error: ' + (d.error || r.status); }
+            else { this.sd.msg = 'saved · ' + (d.count != null ? d.count + ' models' : 'rescanned'); await this.load(); }
+          } catch (e) { this.sd.msg = 'error: ' + e; }
+          this.sd.busy = false;
+        },
+      };
+    }
   </script>
 </body>
 </html>
@@ -567,13 +812,13 @@ export let TRANSFERS_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -594,6 +839,10 @@ export let TRANSFERS_HTML = "<!doctype html>
       <div hx-get=\"/ui/transfers\" hx-trigger=\"load, every 3s\">loading…</div>
     </section>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 </body>
 </html>
 ";
@@ -625,13 +874,13 @@ export let PROFILES_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -731,6 +980,14 @@ export let PROFILES_HTML = "<!doctype html>
               <input type=\"text\" x-model=\"hf_file\" placeholder=\"model.Q5_K_M.gguf\">
             </div>
             <div class=\"full\">
+              <label>quick options <span class=\"meta\">(one-click presets — toggle common flags)</span></label>
+              <div class=\"chip-row\" style=\"margin-bottom:0.6rem\">
+                <template x-for=\"t in quickToggles\" :key=\"t.id\">
+                  <button type=\"button\" class=\"chip\" :class=\"quickActive(t) ? 'chip-on' : ''\"
+                          @click=\"toggleQuick(t)\" x-text=\"t.label\"></button>
+                </template>
+              </div>
+
               <label>intent <span class=\"meta\">(witchgrid-normalized → llama-server flags)</span></label>
               <template x-for=\"(row, i) in intentRows\" :key=\"i\">
                 <div>
@@ -923,6 +1180,10 @@ export let PROFILES_HTML = "<!doctype html>
       <div hx-get=\"/ui/capabilities\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 
   <script>
     function aliasEditor() {
@@ -982,7 +1243,7 @@ export let BENCH_HTML = "<!doctype html>
 <head>
   <meta charset=\"utf-8\">
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>witchgrid — bench</title>
+  <title>witchgrid — utilities</title>
   <link rel=\"icon\" type=\"image/svg+xml\" href=\"/assets/logo.svg\">
   <script>
     (function () {
@@ -1004,13 +1265,13 @@ export let BENCH_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -1074,7 +1335,58 @@ export let BENCH_HTML = "<!doctype html>
       <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">Last 100, newest first. Polls every 5s.</p>
       <div hx-get=\"/ui/bench\" hx-trigger=\"load, every 5s\">loading…</div>
     </section>
+
+    <section x-data=\"testPrompt()\">
+      <h2>Test prompt</h2>
+      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+        Send a single completion request through <code>/v1/llama/{profile}/completion</code>
+        to verify a service responds. Shows tokens, ttft, and tok/s from the response timings.
+      </p>
+      <form class=\"spawn\" @submit.prevent=\"send()\">
+        <div>
+          <label for=\"tp-prof\">profile</label>
+          <select id=\"tp-prof\" x-model=\"profile\" required>
+            <option value=\"\">— select —</option>
+            <template x-for=\"name in Object.keys(profiles)\" :key=\"name\">
+              <option :value=\"name\" x-text=\"name\"></option>
+            </template>
+          </select>
+        </div>
+        <div>
+          <label for=\"tp-np\">n_predict</label>
+          <input id=\"tp-np\" type=\"number\" x-model=\"n_predict\" min=\"1\" max=\"2048\">
+        </div>
+        <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'send'\"></button>
+        <div style=\"grid-column: 1 / -1\">
+          <label for=\"tp-prompt\">prompt</label>
+          <textarea id=\"tp-prompt\" x-model=\"prompt\" rows=\"4\" style=\"width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)\"></textarea>
+        </div>
+        <p class=\"msg err\" x-show=\"error\" x-text=\"error\"></p>
+      </form>
+
+      <div x-show=\"result\" style=\"margin-top:1rem\">
+        <div style=\"display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.5rem\">
+          <span class=\"badge badge-canonical\" x-show=\"result?.timings?.predicted_per_second != null\">
+            <span x-text=\"(result?.timings?.predicted_per_second || 0).toFixed(1)\"></span> tok/s
+          </span>
+          <span class=\"badge badge-scan\" x-show=\"result?.timings?.prompt_ms != null\">
+            ttft <span x-text=\"Math.round(result?.timings?.prompt_ms || 0)\"></span>ms
+          </span>
+          <span class=\"badge\" x-show=\"result?.tokens_predicted != null\">
+            <span x-text=\"result?.tokens_predicted\"></span> tokens
+          </span>
+          <span class=\"badge\" x-show=\"elapsedMs\">
+            <span x-text=\"elapsedMs\"></span>ms wall
+          </span>
+        </div>
+        <pre style=\"background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.82rem; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto\" x-text=\"result?.content || '(no content)'\"></pre>
+      </div>
+    </section>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 
   <script>
     function benchPage() {
@@ -1149,13 +1461,13 @@ export let DEPLOY_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -1271,6 +1583,10 @@ export let DEPLOY_HTML = "<!doctype html>
       <div hx-get=\"/ui/services\" hx-trigger=\"load, every 30s\">loading…</div>
     </section>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 
   <script>
     function deployFlow() {
@@ -1425,13 +1741,13 @@ export let SETTINGS_HTML = "<!doctype html>
       <div class=\"brand\">
         <img src=\"/assets/logo.svg\" alt=\"witchgrid\">
         <h1>witchgrid<span class=\"cursor\">_</span></h1>
+        <span id=\"wg-version\" class=\"meta\" style=\"align-self:flex-end; padding-bottom:0.3rem\"></span>
       </div>
       <nav class=\"page-nav\">
         <a href=\"/\">overview</a>
         <a href=\"/catalog\">catalog</a>
-        <a href=\"/transfers\">transfers</a>
         <a href=\"/profiles\">profiles</a>
-        <a href=\"/bench\">bench</a>
+        <a href=\"/utilities\">utilities</a>
         <a href=\"/deploy\">deploy</a>
         <a href=\"/settings\">settings</a>
       </nav>
@@ -1440,49 +1756,85 @@ export let SETTINGS_HTML = "<!doctype html>
       </button>
     </div>
 
-    <section x-data=\"settingsPage()\">
-      <h2>Settings</h2>
-      <p class=\"meta\" style=\"margin: 0 0 0.75rem 0\">
-        Runtime knobs. Changes take effect on the next interval boundary — no CP restart needed.
-      </p>
+    <div x-data=\"settingsPage()\">
+      <section>
+        <h2>sqlite auto-backup</h2>
+        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+          Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
+          Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
+          Changes take effect on the next interval boundary — no CP restart needed.
+        </p>
 
-      <h3 style=\"margin-top:1.25rem; font-size:1rem\">sqlite auto-backup</h3>
-      <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
-        Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
-        Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
-      </p>
+        <form class=\"spawn\" @submit.prevent=\"save()\">
+          <div>
+            <label for=\"bi\">interval (minutes)</label>
+            <input id=\"bi\" type=\"number\" x-model=\"form.db_backup_interval_min\" min=\"0\" max=\"1440\">
+          </div>
+          <div>
+            <label for=\"bd\">backup dir</label>
+            <input id=\"bd\" type=\"text\" x-model=\"form.db_backup_dir\" placeholder=\"./backups\">
+          </div>
+          <div>
+            <label for=\"bk\">keep last N</label>
+            <input id=\"bk\" type=\"number\" x-model=\"form.db_backup_keep\" min=\"1\" max=\"100\">
+          </div>
+          <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save'\"></button>
 
-      <form class=\"spawn\" @submit.prevent=\"save()\">
-        <div>
-          <label for=\"bi\">interval (minutes)</label>
-          <input id=\"bi\" type=\"number\" x-model=\"form.db_backup_interval_min\" min=\"0\" max=\"1440\">
-        </div>
-        <div>
-          <label for=\"bd\">backup dir</label>
-          <input id=\"bd\" type=\"text\" x-model=\"form.db_backup_dir\" placeholder=\"./backups\">
-        </div>
-        <div>
-          <label for=\"bk\">keep last N</label>
-          <input id=\"bk\" type=\"number\" x-model=\"form.db_backup_keep\" min=\"1\" max=\"100\">
-        </div>
-        <button type=\"submit\" :disabled=\"busy\" x-text=\"busy ? '…' : 'save'\"></button>
+          <p class=\"msg\" :class=\"msgErr ? 'err' : 'ok'\" x-show=\"msg\" x-text=\"msg\"></p>
 
-        <p class=\"msg\" :class=\"msgErr ? 'err' : 'ok'\" x-show=\"msg\" x-text=\"msg\"></p>
+          <div style=\"grid-column: 1 / -1; padding-top: 0.5rem; border-top: 1px solid var(--border-soft); font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--fg-dim)\">
+            <div>last backup: <span x-text=\"lastAt || '—'\"></span></div>
+            <div x-show=\"lastPath\">last path:  <code x-text=\"lastPath\"></code></div>
+          </div>
+        </form>
+      </section>
 
-        <div style=\"grid-column: 1 / -1; padding-top: 0.5rem; border-top: 1px solid var(--border-soft); font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--fg-dim)\">
-          <div>last backup: <span x-text=\"lastAt || '—'\"></span></div>
-          <div x-show=\"lastPath\">last path:  <code x-text=\"lastPath\"></code></div>
+      <section>
+        <h2>Runtime config</h2>
+        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+          Read-only — set via environment on the CP (systemd unit / <code>cp.env</code>). Shown here for visibility.
+        </p>
+        <dl class=\"hw-dl\" style=\"max-width:520px\">
+          <dt>version</dt>      <dd><code x-text=\"cfg.version || '—'\"></code></dd>
+          <dt>bind</dt>         <dd><code x-text=\"(cfg.host || '—') + ':' + (cfg.port ?? '—')\"></code></dd>
+          <dt>auth</dt>         <dd>
+            <span class=\"badge\" :class=\"cfg.auth_enabled ? 'badge-state-active' : 'badge-state-disabled'\"
+                  x-text=\"cfg.auth_enabled ? 'shared-secret' : 'disabled (LAN-trust)'\"></span>
+          </dt>
+          <dt>stale after</dt>  <dd><code x-text=\"(cfg.stale_node_seconds ?? '—') + 's'\"></code></dd>
+        </dl>
+      </section>
+
+      <section>
+        <h2>Import / export</h2>
+        <p class=\"meta\" style=\"margin: 0 0 0.5rem 0\">
+          Download the editable config as JSON to back it up or copy to another CP, or upload one to apply it.
+          Import applies recognized keys and skips the rest.
+        </p>
+        <div style=\"display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center\">
+          <button type=\"button\" class=\"row-action\" @click=\"exportConfig()\">⇩ export config</button>
+          <label class=\"row-action\" style=\"cursor:pointer\">
+            ⇧ import config
+            <input type=\"file\" accept=\"application/json,.json\" @change=\"importConfig($event)\" style=\"display:none\">
+          </label>
         </div>
-      </form>
-    </section>
+        <p class=\"msg\" :class=\"ioErr ? 'err' : 'ok'\" x-show=\"ioMsg\" x-text=\"ioMsg\" style=\"margin-top:0.5rem\"></p>
+      </section>
+    </div>
   </main>
+  <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
+    made with love 💜 by <a href=\"https://schneewolflabs.com/\" target=\"_blank\" rel=\"noopener\" style=\"color:#a855f7\">schneewolf labs</a>
+    <div id=\"wg-footer-info\" class=\"meta\" style=\"margin-top:0.3rem; font-size:0.72rem\"></div>
+  </footer>
 
   <script>
     function settingsPage() {
       return {
         form: { db_backup_interval_min: '0', db_backup_dir: './backups', db_backup_keep: '24' },
         lastAt: '', lastPath: '',
+        cfg: {},                 // /api/config snapshot (runtime + settings)
         busy: false, msg: '', msgErr: false,
+        ioMsg: '', ioErr: false,
         async init() {
           await this.refresh();
         },
@@ -1496,6 +1848,46 @@ export let SETTINGS_HTML = "<!doctype html>
             this.lastAt   = d.db_backup_last_at ? d.db_backup_last_at.value : '';
             this.lastPath = d.db_backup_last_path ? d.db_backup_last_path.value : '';
           } catch (e) { this.msgErr = true; this.msg = 'load failed: ' + e; }
+          try {
+            const rc = await fetch('/api/config');
+            if (rc.ok) this.cfg = await rc.json();
+          } catch (e) { /* runtime panel just shows — */ }
+        },
+        exportConfig() {
+          // Export the editable settings as a flat {key:value} JSON so it
+          // round-trips cleanly through import (PUT /api/settings).
+          const settings = this.cfg.settings || {};
+          const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'witchgrid-config.json';
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(a.href);
+        },
+        async importConfig(ev) {
+          const file = ev.target.files && ev.target.files[0];
+          ev.target.value = '';                  // allow re-selecting the same file
+          if (!file) return;
+          this.ioMsg = ''; this.ioErr = false;
+          let data;
+          try { data = JSON.parse(await file.text()); }
+          catch (e) { this.ioErr = true; this.ioMsg = 'invalid JSON: ' + e; return; }
+          // Accept either a flat {k:v} or a {settings:{k:v}} wrapper.
+          const settings = (data && data.settings) ? data.settings : data;
+          try {
+            const r = await fetch('/api/settings', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(settings),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.ioErr = true; this.ioMsg = d.error || ('HTTP ' + r.status); return; }
+            const applied = (d.updated || []);
+            const skipped = Object.keys(settings).filter(k => !applied.includes(k));
+            this.ioMsg = 'imported: ' + (applied.join(', ') || '(none)') +
+                         (skipped.length ? ' · skipped: ' + skipped.join(', ') : '');
+            await this.refresh();
+          } catch (e) { this.ioErr = true; this.ioMsg = 'import failed: ' + e; }
         },
         async save() {
           this.busy = true; this.msg = ''; this.msgErr = false;
@@ -1864,16 +2256,26 @@ code {
 .bar-warn  { background: var(--warn); }
 .bar-err   { background: var(--err); }
 
-/* Sparkline area: SVG fills the row width naturally */
+/* Sparkline: aligned under its bar (not full card width) and kept short
+ * so the trend reads as a compact history of the bar above it rather
+ * than a full-width line slashing across the card. The wrapper mirrors
+ * the .hw-row grid and drops the SVG into the bar column. */
+.spark-wrap {
+  display: grid;
+  grid-template-columns: 280px 1fr 130px;
+  gap: 0.6rem;
+  margin: 1px 0 5px;
+}
+.spark-wrap .spark { grid-column: 2; }
 .spark {
   display: block;
   width: 100%;
-  height: 24px;
-  margin-top: 2px;
+  height: 15px;
+  margin: 0;
 }
 .spark .axis { stroke: var(--border-soft); stroke-width: 0.5; }
-.spark .line { fill: none; stroke-width: 1.5; }
-.spark .area { opacity: 0.18; }
+.spark .line { fill: none; stroke-width: 1.25; }
+.spark .area { opacity: 0.12; }
 .spark.spark-ok   .line, .spark.spark-ok   .area { stroke: var(--ok);   fill: var(--ok); }
 .spark.spark-warn .line, .spark.spark-warn .area { stroke: var(--warn); fill: var(--warn); }
 .spark.spark-err  .line, .spark.spark-err  .area { stroke: var(--err);  fill: var(--err); }
@@ -1885,6 +2287,222 @@ code {
 .empty     { color: var(--fg-dim); font-style: italic; }
 .id        { font-family: ui-monospace, monospace; font-size: 0.82em; color: var(--fg-dim); }
 .stop-btn  { padding: 0.2rem 0.6rem; font-size: 0.78rem; margin: 0; }
+
+/* ─── node cards (overview NODES list) ──────────────────────────── */
+/* One stacked card per node: identity + status header on top, the
+ * resource charts in the middle, action buttons at the bottom. Replaces
+ * the old 4-column table, which crammed everything horizontally. */
+.node-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.node-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+/* node card is a <details> — the header is the clickable summary */
+summary.node-card-head { cursor: pointer; list-style: none; }
+summary.node-card-head::-webkit-details-marker { display: none; }
+summary.node-card-head::marker { content: \"\"; }
+.node-card-chevron {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--fg-dim);
+  font-size: 1rem;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.node-card[open] > summary .node-card-chevron { transform: rotate(90deg); }
+/* clean collapsed look — drop the header divider when there's nothing below */
+.node-card:not([open]) > summary.node-card-head {
+  padding-bottom: 0;
+  margin-bottom: 0;
+  border-bottom: none;
+}
+.node-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.4rem 1rem;
+  padding-bottom: 0.65rem;
+  margin-bottom: 0.65rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+.node-card-status { margin-left: auto; }
+.node-card-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.node-card-id strong { font-size: 0.95rem; color: var(--fg-1); }
+.node-card-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.node-card-age {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+}
+.node-card-age.stale { color: var(--err); font-weight: 600; }
+.node-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding-top: 0.7rem;
+  margin-top: 0.7rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+/* ─── node card: unified process list (services + unmanaged) ────── */
+/* Managed services and unmanaged procs render as identical <details>
+ * rows for visual consistency; the hardware section above stays
+ * bars-only. Native disclosure (works with JS off), explicit chevron. */
+.node-card-procs {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.proc-head {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--fg-dim);
+  margin: 0.55rem 0 0.25rem;
+}
+.proc-head:first-child { margin-top: 0; }
+
+.proc-item { margin: 0; }
+.proc-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.82rem;
+}
+.proc-summary::-webkit-details-marker { display: none; }
+.proc-summary:hover { background: var(--bg-2); }
+.proc-item[open] .proc-summary { background: var(--bg-2); }
+
+.proc-dot { font-size: 0.6rem; line-height: 1; }
+.proc-name { font-weight: 600; color: var(--fg-1); }
+.proc-port { color: var(--fg-2); }
+.proc-model {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.proc-chevron {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-size: 0.9rem;
+  transition: transform 0.15s ease;
+}
+.proc-item[open] .proc-chevron { transform: rotate(90deg); }
+
+/* unmanaged variant — amber tag instead of a status dot */
+.proc-tag {
+  font-family: ui-monospace, monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--warn);
+  border: 1px solid var(--warn-soft);
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.proc-unmanaged .proc-name { color: var(--warn); }
+
+/* shared key/value detail grid revealed on expand */
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.3rem 1rem;
+  padding: 0.5rem 0 0.7rem 0.75rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, monospace;
+}
+.detail-grid .detail-wide { grid-column: 1 / -1; }
+.detail-grid code { word-break: break-all; }
+.detail-grid .dk {
+  display: inline-block;
+  min-width: 56px;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  margin-right: 0.4rem;
+}
+.svc-actions { display: flex; gap: 0.4rem; padding-top: 0.3rem; }
+
+/* ─── chips (profile quick-option toggles) ─────────────────────── */
+.chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.chip {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.7rem;
+  margin: 0;
+  width: auto;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.chip:hover { border-color: var(--accent); color: var(--fg-1); }
+.chip-on {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand);
+  font-weight: 600;
+}
+
+/* ─── tab bar (catalog sections) ───────────────────────────────── */
+.tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.5rem 0 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.45rem 0.9rem;
+  margin: 0 0 -1px 0;
+  width: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.tab-btn:hover { color: var(--fg-1); background: var(--bg-2); }
+.tab-btn.active {
+  color: var(--brand);
+  border-bottom-color: var(--brand);
+  background: var(--bg-1);
+}
 
 /* ─── hardware detail expander ──────────────────────────────────── */
 tr.hw-detail td { padding-top: 0; padding-bottom: 0.6rem; border-top: none; background: var(--bg-base); }
@@ -2338,6 +2956,21 @@ button[type=\"submit\"]:hover { background: var(--brand); border-color: var(--br
   font-size: 0.85em;
 }
 .ov-collapse[open] > summary::before { content: \"▾\"; }
+/* Make the collapsible heading (Spawn) read like the section > h2
+ * headings (Nodes/Services): uppercase mono, same size/color, brand
+ * marker — so the overview's sections look consistent. */
+.ov-collapse { margin: 2.25rem 0 1.25rem 0; }
+.ov-collapse > summary::before { color: var(--brand); }
+.ov-collapse > summary h2 {
+  display: inline;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, \"JetBrains Mono\", \"Menlo\", monospace;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
 .ov-collapse > summary h2 { display: inline; margin: 0; }
 .ov-collapse > summary:hover h2 { color: var(--accent); }
 .ov-collapse > :not(summary) { margin-top: 0.75rem; }
@@ -2533,6 +3166,18 @@ const KNOWN_INTENTS = [
 ];
 const KV_QUANT_OPTIONS = ['f16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'];
 const KNOWN_INTENT_KEYS = KNOWN_INTENTS.map(i => i.k);
+
+// One-click presets for the common intent combos, so you don't have to
+// know the intent keys. Each toggles a set of (intent → value) pairs;
+// they map straight onto the normalized intents the agent translates.
+const QUICK_TOGGLES = [
+  { id: 'flash',   label: '⚡ flash attention', set: [{ k: 'flash_attention', v: 'true' }] },
+  { id: 'q4kv',    label: '🗜 q4 KV cache',     set: [{ k: 'kv_cache_k', v: 'q4_0' }, { k: 'kv_cache_v', v: 'q4_0' }] },
+  { id: 'single',  label: '👤 single slot (chat/RP)', set: [{ k: 'parallel_slots', v: '1' }] },
+  { id: 'fullgpu', label: '🎮 full GPU offload', set: [{ k: 'gpu_layers', v: '99' }] },
+  { id: 'cpu',     label: '🧮 CPU only',         set: [{ k: 'gpu_layers', v: '0' }] },
+  { id: 'ctx128',  label: '📏 128K context',     set: [{ k: 'context', v: '131072' }] },
+];
 function intentSpec(k) {
   return KNOWN_INTENTS.find(i => i.k === k) || { k, kind: 'text', help: '' };
 }
@@ -2579,6 +3224,30 @@ function profileEditor() {
         });
         history.replaceState({}, '', window.location.pathname);
       }
+      // Adopt hand-off: a profile draft parsed from an unmanaged
+      // llama-server's argv, stashed in sessionStorage by adoptUnmanaged().
+      let adopt = null;
+      try { adopt = sessionStorage.getItem('wg-adopt-profile'); } catch (e) {}
+      if (adopt) {
+        try { this.openFromAdopt(JSON.parse(adopt)); } catch (e) {}
+        try { sessionStorage.removeItem('wg-adopt-profile'); } catch (e) {}
+      }
+    },
+
+    openFromAdopt(draft) {
+      this.reset();
+      this.isNew = true;
+      this.open = true;
+      this.binary = 'llama-server';
+      this.name = draft.name || '';
+      this.useRawPath = true;                       // adopted procs use a raw -m path
+      this.default_model = draft.default_model || '';
+      this.intentRows = Object.entries(draft.intent || {}).map(([k, v]) => ({ k, v: String(v) }));
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+      if (draft.intent && draft.intent.context)    this.context = parseInt(draft.intent.context, 10) || this.context;
+      if (draft.intent && draft.intent.kv_cache_k) this.kv_type = draft.intent.kv_cache_k;
+      this.loadCatalog();
+      this.loadCapabilities();
     },
 
     async openPrefilled({ alias, hf_repo, hf_file }) {
@@ -2650,6 +3319,25 @@ function profileEditor() {
       if (s.kind === 'tri_bool') return 'true';
       if (s.kind === 'number')   return '';
       return '';
+    },
+
+    // ── quick toggles (suggested flags) ──
+    quickToggles: QUICK_TOGGLES,
+    hasIntent(k, v)  { const r = this.intentRows.find(r => r.k === k); return !!r && String(r.v) === String(v); },
+    setIntent(k, v)  {
+      const r = this.intentRows.find(r => r.k === k);
+      if (r) r.v = v; else this.intentRows.push({ k, v });
+      this.intentRows = this.intentRows.filter(r => r.k !== '');   // drop the placeholder row
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+    },
+    unsetIntent(k)   {
+      this.intentRows = this.intentRows.filter(r => r.k !== k);
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+    },
+    quickActive(t)   { return t.set.every(p => this.hasIntent(p.k, p.v)); },
+    toggleQuick(t)   {
+      if (this.quickActive(t)) { t.set.forEach(p => this.unsetIntent(p.k)); }
+      else                     { t.set.forEach(p => this.setIntent(p.k, p.v)); }
     },
     onIntentKeyChange(i, newKey) {
       // Reset value to the new key's default when the operator switches
@@ -2957,6 +3645,60 @@ async function toggleAutoRestart(node_id, enable) {
   else { window.location.reload(); }
 }
 
+// Best-effort SIGTERM of an unmanaged process from the node card.
+// Cross-user procs (different owner than the agent) will fail with EPERM
+// — surfaced from the agent as a 502 so we can tell the operator plainly.
+async function killUnmanaged(node, pid) {
+  if (!confirm('Send SIGTERM to PID ' + pid + ' on ' + node + '?\\n\\n' +
+               'This is an unmanaged process (not spawned by witchgrid). ' +
+               'If it is owned by another user the kill will be denied.')) return;
+  const r = await fetch('/unmanaged/kill', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ node_id: node, pid: pid }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert('Kill failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  const panel = document.querySelector('[hx-get=\"/ui/nodes\"]');
+  if (panel && window.htmx) { window.htmx.trigger(panel, 'load'); }
+  else { window.location.reload(); }
+}
+
+// Parse an unmanaged llama-server's argv into a profile draft and hand it
+// to the profiles editor (via sessionStorage) prefilled. Reuses the
+// cmdline we already captured — no live API probe needed.
+function adoptUnmanaged(btn) {
+  const cmdline = (btn && btn.dataset && btn.dataset.cmdline) || '';
+  const toks = cmdline.trim().split(/\\s+/);
+  const get = (...flags) => {
+    for (let i = 0; i < toks.length - 1; i++) if (flags.includes(toks[i])) return toks[i + 1];
+    return null;
+  };
+  const model = get('-m', '--model') || '';
+  const alias = model.split('/').pop().replace(/\\.gguf$/i, '').toLowerCase();
+  const intent = {};
+  const ctx = get('-c', '--ctx-size');                 if (ctx) intent.context = ctx;
+  const ngl = get('-ngl', '--gpu-layers', '--n-gpu-layers'); if (ngl != null) intent.gpu_layers = ngl;
+  const np  = get('-np', '--parallel');                if (np) intent.parallel_slots = np;
+  const ctk = get('-ctk', '--cache-type-k');           if (ctk) intent.kv_cache_k = ctk;
+  const ctv = get('-ctv', '--cache-type-v');           if (ctv) intent.kv_cache_v = ctv;
+  const faIdx = toks.findIndex(t => t === '-fa' || t === '--flash-attn');
+  if (faIdx >= 0) {
+    const v = toks[faIdx + 1];
+    intent.flash_attention = (v === 'off') ? 'false' : (v === 'auto') ? 'auto' : 'true';
+  }
+  const draft = {
+    name: (alias || 'adopted').replace(/[^a-z0-9-]/g, '-'),
+    default_model: model,
+    intent,
+  };
+  try { sessionStorage.setItem('wg-adopt-profile', JSON.stringify(draft)); } catch (e) {}
+  window.location.href = '/profiles';
+}
+
 async function deleteProfile(name) {
   if (!confirm('Delete profile \"' + name + '\"?')) return;
   const r = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
@@ -3117,7 +3859,11 @@ function newProfile() {
   const restore = (root) => {
     const state = load();
     (root || document).querySelectorAll('details[data-detail-key]').forEach(d => {
-      if (state[d.dataset.detailKey]) d.open = true;
+      // Explicit stored state wins (true OR false); otherwise keep the
+      // rendered default. This supports both default-collapsed panels and
+      // default-expanded ones (node cards) with collapse remembered.
+      const k = d.dataset.detailKey;
+      if (Object.prototype.hasOwnProperty.call(state, k)) d.open = state[k];
     });
   };
 
@@ -3131,7 +3877,7 @@ function newProfile() {
     const key = e.target.dataset.detailKey;
     if (!key) return;
     const state = load();
-    if (e.target.open) state[key] = true; else delete state[key];
+    state[key] = e.target.open;   // store true/false explicitly
     save(state);
   }, true);
 })();
@@ -3438,6 +4184,25 @@ function profileWizard() {
     if (!el) return;
     fetch('/healthz').then((r) => r.json()).then((d) => {
       if (d && d.version) el.textContent = 'v' + d.version;
+    }).catch(() => {});
+  }
+  if (document.readyState !== 'loading') fill();
+  else document.addEventListener('DOMContentLoaded', fill);
+})();
+
+// ── footer build info ────────────────────────────────────────────────
+// Fill #wg-footer-info with version + the CP endpoint you're actually
+// talking to (window.location.host — more useful than the 0.0.0.0 bind)
+// + auth posture, from /api/config.
+(function () {
+  function fill() {
+    const el = document.getElementById('wg-footer-info');
+    if (!el) return;
+    fetch('/api/config').then((r) => r.json()).then((d) => {
+      if (!d) return;
+      const parts = ['witchgrid v' + (d.version || '?'), 'CP ' + window.location.host];
+      parts.push('auth ' + (d.auth_enabled ? 'on' : 'off'));
+      el.textContent = parts.join(' · ');
     }).catch(() => {});
   }
   if (document.readyState !== 'loading') fill();

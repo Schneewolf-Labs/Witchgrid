@@ -22,6 +22,7 @@
 // expensive to do every boot for a v0.2 nicety.
 
 import { list_dir, file_stat, is_dir, is_file, exists } from "@stdlib/fs";
+import { exec_argv } from "@stdlib/process";
 import { read_metadata } from "../cp/gguf";
 
 // Walk dir recursively, accumulating absolute paths matching *.gguf.
@@ -29,39 +30,32 @@ import { read_metadata } from "../cp/gguf";
 // don't distinguish — that's fine for our purpose; a symlink to a GGUF
 // is a GGUF). max_depth caps runaway walks if someone points us at /.
 fn walk_gguf(root: string, max_depth: i32, out): null {
-	if (max_depth < 0) { return null; }
 	if (!exists(root)) { return null; }
 
-	let entries = null;
+	// Enumerate via `find`, NOT a recursive list_dir walk. The COMPILED
+	// Hemlock runtime ABORTS the whole process when list_dir hits a
+	// permission-denied dir (it's only catchable in the interpreter), so a
+	// scan dir containing an unreadable subtree (e.g. /tmp/systemd-private-*)
+	// would crash-loop the agent. find skips unreadable dirs gracefully
+	// (its errors go to stderr, which we ignore) and can never take us down.
+	// exec_argv passes args as an array (no shell) so the path can't inject.
+	let r = null;
 	try {
-		entries = list_dir(root);
+		r = exec_argv(["find", "-L", root, "-maxdepth", "" + (max_depth + 1),
+			"-type", "f", "-name", "*.gguf"]);
 	} catch (e) {
-		// Permission denied / IO error — skip, don't blow up the scan.
-		return null;
+		return null;   // find missing / unspawnable — skip this root
 	}
-	for (name in entries) {
-		if (name == "." || name == "..") { continue; }
-		// Skip hidden dirs (.git, .cache) — these never hold models we
-		// care about and waste time on huge trees.
-		if (name.length > 0 && name[0] == '.') { continue; }
-
-		let full = root + "/" + name;
-		let is_d = false;
-		let is_f = false;
-		try { is_d = is_dir(full); } catch (e) { }
-		try { is_f = is_file(full); } catch (e) { }
-
-		if (is_d) {
-			walk_gguf(full, max_depth - 1, out);
-			continue;
-		}
-		if (!is_f) { continue; }
-		// Filename-based extension match. Avoids slurping every file's
-		// stat — most dirs have lots of non-GGUF cruft.
-		if (name.length < 5) { continue; }
-		let dot = name.length - 5;
-		if (name.substr(dot, 5) != ".gguf") { continue; }
-		out.push(full);
+	// exit 1 just means some subdirs were unreadable; stdout is still valid.
+	if (r.output == null || r.output.length == 0) { return null; }
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let p = line.trim();
+		if (p.length == 0) { continue; }
+		// Skip anything under a hidden dir/file (.git, .cache) — matches the
+		// old walk's behavior and avoids huge VCS/cache trees.
+		if (p.find("/.") >= 0) { continue; }
+		out.push(p);
 	}
 	return null;
 }

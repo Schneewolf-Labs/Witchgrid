@@ -144,6 +144,22 @@ export fn set_auto_restart(db, on: bool): null {
 	return null;
 }
 
+// Generic agent_settings get/set (string values). Used for the editable
+// scan-dirs override (persisted as a JSON array string).
+export fn agent_setting_get(db, key: string, default_value: string): string {
+	let r = query(db, "select value from agent_settings where key = ?", [key]);
+	if (r.length == 0) { return default_value; }
+	return r[0].value;
+}
+
+export fn agent_setting_set(db, key: string, value: string): null {
+	db_exec(db,
+		"insert into agent_settings (key, value) values (?, ?) "
+		+ "on conflict(key) do update set value = excluded.value",
+		[key, value]);
+	return null;
+}
+
 // Mark stale rows as 'dead' (soft-delete) so the orphan-adoption
 // path can later port-match a discovered llama-server back to the
 // profile metadata that originally spawned it. Catches:
@@ -192,6 +208,17 @@ export fn reap_zombie_services(db): i32 {
 // reap_zombie_services and reconcile_services so history is pruned on
 // whichever path is doing the per-tick cleanup.
 fn prune_service_history(db): null {
+	// Superseded rows: a profile that crashed (state 'failed'/'dead'/
+	// 'stopped') but is now 'running' again left a stale terminal row that
+	// the dashboard renders as a phantom "down" alongside the live one.
+	// Drop those immediately regardless of age — the failure is resolved
+	// once a running instance for the same profile exists. (The 'failed'
+	// "needs a human" signal is only meaningful while nothing's running.)
+	db_exec(db,
+		"delete from services where state in ('dead', 'stopped', 'failed') "
+		+ "and profile in (select profile from services where state = 'running')",
+		[]);
+	// Age-based prune of the remaining (genuinely-not-running) history.
 	db_exec(db,
 		"delete from services where state in ('dead', 'stopped', 'failed') "
 		+ "and started_at < datetime('now', ?)",
@@ -816,9 +843,13 @@ export fn list_services(db): array {
 		// pinned GPU index list at spawn time — empty/null means it was
 		// placed CPU-only (gpu_layers=0, CUDA_VISIBLE_DEVICES="").
 		let device = "cpu";
+		let gpus = [];
 		let gj = row?.gpus_json;
 		if (gj != null && gj != "" && gj != "[]") {
-			try { if (parse(gj).length > 0) { device = "gpu"; } } catch (e) { }
+			try {
+				let parsed = parse(gj);
+				if (parsed.length > 0) { device = "gpu"; gpus = parsed; }
+			} catch (e) { }
 		}
 		out.push({
 			id: row.id,
@@ -830,6 +861,7 @@ export fn list_services(db): array {
 			started_at: row.started_at,
 			profile_version: row?.profile_version,
 			device: device,
+			gpus: gpus,        // pinned GPU index list (empty = CPU-only)
 			state: row?.state,
 			alive: process_alive(row.pid),
 		});
@@ -1090,6 +1122,29 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				return { status: 404, body: "{\"error\":\"not found\"}" };
 			}
 			return { status: 204, body: "" };
+		},
+		// POST /unmanaged/kill { pid } — best-effort SIGTERM of a process
+		// witchgrid did NOT spawn (the dashboard offers this on unmanaged
+		// rows). Refuses pids that are our own managed services (use /stop).
+		// Note: the agent runs as one user; killing another user's process
+		// fails with EPERM — surfaced as a 502 so the UI can say so.
+		kill_unmanaged: fn(req): object {
+			let payload = parse(req.body);
+			let pid = payload?.pid;
+			if (pid == null) {
+				return { status: 400, body: "{\"error\":\"pid required\"}" };
+			}
+			let mine = query(db,
+				"select id from services where pid = ? and state = 'running'", [pid]);
+			if (mine.length > 0) {
+				return { status: 409, body: "{\"error\":\"that pid is a managed witchgrid service \\u2014 use stop\"}" };
+			}
+			try {
+				kill(i32(pid), SIGTERM);
+			} catch (e) {
+				return { status: 502, body: stringify({ error: "kill failed: " + e }) };
+			}
+			return { status: 200, body: "{\"ok\":true}" };
 		},
 		// GET /settings → { auto_restart }. Per-agent knobs; CP mirrors
 		// this into /nodes and the dashboard exposes a toggle.

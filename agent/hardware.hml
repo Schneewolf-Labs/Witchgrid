@@ -19,7 +19,7 @@
 
 import { exec_argv } from "@stdlib/process";
 import { cpu_count, total_memory, free_memory } from "@stdlib/os";
-import { exists } from "@stdlib/fs";
+import { exists, open } from "@stdlib/fs";
 import { parse } from "@stdlib/json";
 
 // Apple Silicon Metal cap: by default Metal can claim ~75% of system
@@ -308,6 +308,136 @@ export fn probe_disks(canonical, extras): array {
 // vram contention is invisible to placement unless we surface it.
 // Reporting these to CP doesn't grant control over them — it just
 // stops the dashboard from claiming "47 GB free" when 28 GB is in use.
+// Map every listening TCP port to the pid(s) holding it, via one
+// `ss -ltnp` call. Lets us answer "what port is this unmanaged
+// llama-server serving on?" without a per-pid probe. Linux-only (ss);
+// returns {} where ss is absent (macOS) or unreadable — callers treat
+// a missing entry as "port unknown". Shape: { pid_str → [port, ...] }.
+fn listening_ports_by_pid(): object {
+	let out = {};
+	let r = null;
+	// -H drops the header row; -p needs no root to see *our* pids and
+	// (on most distros) others' too. If it can't, the pid= field is just
+	// absent and that proc simply has no port — non-fatal.
+	try { r = exec_argv(["ss", "-Hltnp"]); } catch (e) { return out; }
+	if (r.exit_code != 0 || r.output.length == 0) { return out; }
+
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		if (line.find("LISTEN") < 0) { continue; }
+		// Tokenize on whitespace (ss pads with runs of spaces).
+		let toks = [];
+		let parts = line.split(" ");
+		for (p in parts) { let pp = p.trim(); if (pp.length > 0) { toks.push(pp); } }
+		// Columns (header-less): State Recv-Q Send-Q Local Peer Process
+		if (toks.length < 4) { continue; }
+		// Local Address:Port — port is after the final ':' ("0.0.0.0:8080",
+		// "[::]:8080", "*:8080" all end in ":<port>").
+		let local = toks[3];
+		let colon = -1;
+		let ci = 0;
+		while (ci < local.length) {
+			if (local.substr(ci, 1) == ":") { colon = ci; }
+			ci = ci + 1;
+		}
+		if (colon < 0) { continue; }
+		let port_str = local.substr(colon + 1, local.length - colon - 1);
+		// Guard the i32() — skip non-numeric (shouldn't happen post-':').
+		let all_digit = port_str.length > 0;
+		let di = 0;
+		while (di < port_str.length) {
+			let c = port_str.substr(di, 1);
+			if (c < "0" || c > "9") { all_digit = false; }
+			di = di + 1;
+		}
+		if (!all_digit) { continue; }
+		let port = i32(port_str);
+
+		// One LISTEN line may name several pids: users:(("a",pid=1,fd=2),
+		// ("b",pid=3,fd=4)). Walk every "pid=" occurrence.
+		let rest = line;
+		loop {
+			let idx = rest.find("pid=");
+			if (idx < 0) { break; }
+			rest = rest.substr(idx + 4, rest.length - idx - 4);
+			let d = 0;
+			while (d < rest.length) {
+				let ch = rest.substr(d, 1);
+				if (ch >= "0" && ch <= "9") { d = d + 1; } else { break; }
+			}
+			if (d > 0) {
+				let pid_str = rest.substr(0, d);
+				if (!out.has(pid_str)) { out[pid_str] = []; }
+				let dup = false;
+				for (e in out[pid_str]) { if (e == port) { dup = true; } }
+				if (!dup) { out[pid_str].push(port); }
+			}
+		}
+	}
+	return out;
+}
+
+// Full argv of a pid from /proc/<pid>/cmdline (NUL-separated). Returns
+// "" when unreadable (macOS, gone proc, hidepid). Trimmed + space-joined
+// so it renders on one line in the dashboard detail panel.
+fn read_cmdline(pid: i32): string {
+	let out = "";
+	try {
+		let f = open("/proc/" + pid + "/cmdline", "r");
+		let buf = f.read_binary();
+		f.close();
+		if (buf == null || buf.length == 0) { return ""; }
+		let start = 0;
+		let i = 0;
+		while (i < buf.length) {
+			if (buf[i] == 0) {
+				let seg = __string_from_bytes(buf.slice(start, i));
+				if (out.length > 0) { out = out + " "; }
+				out = out + seg;
+				start = i + 1;
+			}
+			i = i + 1;
+		}
+	} catch (e) { return ""; }
+	return out.trim();
+}
+
+fn str_is_digits(s: string): bool {
+	if (s == null || s.length == 0) { return false; }
+	let i = 0;
+	while (i < s.length) {
+		let c = s.substr(i, 1);
+		if (c < "0" || c > "9") { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// Pull the listening port straight out of a captured cmdline. This is the
+// reliable cross-user path: `ss` redacts the pid→socket mapping for other
+// users' processes (no root), but /proc/<pid>/cmdline is world-readable,
+// and servers spell their port out — llama-server/sd-server: `--port N`
+// (or `--port=N`). Returns -1 when no explicit port flag is present.
+fn port_from_cmdline(cmd: string): i32 {
+	if (cmd == null || cmd.length == 0) { return -1; }
+	let toks = cmd.split(" ");
+	let i = 0;
+	while (i < toks.length) {
+		let t = toks[i];
+		if (t == "--port") {
+			if (i + 1 < toks.length && str_is_digits(toks[i + 1])) {
+				return i32(toks[i + 1]);
+			}
+		}
+		if (t.find("--port=") == 0) {
+			let v = t.substr(7, t.length - 7);
+			if (str_is_digits(v)) { return i32(v); }
+		}
+		i = i + 1;
+	}
+	return -1;
+}
+
 export fn probe_unmanaged_procs(gpus, known_pids): array {
 	if (gpus.length == 0) { return []; }
 
@@ -331,6 +461,9 @@ export fn probe_unmanaged_procs(gpus, known_pids): array {
 	let known = {};
 	for (p in known_pids) { known["" + p] = true; }
 
+	// pid → listening ports, probed once for the whole batch.
+	let port_map = listening_ports_by_pid();
+
 	let out = [];
 	let lines = r.output.split("\n");
 	for (line in lines) {
@@ -345,6 +478,19 @@ export fn probe_unmanaged_procs(gpus, known_pids): array {
 		let uuid = parts[3].trim();
 		let gpu_idx = -1;
 		if (uuid_to_idx.has(uuid)) { gpu_idx = uuid_to_idx[uuid]; }
+
+		// Port(s) this proc listens on + its full argv — the "what
+		// actually is this?" detail surfaced on click in the dashboard.
+		// ss gives us own-user pids; the cmdline --port flag covers
+		// other users' procs (ss redacts their pid mapping without root).
+		let ports = port_map?["" + pid] ?? [];
+		let cmdline = read_cmdline(pid);
+		let cport = port_from_cmdline(cmdline);
+		if (cport > 0) {
+			let seen = false;
+			for (e in ports) { if (e == cport) { seen = true; } }
+			if (!seen) { ports.push(cport); }
+		}
 
 		// Owner via stat(1) — cheap, cross-distro, and survives /proc
 		// hidepid=1 since stat just needs +x on /proc itself. Format
@@ -369,6 +515,8 @@ export fn probe_unmanaged_procs(gpus, known_pids): array {
 			gpu_index:     gpu_idx,
 			owner_name:    owner_name,
 			owner_uid:     owner_uid,
+			ports:         ports,
+			cmdline:       cmdline,
 		});
 	}
 	return out;

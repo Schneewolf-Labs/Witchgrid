@@ -159,6 +159,18 @@ const KNOWN_INTENTS = [
 ];
 const KV_QUANT_OPTIONS = ['f16', 'q8_0', 'q4_0', 'q4_1', 'q5_0', 'q5_1', 'iq4_nl'];
 const KNOWN_INTENT_KEYS = KNOWN_INTENTS.map(i => i.k);
+
+// One-click presets for the common intent combos, so you don't have to
+// know the intent keys. Each toggles a set of (intent → value) pairs;
+// they map straight onto the normalized intents the agent translates.
+const QUICK_TOGGLES = [
+  { id: 'flash',   label: '⚡ flash attention', set: [{ k: 'flash_attention', v: 'true' }] },
+  { id: 'q4kv',    label: '🗜 q4 KV cache',     set: [{ k: 'kv_cache_k', v: 'q4_0' }, { k: 'kv_cache_v', v: 'q4_0' }] },
+  { id: 'single',  label: '👤 single slot (chat/RP)', set: [{ k: 'parallel_slots', v: '1' }] },
+  { id: 'fullgpu', label: '🎮 full GPU offload', set: [{ k: 'gpu_layers', v: '99' }] },
+  { id: 'cpu',     label: '🧮 CPU only',         set: [{ k: 'gpu_layers', v: '0' }] },
+  { id: 'ctx128',  label: '📏 128K context',     set: [{ k: 'context', v: '131072' }] },
+];
 function intentSpec(k) {
   return KNOWN_INTENTS.find(i => i.k === k) || { k, kind: 'text', help: '' };
 }
@@ -205,6 +217,30 @@ function profileEditor() {
         });
         history.replaceState({}, '', window.location.pathname);
       }
+      // Adopt hand-off: a profile draft parsed from an unmanaged
+      // llama-server's argv, stashed in sessionStorage by adoptUnmanaged().
+      let adopt = null;
+      try { adopt = sessionStorage.getItem('wg-adopt-profile'); } catch (e) {}
+      if (adopt) {
+        try { this.openFromAdopt(JSON.parse(adopt)); } catch (e) {}
+        try { sessionStorage.removeItem('wg-adopt-profile'); } catch (e) {}
+      }
+    },
+
+    openFromAdopt(draft) {
+      this.reset();
+      this.isNew = true;
+      this.open = true;
+      this.binary = 'llama-server';
+      this.name = draft.name || '';
+      this.useRawPath = true;                       // adopted procs use a raw -m path
+      this.default_model = draft.default_model || '';
+      this.intentRows = Object.entries(draft.intent || {}).map(([k, v]) => ({ k, v: String(v) }));
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+      if (draft.intent && draft.intent.context)    this.context = parseInt(draft.intent.context, 10) || this.context;
+      if (draft.intent && draft.intent.kv_cache_k) this.kv_type = draft.intent.kv_cache_k;
+      this.loadCatalog();
+      this.loadCapabilities();
     },
 
     async openPrefilled({ alias, hf_repo, hf_file }) {
@@ -276,6 +312,25 @@ function profileEditor() {
       if (s.kind === 'tri_bool') return 'true';
       if (s.kind === 'number')   return '';
       return '';
+    },
+
+    // ── quick toggles (suggested flags) ──
+    quickToggles: QUICK_TOGGLES,
+    hasIntent(k, v)  { const r = this.intentRows.find(r => r.k === k); return !!r && String(r.v) === String(v); },
+    setIntent(k, v)  {
+      const r = this.intentRows.find(r => r.k === k);
+      if (r) r.v = v; else this.intentRows.push({ k, v });
+      this.intentRows = this.intentRows.filter(r => r.k !== '');   // drop the placeholder row
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+    },
+    unsetIntent(k)   {
+      this.intentRows = this.intentRows.filter(r => r.k !== k);
+      if (this.intentRows.length === 0) this.intentRows.push({ k: '', v: '' });
+    },
+    quickActive(t)   { return t.set.every(p => this.hasIntent(p.k, p.v)); },
+    toggleQuick(t)   {
+      if (this.quickActive(t)) { t.set.forEach(p => this.unsetIntent(p.k)); }
+      else                     { t.set.forEach(p => this.setIntent(p.k, p.v)); }
     },
     onIntentKeyChange(i, newKey) {
       // Reset value to the new key's default when the operator switches
@@ -583,6 +638,60 @@ async function toggleAutoRestart(node_id, enable) {
   else { window.location.reload(); }
 }
 
+// Best-effort SIGTERM of an unmanaged process from the node card.
+// Cross-user procs (different owner than the agent) will fail with EPERM
+// — surfaced from the agent as a 502 so we can tell the operator plainly.
+async function killUnmanaged(node, pid) {
+  if (!confirm('Send SIGTERM to PID ' + pid + ' on ' + node + '?\n\n' +
+               'This is an unmanaged process (not spawned by witchgrid). ' +
+               'If it is owned by another user the kill will be denied.')) return;
+  const r = await fetch('/unmanaged/kill', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ node_id: node, pid: pid }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    alert('Kill failed: ' + (d.error || ('HTTP ' + r.status)));
+    return;
+  }
+  const panel = document.querySelector('[hx-get="/ui/nodes"]');
+  if (panel && window.htmx) { window.htmx.trigger(panel, 'load'); }
+  else { window.location.reload(); }
+}
+
+// Parse an unmanaged llama-server's argv into a profile draft and hand it
+// to the profiles editor (via sessionStorage) prefilled. Reuses the
+// cmdline we already captured — no live API probe needed.
+function adoptUnmanaged(btn) {
+  const cmdline = (btn && btn.dataset && btn.dataset.cmdline) || '';
+  const toks = cmdline.trim().split(/\s+/);
+  const get = (...flags) => {
+    for (let i = 0; i < toks.length - 1; i++) if (flags.includes(toks[i])) return toks[i + 1];
+    return null;
+  };
+  const model = get('-m', '--model') || '';
+  const alias = model.split('/').pop().replace(/\.gguf$/i, '').toLowerCase();
+  const intent = {};
+  const ctx = get('-c', '--ctx-size');                 if (ctx) intent.context = ctx;
+  const ngl = get('-ngl', '--gpu-layers', '--n-gpu-layers'); if (ngl != null) intent.gpu_layers = ngl;
+  const np  = get('-np', '--parallel');                if (np) intent.parallel_slots = np;
+  const ctk = get('-ctk', '--cache-type-k');           if (ctk) intent.kv_cache_k = ctk;
+  const ctv = get('-ctv', '--cache-type-v');           if (ctv) intent.kv_cache_v = ctv;
+  const faIdx = toks.findIndex(t => t === '-fa' || t === '--flash-attn');
+  if (faIdx >= 0) {
+    const v = toks[faIdx + 1];
+    intent.flash_attention = (v === 'off') ? 'false' : (v === 'auto') ? 'auto' : 'true';
+  }
+  const draft = {
+    name: (alias || 'adopted').replace(/[^a-z0-9-]/g, '-'),
+    default_model: model,
+    intent,
+  };
+  try { sessionStorage.setItem('wg-adopt-profile', JSON.stringify(draft)); } catch (e) {}
+  window.location.href = '/profiles';
+}
+
 async function deleteProfile(name) {
   if (!confirm('Delete profile "' + name + '"?')) return;
   const r = await fetch('/api/profiles/' + encodeURIComponent(name), { method: 'DELETE' });
@@ -743,7 +852,11 @@ function newProfile() {
   const restore = (root) => {
     const state = load();
     (root || document).querySelectorAll('details[data-detail-key]').forEach(d => {
-      if (state[d.dataset.detailKey]) d.open = true;
+      // Explicit stored state wins (true OR false); otherwise keep the
+      // rendered default. This supports both default-collapsed panels and
+      // default-expanded ones (node cards) with collapse remembered.
+      const k = d.dataset.detailKey;
+      if (Object.prototype.hasOwnProperty.call(state, k)) d.open = state[k];
     });
   };
 
@@ -757,7 +870,7 @@ function newProfile() {
     const key = e.target.dataset.detailKey;
     if (!key) return;
     const state = load();
-    if (e.target.open) state[key] = true; else delete state[key];
+    state[key] = e.target.open;   // store true/false explicitly
     save(state);
   }, true);
 })();
@@ -1064,6 +1177,25 @@ function profileWizard() {
     if (!el) return;
     fetch('/healthz').then((r) => r.json()).then((d) => {
       if (d && d.version) el.textContent = 'v' + d.version;
+    }).catch(() => {});
+  }
+  if (document.readyState !== 'loading') fill();
+  else document.addEventListener('DOMContentLoaded', fill);
+})();
+
+// ── footer build info ────────────────────────────────────────────────
+// Fill #wg-footer-info with version + the CP endpoint you're actually
+// talking to (window.location.host — more useful than the 0.0.0.0 bind)
+// + auth posture, from /api/config.
+(function () {
+  function fill() {
+    const el = document.getElementById('wg-footer-info');
+    if (!el) return;
+    fetch('/api/config').then((r) => r.json()).then((d) => {
+      if (!d) return;
+      const parts = ['witchgrid v' + (d.version || '?'), 'CP ' + window.location.host];
+      parts.push('auth ' + (d.auth_enabled ? 'on' : 'off'));
+      el.textContent = parts.join(' · ');
     }).catch(() => {});
   }
   if (document.readyState !== 'loading') fill();

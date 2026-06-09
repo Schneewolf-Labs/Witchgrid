@@ -55,11 +55,11 @@ import { post_json, post } from "@stdlib/http";
 import { sha256 } from "@stdlib/hash";
 import { sleep } from "@stdlib/time";
 import { homedir } from "@stdlib/os";
-import { exists, make_dirs } from "@stdlib/fs";
+import { exists, make_dirs, remove_file } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { WITCHGRID_VERSION } from "../version";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, agent_setting_get, agent_setting_set } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
@@ -248,7 +248,7 @@ fn collect_known_pids(db): array {
 // tick. The only way to stop the loop is process exit.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
                         agent_url: string, canonical_dir: string,
-                        extra_dirs, models_ref, runtime_ref, caps_ref, db,
+                        scan_dirs_ref, models_ref, runtime_ref, caps_ref, db,
                         interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
@@ -260,7 +260,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		} catch (e) {
 			eprint("[watchdog] reconcile error: " + e);
 		}
-		let hw = probe(canonical_dir, extra_dirs);
+		let hw = probe(canonical_dir, scan_dirs_ref.extra);
 		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));
 		try {
 			let resp = cp_post_json(cp_url + "/register", {
@@ -269,6 +269,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				role:      hw.role,
 				hardware:  hw,
 				agent_url: agent_url,
+				agent_version: WITCHGRID_VERSION,
 				models:    models_ref.entries,
 				runtime:   runtime_ref.value,
 				unmanaged_processes: unmanaged,
@@ -457,6 +458,11 @@ fn main(): null {
 	// (Hemlock arrays are passed by value in some assignment forms; the
 	// holder dodges any reassignment-vs-mutation ambiguity.)
 	let models_ref = { entries: model_entries };
+	// Extra scan dirs are editable at runtime via /scan-dirs; the holder
+	// lets the heartbeat + rescan see edits without a restart. Seeded from
+	// the env value; a persisted override (below, once the db is open)
+	// replaces it.
+	let scan_dirs_ref = { extra: extra_dirs };
 
 	// Open db before initial register so the heartbeat (and the very
 	// first /register) can include the unmanaged-proc list — needs the
@@ -482,12 +488,26 @@ fn main(): null {
 	init_whisper_cpp_schema(db);
 	init_piper_cpp_schema(db);
 
+	// Apply a persisted scan-dirs override (set via POST /scan-dirs) over
+	// the env default, then re-scan so the first register reflects it.
+	let _sd_override = agent_setting_get(db, "scan_dirs_extra", "");
+	if (_sd_override != "") {
+		try {
+			scan_dirs_ref.extra = parse(_sd_override);
+			models_ref.entries = scan_models(canonical_dir, scan_dirs_ref.extra);
+			print("[agent] scan-dirs override applied: "
+				+ scan_dirs_ref.extra.length + " extra dir(s); "
+				+ models_ref.entries.length + " GGUF(s)");
+		} catch (e) { eprint("[agent] bad scan_dirs_extra override: " + e); }
+	}
+
 	register_with_cp(cp_url, {
 		node_id:   node_id,
 		hostname:  hostname,
 		role:      hw.role,
 		hardware:  hw,
 		agent_url: agent_url,
+		agent_version: WITCHGRID_VERSION,
 		models:    models_ref.entries,
 		runtime:   runtime_ref.value,
 		unmanaged_processes: probe_unmanaged_procs(hw.gpus,
@@ -501,7 +521,7 @@ fn main(): null {
 	// holder object so a llama_cpp/activate hot-swap is reflected live,
 	// same as runtime_ref/models_ref.
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               canonical_dir, extra_dirs, models_ref, runtime_ref,
+	               canonical_dir, scan_dirs_ref, models_ref, runtime_ref,
 	               caps_ref, db, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
@@ -561,12 +581,62 @@ fn main(): null {
 	// successful download immediately enters the catalog without
 	// waiting for an operator to re-trigger.
 	fn do_rescan(): null {
-		let fresh = scan_models(canonical_dir, extra_dirs);
+		let fresh = scan_models(canonical_dir, scan_dirs_ref.extra);
 		models_ref.entries = fresh;
 		return null;
 	}
 	let pull = make_pull_handler(db, canonical_dir, do_rescan,
 		extract_url_host(agent_url));
+
+	// ── scan-dirs editor (#334) + model delete (#335) ──────────────────
+	// GET /scan-dirs → current dirs; POST /scan-dirs { extra:[...] } edits
+	// the read-only scan dirs (persisted, live rescan). POST /models/delete
+	// { path } removes a GGUF from disk (guarded: .gguf + under a scan dir).
+	fn scan_dirs_get(req): object {
+		return { status: 200, body: stringify({
+			canonical: canonical_dir, extra: scan_dirs_ref.extra }) };
+	}
+	fn scan_dirs_set(req): object {
+		let payload = parse(req.body);
+		let extra = payload?.extra;
+		if (extra == null) {
+			return { status: 400, body: "{\"error\":\"extra (array of paths) required\"}" };
+		}
+		let clean = [];
+		for (d in extra) {
+			let dd = ("" + d).trim();
+			if (dd.length > 0) { clean.push(dd); }
+		}
+		scan_dirs_ref.extra = clean;
+		agent_setting_set(db, "scan_dirs_extra", stringify(clean));
+		do_rescan();
+		return { status: 200, body: stringify({
+			canonical: canonical_dir, extra: clean,
+			count: models_ref.entries.length }) };
+	}
+	fn models_delete(req): object {
+		let payload = parse(req.body);
+		let path = payload?.path;
+		if (path == null || path == "") {
+			return { status: 400, body: "{\"error\":\"path required\"}" };
+		}
+		if (!path.ends_with(".gguf")) {
+			return { status: 400, body: "{\"error\":\"only .gguf files can be deleted\"}" };
+		}
+		// Must live under a known scan dir — defence against arbitrary delete.
+		let allowed = (path.find(canonical_dir) == 0);
+		for (d in scan_dirs_ref.extra) { if (path.find(d) == 0) { allowed = true; } }
+		if (!allowed) {
+			return { status: 403, body: "{\"error\":\"path is not under a scan dir\"}" };
+		}
+		if (!exists(path)) {
+			return { status: 404, body: "{\"error\":\"file not found on this node\"}" };
+		}
+		try { remove_file(path); }
+		catch (e) { return { status: 500, body: stringify({ error: "delete failed: " + e }) }; }
+		do_rescan();
+		return { status: 200, body: stringify({ ok: true, count: models_ref.entries.length }) };
+	}
 
 	// llama.cpp install handlers — activate triggers do_rescan_caps
 	// so a fresh build is reflected in /capabilities + the next
@@ -601,6 +671,7 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: svc.create },
 		{ method: "GET",  path: "/services",      handler: svc.list },
 		{ method: "POST", path: "/services/stop", handler: svc.stop },
+		{ method: "POST", path: "/unmanaged/kill", handler: svc.kill_unmanaged },
 		{ method: "GET",  path: "/services/log/", prefix: true, handler: svc.log },
 		// Per-agent settings (auto-restart watchdog toggle). CP proxies
 		// these for the dashboard; default-on so a fresh agent supervises.
@@ -659,6 +730,9 @@ fn main(): null {
 			})};
 		} },
 		{ method: "POST", path: "/models/pull",   handler: pull },
+		{ method: "POST", path: "/models/delete", handler: models_delete },
+		{ method: "GET",  path: "/scan-dirs",     handler: scan_dirs_get },
+		{ method: "POST", path: "/scan-dirs",     handler: scan_dirs_set },
 		{ method: "GET",  path: "/models/transfers", handler: fn(req): object {
 			return { status: 200, body: stringify(list_transfers(db)) };
 		} },

@@ -20,7 +20,7 @@ FAKE="$ROOT/tests/integration/fake_llama_server.py"
 MODEL="$ROOT/tests/fixtures/nemo_llama.gguf"   # a valid GGUF for any metadata read
 
 CP_PORT=8765                                    # default bind (override: WITCHGRID_CP_PORT)
-AGENT_PORT=8766
+AGENT_PORT="${AGENT_PORT:-8766}"
 NODE_ID="test-agent"
 SVC_PORT=18950
 HEARTBEAT_SECS=1                                # fast agent heartbeat (liveness tests)

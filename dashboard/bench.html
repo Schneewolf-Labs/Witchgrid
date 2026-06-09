@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>witchgrid — bench</title>
+  <title>witchgrid — utilities</title>
   <link rel="icon" type="image/svg+xml" href="/assets/logo.svg">
   <script>
     (function () {
@@ -25,13 +25,13 @@
       <div class="brand">
         <img src="/assets/logo.svg" alt="witchgrid">
         <h1>witchgrid<span class="cursor">_</span></h1>
+        <span id="wg-version" class="meta" style="align-self:flex-end; padding-bottom:0.3rem"></span>
       </div>
       <nav class="page-nav">
         <a href="/">overview</a>
         <a href="/catalog">catalog</a>
-        <a href="/transfers">transfers</a>
         <a href="/profiles">profiles</a>
-        <a href="/bench">bench</a>
+        <a href="/utilities">utilities</a>
         <a href="/deploy">deploy</a>
         <a href="/settings">settings</a>
       </nav>
@@ -95,7 +95,58 @@
       <p class="meta" style="margin: 0 0 0.5rem 0">Last 100, newest first. Polls every 5s.</p>
       <div hx-get="/ui/bench" hx-trigger="load, every 5s">loading…</div>
     </section>
+
+    <section x-data="testPrompt()">
+      <h2>Test prompt</h2>
+      <p class="meta" style="margin: 0 0 0.5rem 0">
+        Send a single completion request through <code>/v1/llama/{profile}/completion</code>
+        to verify a service responds. Shows tokens, ttft, and tok/s from the response timings.
+      </p>
+      <form class="spawn" @submit.prevent="send()">
+        <div>
+          <label for="tp-prof">profile</label>
+          <select id="tp-prof" x-model="profile" required>
+            <option value="">— select —</option>
+            <template x-for="name in Object.keys(profiles)" :key="name">
+              <option :value="name" x-text="name"></option>
+            </template>
+          </select>
+        </div>
+        <div>
+          <label for="tp-np">n_predict</label>
+          <input id="tp-np" type="number" x-model="n_predict" min="1" max="2048">
+        </div>
+        <button type="submit" :disabled="busy" x-text="busy ? '…' : 'send'"></button>
+        <div style="grid-column: 1 / -1">
+          <label for="tp-prompt">prompt</label>
+          <textarea id="tp-prompt" x-model="prompt" rows="4" style="width:100%; font-family:ui-monospace,monospace; font-size:0.85rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+        </div>
+        <p class="msg err" x-show="error" x-text="error"></p>
+      </form>
+
+      <div x-show="result" style="margin-top:1rem">
+        <div style="display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:0.5rem">
+          <span class="badge badge-canonical" x-show="result?.timings?.predicted_per_second != null">
+            <span x-text="(result?.timings?.predicted_per_second || 0).toFixed(1)"></span> tok/s
+          </span>
+          <span class="badge badge-scan" x-show="result?.timings?.prompt_ms != null">
+            ttft <span x-text="Math.round(result?.timings?.prompt_ms || 0)"></span>ms
+          </span>
+          <span class="badge" x-show="result?.tokens_predicted != null">
+            <span x-text="result?.tokens_predicted"></span> tokens
+          </span>
+          <span class="badge" x-show="elapsedMs">
+            <span x-text="elapsedMs"></span>ms wall
+          </span>
+        </div>
+        <pre style="background:var(--bg-2); border:1px solid var(--border); border-radius:6px; padding:0.75rem; font-size:0.82rem; white-space:pre-wrap; word-break:break-word; max-height:400px; overflow-y:auto" x-text="result?.content || '(no content)'"></pre>
+      </div>
+    </section>
   </main>
+  <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
+    made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
+    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+  </footer>
 
   <script>
     function benchPage() {

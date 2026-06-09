@@ -340,16 +340,26 @@ code {
 .bar-warn  { background: var(--warn); }
 .bar-err   { background: var(--err); }
 
-/* Sparkline area: SVG fills the row width naturally */
+/* Sparkline: aligned under its bar (not full card width) and kept short
+ * so the trend reads as a compact history of the bar above it rather
+ * than a full-width line slashing across the card. The wrapper mirrors
+ * the .hw-row grid and drops the SVG into the bar column. */
+.spark-wrap {
+  display: grid;
+  grid-template-columns: 280px 1fr 130px;
+  gap: 0.6rem;
+  margin: 1px 0 5px;
+}
+.spark-wrap .spark { grid-column: 2; }
 .spark {
   display: block;
   width: 100%;
-  height: 24px;
-  margin-top: 2px;
+  height: 15px;
+  margin: 0;
 }
 .spark .axis { stroke: var(--border-soft); stroke-width: 0.5; }
-.spark .line { fill: none; stroke-width: 1.5; }
-.spark .area { opacity: 0.18; }
+.spark .line { fill: none; stroke-width: 1.25; }
+.spark .area { opacity: 0.12; }
 .spark.spark-ok   .line, .spark.spark-ok   .area { stroke: var(--ok);   fill: var(--ok); }
 .spark.spark-warn .line, .spark.spark-warn .area { stroke: var(--warn); fill: var(--warn); }
 .spark.spark-err  .line, .spark.spark-err  .area { stroke: var(--err);  fill: var(--err); }
@@ -361,6 +371,222 @@ code {
 .empty     { color: var(--fg-dim); font-style: italic; }
 .id        { font-family: ui-monospace, monospace; font-size: 0.82em; color: var(--fg-dim); }
 .stop-btn  { padding: 0.2rem 0.6rem; font-size: 0.78rem; margin: 0; }
+
+/* ─── node cards (overview NODES list) ──────────────────────────── */
+/* One stacked card per node: identity + status header on top, the
+ * resource charts in the middle, action buttons at the bottom. Replaces
+ * the old 4-column table, which crammed everything horizontally. */
+.node-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+.node-card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.85rem 1rem;
+}
+/* node card is a <details> — the header is the clickable summary */
+summary.node-card-head { cursor: pointer; list-style: none; }
+summary.node-card-head::-webkit-details-marker { display: none; }
+summary.node-card-head::marker { content: ""; }
+.node-card-chevron {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--fg-dim);
+  font-size: 1rem;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.node-card[open] > summary .node-card-chevron { transform: rotate(90deg); }
+/* clean collapsed look — drop the header divider when there's nothing below */
+.node-card:not([open]) > summary.node-card-head {
+  padding-bottom: 0;
+  margin-bottom: 0;
+  border-bottom: none;
+}
+.node-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.4rem 1rem;
+  padding-bottom: 0.65rem;
+  margin-bottom: 0.65rem;
+  border-bottom: 1px solid var(--border-soft);
+}
+.node-card-status { margin-left: auto; }
+.node-card-id {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.node-card-id strong { font-size: 0.95rem; color: var(--fg-1); }
+.node-card-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.node-card-age {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  color: var(--fg-dim);
+}
+.node-card-age.stale { color: var(--err); font-weight: 600; }
+.node-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding-top: 0.7rem;
+  margin-top: 0.7rem;
+  border-top: 1px solid var(--border-soft);
+}
+
+/* ─── node card: unified process list (services + unmanaged) ────── */
+/* Managed services and unmanaged procs render as identical <details>
+ * rows for visual consistency; the hardware section above stays
+ * bars-only. Native disclosure (works with JS off), explicit chevron. */
+.node-card-procs {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.proc-head {
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--fg-dim);
+  margin: 0.55rem 0 0.25rem;
+}
+.proc-head:first-child { margin-top: 0; }
+
+.proc-item { margin: 0; }
+.proc-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.82rem;
+}
+.proc-summary::-webkit-details-marker { display: none; }
+.proc-summary:hover { background: var(--bg-2); }
+.proc-item[open] .proc-summary { background: var(--bg-2); }
+
+.proc-dot { font-size: 0.6rem; line-height: 1; }
+.proc-name { font-weight: 600; color: var(--fg-1); }
+.proc-port { color: var(--fg-2); }
+.proc-model {
+  color: var(--fg-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.proc-chevron {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-size: 0.9rem;
+  transition: transform 0.15s ease;
+}
+.proc-item[open] .proc-chevron { transform: rotate(90deg); }
+
+/* unmanaged variant — amber tag instead of a status dot */
+.proc-tag {
+  font-family: ui-monospace, monospace;
+  font-size: 0.62rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--warn);
+  border: 1px solid var(--warn-soft);
+  background: var(--warn-soft);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.proc-unmanaged .proc-name { color: var(--warn); }
+
+/* shared key/value detail grid revealed on expand */
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.3rem 1rem;
+  padding: 0.5rem 0 0.7rem 0.75rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, monospace;
+}
+.detail-grid .detail-wide { grid-column: 1 / -1; }
+.detail-grid code { word-break: break-all; }
+.detail-grid .dk {
+  display: inline-block;
+  min-width: 56px;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  margin-right: 0.4rem;
+}
+.svc-actions { display: flex; gap: 0.4rem; padding-top: 0.3rem; }
+
+/* ─── chips (profile quick-option toggles) ─────────────────────── */
+.chip-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.chip {
+  font-family: ui-monospace, monospace;
+  font-size: 0.78rem;
+  padding: 0.3rem 0.7rem;
+  margin: 0;
+  width: auto;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--fg-2);
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+.chip:hover { border-color: var(--accent); color: var(--fg-1); }
+.chip-on {
+  background: var(--brand-soft);
+  border-color: var(--brand);
+  color: var(--brand);
+  font-weight: 600;
+}
+
+/* ─── tab bar (catalog sections) ───────────────────────────────── */
+.tabbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+  margin: 0.5rem 0 1.25rem;
+  border-bottom: 1px solid var(--border);
+}
+.tab-btn {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 0.45rem 0.9rem;
+  margin: 0 0 -1px 0;
+  width: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: 2px solid transparent;
+  border-radius: 6px 6px 0 0;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.tab-btn:hover { color: var(--fg-1); background: var(--bg-2); }
+.tab-btn.active {
+  color: var(--brand);
+  border-bottom-color: var(--brand);
+  background: var(--bg-1);
+}
 
 /* ─── hardware detail expander ──────────────────────────────────── */
 tr.hw-detail td { padding-top: 0; padding-bottom: 0.6rem; border-top: none; background: var(--bg-base); }
@@ -814,6 +1040,21 @@ button[type="submit"]:hover { background: var(--brand); border-color: var(--bran
   font-size: 0.85em;
 }
 .ov-collapse[open] > summary::before { content: "▾"; }
+/* Make the collapsible heading (Spawn) read like the section > h2
+ * headings (Nodes/Services): uppercase mono, same size/color, brand
+ * marker — so the overview's sections look consistent. */
+.ov-collapse { margin: 2.25rem 0 1.25rem 0; }
+.ov-collapse > summary::before { color: var(--brand); }
+.ov-collapse > summary h2 {
+  display: inline;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", "Menlo", monospace;
+  font-size: 0.9rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
 .ov-collapse > summary h2 { display: inline; margin: 0; }
 .ov-collapse > summary:hover h2 { color: var(--accent); }
 .ov-collapse > :not(summary) { margin-top: 0.75rem; }

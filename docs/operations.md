@@ -125,21 +125,55 @@ provided it was built against a Hemlock with the signal fix
 older toolchain it falls back to default termination; SQLite WAL is
 crash-durable, so the DB still recovers + checkpoints on the next open.
 
+### Zero-downtime agent restarts (don't tree-kill the inference)
+
+The agent `posix_spawn`s its inference servers with `setsid:true` — they're
+their own session leaders, so they **survive the agent going away** and the
+restarted agent re-adopts the still-`running` rows (no respawn). The agent
+itself installs **no** shutdown handler, so it never stops its children.
+
+That means an agent restart can be **zero-downtime** — *if* the service
+manager doesn't kill the agent's whole process tree/cgroup along with it.
+Configure it not to:
+
+- **pm2** → `--no-treekill` (only the agent gets the signal, not its children).
+- **systemd** → `KillMode=process` in `[Service]` (kill the main process only,
+  not the whole cgroup).
+- **launchd** → `AbandonProcessGroup=true` so children aren't reaped with the job.
+
+Without these, every agent roll bounces inference for a few seconds (the
+children die, the watchdog respawns them). With them, you can upgrade the
+agent under live traffic.
+
 ### pm2 (no-sudo agent supervision)
 
 When you can't (or don't want to) write a system unit, pm2 with its boot hook
 works for the agent:
 
 ```bash
-pm2 start "$HOME/witchgrid-agent.sh" --name witchgrid-agent --interpreter bash
+pm2 start "$HOME/witchgrid-agent.sh" --name witchgrid-agent --interpreter bash --no-treekill
 pm2 save                      # persist; pm2's startup unit resurrects on reboot
+```
+
+`--no-treekill` is the zero-downtime bit (see above). To add it to an
+already-running agent: `pm2 delete witchgrid-agent` then re-`start` with the
+flag (the delete bounces the services one last time), then `pm2 save`.
+
+### systemd (--user) agents
+
+```ini
+[Service]
+KillMode=process              # zero-downtime: don't cgroup-kill the inference
+ExecStart=%h/witchgrid-agent.sh
+Restart=on-failure
 ```
 
 ### launchd (macOS agents)
 
 A user LaunchAgent (`~/Library/LaunchAgents/ai.flammen.witchgrid-agent.plist`)
 with `KeepAlive` + `RunAtLoad` survives reboots; restart with
-`launchctl kickstart -k gui/$(id -u)/ai.flammen.witchgrid-agent`.
+`launchctl kickstart -k gui/$(id -u)/ai.flammen.witchgrid-agent`. Add
+`<key>AbandonProcessGroup</key><true/>` for zero-downtime restarts.
 
 ## Configuration reference
 

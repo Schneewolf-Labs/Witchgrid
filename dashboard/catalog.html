@@ -25,13 +25,13 @@
       <div class="brand">
         <img src="/assets/logo.svg" alt="witchgrid">
         <h1>witchgrid<span class="cursor">_</span></h1>
+        <span id="wg-version" class="meta" style="align-self:flex-end; padding-bottom:0.3rem"></span>
       </div>
       <nav class="page-nav">
         <a href="/">overview</a>
         <a href="/catalog">catalog</a>
-        <a href="/transfers">transfers</a>
         <a href="/profiles">profiles</a>
-        <a href="/bench">bench</a>
+        <a href="/utilities">utilities</a>
         <a href="/deploy">deploy</a>
         <a href="/settings">settings</a>
       </nav>
@@ -46,12 +46,23 @@
       </div>
     </div>
 
+    <div x-data="{ tab: 'catalog' }" @wg-find-quants.window="tab='hf'">
+      <div class="tabbar">
+        <button type="button" class="tab-btn" :class="tab==='catalog' ? 'active' : ''" @click="tab='catalog'">catalog</button>
+        <button type="button" class="tab-btn" :class="tab==='hf' ? 'active' : ''" @click="tab='hf'">huggingface</button>
+        <button type="button" class="tab-btn" :class="tab==='transfers' ? 'active' : ''" @click="tab='transfers'">transfers</button>
+        <button type="button" class="tab-btn" :class="tab==='missing' ? 'active' : ''" @click="tab='missing'">missing</button>
+      </div>
+
+    <div x-show="tab==='missing'">
     <section>
       <h2>Missing</h2>
       <p class="meta" style="margin: 0 0 0.5rem 0">Aliases referenced by a profile but not on disk anywhere in the fleet. If the profile names an HF source, pull from here.</p>
       <div hx-get="/ui/missing" hx-trigger="load, every 30s">loading…</div>
     </section>
+    </div>
 
+    <div x-show="tab==='hf'">
     <section x-data="hfPull()">
       <h2>Pull from HuggingFace</h2>
       <p class="meta" style="margin: 0 0 0.75rem 0">
@@ -91,7 +102,7 @@
       <div x-show="files.length > 0" style="margin-top:1rem">
         <h3 style="margin:0 0 0.5rem 0">files in <code x-text="selectedRepo"></code></h3>
         <table>
-          <thead><tr><th>file</th><th>size</th><th>alias</th><th>node</th><th></th></tr></thead>
+          <thead><tr><th>file</th><th>quant</th><th>size</th><th>alias</th><th>node</th><th></th></tr></thead>
           <tbody>
             <template x-for="f in files" :key="f.path">
               <tr>
@@ -99,6 +110,7 @@
                   <code x-text="f.path"></code>
                   <span x-show="f.sharded" class="badge badge-scan" style="margin-left:0.4rem">sharded</span>
                 </td>
+                <td><span class="badge badge-state-active" x-text="ggufQuant(f.path)"></span></td>
                 <td><span class="meta" x-text="formatSize(f.size)"></span></td>
                 <td><code class="meta" x-text="aliasFor(f.path)"></code></td>
                 <td>
@@ -125,16 +137,139 @@
             + create profile for <code x-text="lastPulled?.alias"></code>
           </a>
         </p>
-        <p class="meta" style="margin-top:0.5rem">Once started, watch progress on <a href="/transfers">/transfers</a>.</p>
+        <p class="meta" style="margin-top:0.5rem">Once started, watch progress in <strong>Transfers</strong> below.</p>
       </div>
     </section>
+    </div>
 
-    <section>
+    <div x-show="tab==='catalog'">
+    <section x-data="catalogBrowser()">
       <h2>Catalog</h2>
-      <p class="meta" style="margin: 0 0 0.5rem 0">Models discovered on each node. Profiles using <code>model_alias</code> resolve here at spawn time. Use the per-row picker to copy a model to another node.</p>
-      <div hx-get="/ui/catalog" hx-trigger="load, every 10s">loading…</div>
+      <p class="meta" style="margin: 0 0 0.5rem 0">Models discovered on each node. Search, expand a model for its GGUF metadata, or copy it to another node.</p>
+      <input type="text" x-model="q" placeholder="filter by alias, architecture, or name…"
+             style="width:100%; max-width:480px; margin-bottom:0.6rem">
+
+      <details class="ov-collapse" style="margin:0 0 1rem">
+        <summary><h2>scan directories</h2> <span class="meta">edit where a node looks for models</span></summary>
+        <div style="background:var(--bg-1); border:1px solid var(--border); border-radius:8px; padding:1rem; max-width:640px">
+          <label>node</label>
+          <select x-model="sd.node" @change="loadScanDirs()" style="max-width:320px">
+            <option value="">— select node —</option>
+            <template x-for="n in nodes" :key="n.node_id"><option :value="n.node_id" x-text="n.node_id"></option></template>
+          </select>
+          <div x-show="sd.node" style="margin-top:0.75rem">
+            <p class="meta" style="margin:0 0 0.5rem">canonical (pulls land here; set via env, read-only): <code x-text="sd.canonical || '—'"></code></p>
+            <label>extra scan dirs <span class="meta">(one path per line)</span></label>
+            <textarea x-model="sd.extra" rows="3" placeholder="/mnt/models&#10;/data/gguf"
+                      style="width:100%; font-family:ui-monospace,monospace; font-size:0.82rem; padding:0.5rem; background:var(--bg-2); border:1px solid var(--border); border-radius:4px; color:var(--fg-1)"></textarea>
+            <div style="display:flex; gap:0.6rem; align-items:center; margin-top:0.5rem">
+              <button type="button" @click="saveScanDirs()" :disabled="sd.busy" x-text="sd.busy ? '…' : 'save + rescan'"></button>
+              <span class="meta" x-text="sd.msg"></span>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <p class="meta" x-show="loading">loading…</p>
+      <p class="empty" x-show="!loading && filtered.length === 0"
+         x-text="q ? 'no models match “' + q + '”' : 'No models in any node catalog. Set WITCHGRID_MODEL_DIR on an agent.'"></p>
+      <div class="node-card-procs" style="border-top:none; margin-top:0; padding-top:0" x-show="filtered.length > 0">
+        <template x-for="m in filtered" :key="m.alias">
+          <details class="proc-item">
+            <summary class="proc-summary">
+              <strong class="proc-name" x-text="m.alias"></strong>
+              <span class="badge badge-scan" x-text="m.architecture || '?'"></span>
+              <code class="proc-port" x-text="fmtSize(m.size_mb)"></code>
+              <span class="meta proc-model" x-text="(m.on_nodes ? m.on_nodes.length : 0) + ' node' + ((m.on_nodes && m.on_nodes.length === 1) ? '' : 's')"></span>
+              <span class="proc-chevron">›</span>
+            </summary>
+            <div class="detail-grid">
+              <div><span class="dk">name</span><span x-text="m.general_name || '—'"></span></div>
+              <div><span class="dk">arch</span><code x-text="m.architecture || '—'"></code></div>
+              <div><span class="dk">context</span><code x-text="m.claimed_context ? Number(m.claimed_context).toLocaleString() : '—'"></code></div>
+              <div><span class="dk">size</span><span x-text="fmtSize(m.size_mb)"></span></div>
+              <div class="detail-wide"><span class="dk">source</span>
+                <template x-if="m.source_url"><a :href="m.source_url" target="_blank" x-text="m.source_url"></a></template>
+                <template x-if="!m.source_url"><span class="meta">—</span></template>
+              </div>
+              <div class="detail-wide"><span class="dk">quants</span>
+                <button type="button" class="row-action" @click="findQuants(m)">⊕ find other quants / sources</button>
+                <span class="meta" style="margin-left:0.4rem">searches HuggingFace for other quantizations of this model</span>
+              </div>
+              <div class="detail-wide"><span class="dk">spawn</span>
+                <template x-if="matchingProfiles(m).length > 0">
+                  <span style="display:inline-flex; gap:0.4rem; align-items:center; flex-wrap:wrap">
+                    <select x-model="spawnSel[m.alias]" style="font-family:ui-monospace,monospace; font-size:0.8rem">
+                      <option value="">profile…</option>
+                      <template x-for="pn in matchingProfiles(m)" :key="pn"><option :value="pn" x-text="pn"></option></template>
+                    </select>
+                    <button type="button" class="row-action" @click="spawnModel(m)" :disabled="!spawnSel[m.alias]">spawn</button>
+                    <span class="meta" x-show="spawnMsg[m.alias]" x-text="spawnMsg[m.alias]"></span>
+                  </span>
+                </template>
+                <template x-if="matchingProfiles(m).length === 0">
+                  <a class="row-action" :href="profileCreateUrl(m)" style="text-decoration:none; display:inline-block">+ create a profile to spawn this</a>
+                </template>
+              </div>
+              <div class="detail-wide"><span class="dk">on nodes</span>
+                <div>
+                  <template x-for="on in m.on_nodes" :key="on.node_id">
+                    <div class="catalog-node" style="display:flex; gap:0.5rem; align-items:center; padding:0.15rem 0">
+                      <strong x-text="on.node_id"></strong>
+                      <code class="meta" style="flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis" x-text="on.path"></code>
+                      <button type="button" class="row-action row-action-danger" @click="askDelete(m.alias, on.node_id, on.path)">delete</button>
+                    </div>
+                  </template>
+                </div>
+              </div>
+              <div class="detail-wide" x-show="copyTargets(m).length > 0">
+                <span class="dk">copy to</span>
+                <select x-model="copyTo[m.alias]" style="font-family:ui-monospace,monospace; font-size:0.8rem">
+                  <option value="">target node…</option>
+                  <template x-for="nid in copyTargets(m)" :key="nid"><option :value="nid" x-text="nid"></option></template>
+                </select>
+                <button type="button" class="row-action" @click="distribute(m)" :disabled="!copyTo[m.alias]">pull</button>
+                <span class="meta" x-show="msg[m.alias]" x-text="msg[m.alias]" style="margin-left:0.5rem"></span>
+              </div>
+            </div>
+          </details>
+        </template>
+      </div>
+
+      <!-- delete confirmation modal -->
+      <div class="modal-backdrop" x-show="del.open" x-cloak @click.self="cancelDelete()" style="display:none">
+        <div class="modal-card" @click.stop style="max-width:560px">
+          <h3 style="margin:0 0 0.5rem 0">Delete model?</h3>
+          <p class="meta" style="margin:0 0 0.75rem 0">
+            Permanently removes this file from disk on <strong x-text="del.node"></strong>. This cannot be undone.
+          </p>
+          <div class="detail-grid" style="padding-left:0">
+            <div><span class="dk">alias</span><code x-text="del.alias"></code></div>
+            <div class="detail-wide"><span class="dk">path</span><code x-text="del.path"></code></div>
+          </div>
+          <p class="msg err" x-show="del.err" x-text="del.err" style="margin-top:0.5rem"></p>
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:1rem">
+            <button type="button" class="row-action" @click="cancelDelete()" :disabled="del.busy">cancel</button>
+            <button type="button" class="row-action row-action-danger" @click="confirmDelete()" :disabled="del.busy" x-text="del.busy ? '…' : 'delete'"></button>
+          </div>
+        </div>
+      </div>
     </section>
+    </div>
+
+    <div x-show="tab==='transfers'">
+    <section>
+      <h2>Transfers</h2>
+      <p class="meta" style="margin: 0 0 0.5rem 0">In-flight + recent model pulls/distributions across the fleet. Polls every 5s.</p>
+      <div hx-get="/ui/transfers" hx-trigger="load, every 5s">loading…</div>
+    </section>
+    </div>
+    </div>
   </main>
+  <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
+    made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
+    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+  </footer>
 
   <script>
     function hfPull() {
@@ -149,6 +284,17 @@
             const r = await fetch('/nodes');
             this.nodes = (await r.json()).filter(n => (n.state || 'active') !== 'disabled');
           } catch (e) { /* nodes optional for search */ }
+          // "find other quants" hand-off from a catalog model: prefill the
+          // search with the base model name and run it (repos = sources).
+          window.addEventListener('wg-find-quants', (e) => {
+            this.q = (e.detail && e.detail.base) || '';
+            if (this.q) this.search();
+          });
+        },
+        // Extract the quant tag from a GGUF filename (Q4_K_M, IQ4_XS, F16…).
+        ggufQuant(path) {
+          const m = (path || '').match(/(IQ\d+[A-Z0-9_]*|Q\d+_K_[SML]|Q\d+_K|Q\d+_\d+|Q\d+|BF16|F16|F32)/i);
+          return m ? m[1].toUpperCase() : '—';
         },
         async search() {
           if (!this.q.trim()) return;
@@ -238,6 +384,148 @@
             return Math.round(bytes / 1048576) + ' MB';
           }
           return Math.round(bytes / 1024) + ' KB';
+        },
+      };
+    }
+
+    // Searchable, expandable catalog browser (replaces the static table).
+    // Pulls /api/catalog (full GGUF metadata) + /nodes (copy-to targets);
+    // each model expands to its metadata and a copy-to-node control.
+    function catalogBrowser() {
+      return {
+        models: [], nodes: [], profiles: {}, q: '', loading: true,
+        copyTo: {}, msg: {}, spawnSel: {}, spawnMsg: {},
+        async init() {
+          await this.load();
+          setInterval(() => this.load(), 15000);
+        },
+        async load() {
+          try {
+            const [rc, rn, rp] = await Promise.all([fetch('/api/catalog'), fetch('/nodes'), fetch('/api/profiles')]);
+            if (rc.ok) this.models = await rc.json();
+            if (rn.ok) this.nodes = await rn.json();
+            if (rp.ok) this.profiles = await rp.json();
+          } catch (e) { /* keep last good data */ }
+          this.loading = false;
+        },
+        // Profiles that resolve to this catalog model (so it can be spawned
+        // directly). Matched on model_alias.
+        matchingProfiles(m) {
+          return Object.keys(this.profiles).filter(n => this.profiles[n] && this.profiles[n].model_alias === m.alias);
+        },
+        async spawnModel(m) {
+          const prof = this.spawnSel[m.alias];
+          if (!prof) return;
+          this.spawnMsg[m.alias] = 'spawning…';
+          try {
+            const r = await fetch('/services', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ profile: prof }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.spawnMsg[m.alias] = 'error: ' + (d.error || ('HTTP ' + r.status)); return; }
+            const where = d.node_id + ' :' + d.port + (d.device ? ' (' + d.device.toUpperCase() + ')' : '');
+            this.spawnMsg[m.alias] = '✓ spawned on ' + where + ' — loading model…';
+            // Poll readiness (same helper the overview spawn uses) so the
+            // operator sees loading → ready without leaving the catalog.
+            if (window.wgPollReady) {
+              window.wgPollReady(prof, (phase) => {
+                if (phase === 'ready')        this.spawnMsg[m.alias] = '✓ ready — ' + prof + ' serving on :' + d.port;
+                else if (phase === 'timeout') this.spawnMsg[m.alias] = 'spawned on ' + where + ' — still loading (see Overview)';
+              });
+            }
+          } catch (e) { this.spawnMsg[m.alias] = 'error: ' + e; }
+        },
+        profileCreateUrl(m) { return '/profiles?prefill_alias=' + encodeURIComponent(m.alias); },
+        get filtered() {
+          const q = this.q.trim().toLowerCase();
+          if (!q) return this.models;
+          return this.models.filter(m =>
+            (m.alias || '').toLowerCase().includes(q) ||
+            (m.architecture || '').toLowerCase().includes(q) ||
+            (m.general_name || '').toLowerCase().includes(q));
+        },
+        copyTargets(m) {
+          const have = new Set((m.on_nodes || []).map(o => o.node_id));
+          return this.nodes.map(n => n.node_id).filter(id => !have.has(id));
+        },
+        async distribute(m) {
+          const target = this.copyTo[m.alias];
+          if (!target) return;
+          this.msg[m.alias] = 'queuing…';
+          try {
+            const r = await fetch('/models/distribute', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ alias: m.alias, target_node: target }),
+            });
+            const d = await r.json();
+            this.msg[m.alias] = d.error ? ('error: ' + d.error) : ('queued ' + d.transfer_id + ' → ' + target);
+          } catch (e) { this.msg[m.alias] = 'error: ' + e; }
+        },
+        fmtSize(mb) {
+          if (mb == null) return '—';
+          return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
+        },
+
+        // ── quant suggestions: strip the quant tag to a base model name,
+        // then hand off to the HF browser (repos = sources, files = quants). ──
+        findQuants(m) {
+          const base = (m.general_name || m.alias || '')
+            .replace(/[-_. ]?(iq\d+[a-z0-9_]*|q\d+_k_[sml]|q\d+_k|q\d+_\d+|q\d+|f16|f32|bf16)\b.*$/i, '')
+            .replace(/[-_. ]?gguf$/i, '')
+            .trim();
+          window.dispatchEvent(new CustomEvent('wg-find-quants', { detail: { base: base || m.alias } }));
+        },
+
+        // ── delete model (with confirmation modal) ──
+        del: { open: false, alias: '', node: '', path: '', busy: false, err: '' },
+        askDelete(alias, node, path) { this.del = { open: true, alias, node, path, busy: false, err: '' }; },
+        cancelDelete() { this.del.open = false; },
+        async confirmDelete() {
+          this.del.busy = true; this.del.err = '';
+          try {
+            const r = await fetch('/models/delete', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.del.node, path: this.del.path }),
+            });
+            const d = await r.json().catch(() => ({}));
+            if (!r.ok) { this.del.err = d.error || ('HTTP ' + r.status); this.del.busy = false; return; }
+            this.del.open = false; this.del.busy = false;
+            await this.load();
+          } catch (e) { this.del.err = String(e); this.del.busy = false; }
+        },
+
+        // ── per-node scan-dir editor ──
+        sd: { node: '', canonical: '', extra: '', msg: '', busy: false },
+        async loadScanDirs() {
+          if (!this.sd.node) { this.sd.canonical = ''; this.sd.extra = ''; this.sd.msg = ''; return; }
+          this.sd.msg = 'loading…';
+          try {
+            const r = await fetch('/api/scan-dirs', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.sd.node }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.sd.msg = 'error: ' + (d.error || r.status); return; }
+            this.sd.canonical = d.canonical || '';
+            this.sd.extra = (d.extra || []).join('\n');
+            this.sd.msg = '';
+          } catch (e) { this.sd.msg = 'error: ' + e; }
+        },
+        async saveScanDirs() {
+          this.sd.busy = true; this.sd.msg = '';
+          const extra = this.sd.extra.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+          try {
+            const r = await fetch('/api/scan-dirs', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ node_id: this.sd.node, extra }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.sd.msg = 'error: ' + (d.error || r.status); }
+            else { this.sd.msg = 'saved · ' + (d.count != null ? d.count + ' models' : 'rescanned'); await this.load(); }
+          } catch (e) { this.sd.msg = 'error: ' + e; }
+          this.sd.busy = false;
         },
       };
     }

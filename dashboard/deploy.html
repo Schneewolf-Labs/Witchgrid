@@ -25,13 +25,13 @@
       <div class="brand">
         <img src="/assets/logo.svg" alt="witchgrid">
         <h1>witchgrid<span class="cursor">_</span></h1>
+        <span id="wg-version" class="meta" style="align-self:flex-end; padding-bottom:0.3rem"></span>
       </div>
       <nav class="page-nav">
         <a href="/">overview</a>
         <a href="/catalog">catalog</a>
-        <a href="/transfers">transfers</a>
         <a href="/profiles">profiles</a>
-        <a href="/bench">bench</a>
+        <a href="/utilities">utilities</a>
         <a href="/deploy">deploy</a>
         <a href="/settings">settings</a>
       </nav>
@@ -147,6 +147,10 @@
       <div hx-get="/ui/services" hx-trigger="load, every 30s">loading…</div>
     </section>
   </main>
+  <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
+    made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
+    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+  </footer>
 
   <script>
     function deployFlow() {

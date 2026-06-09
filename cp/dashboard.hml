@@ -19,6 +19,7 @@
 // without importing them itself. Single import surface for the dashboard.
 import { INDEX_HTML, CATALOG_HTML, TRANSFERS_HTML, PROFILES_HTML, BENCH_HTML, DEPLOY_HTML, SETTINGS_HTML,
          STYLES_CSS, DASHBOARD_JS, LOGO_SVG } from "./embedded_assets";
+import { WITCHGRID_VERSION } from "../version";
 // Page shells — one per route. Topbar is duplicated across them.
 export let OVERVIEW_HTML  = INDEX_HTML;
 export let PAGE_CATALOG   = CATALOG_HTML;
@@ -88,9 +89,9 @@ fn util_class(free, total): string {
 fn render_sparkline(values, total, kind: string): string {
 	// Empty / single-point series → just an axis hint, no path.
 	if (values == null || values.length < 2) {
-		return "<svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 200 24\" preserveAspectRatio=\"none\">"
+		return "<div class=\"spark-wrap\"><svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 200 24\" preserveAspectRatio=\"none\">"
 			+ "<line class=\"axis\" x1=\"0\" y1=\"23.5\" x2=\"200\" y2=\"23.5\"/>"
-			+ "</svg>";
+			+ "</svg></div>";
 	}
 
 	let w = 200;
@@ -122,12 +123,12 @@ fn render_sparkline(values, total, kind: string): string {
 	// Area path = stroke path + bottom-right corner + bottom-left corner + close.
 	let area = path + " L" + (w - 1) + "," + (h - 1) + " L1," + (h - 1) + " Z";
 
-	return "<svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 " + w + " " + h
+	return "<div class=\"spark-wrap\"><svg class=\"spark spark-" + kind + "\" viewBox=\"0 0 " + w + " " + h
 		+ "\" preserveAspectRatio=\"none\">"
 		+ "<line class=\"axis\" x1=\"0\" y1=\"" + (h - 0) + "\" x2=\"" + w + "\" y2=\"" + (h - 0) + "\"/>"
 		+ "<path class=\"area\" d=\"" + area + "\"/>"
 		+ "<path class=\"line\" d=\"" + path + "\"/>"
-		+ "</svg>";
+		+ "</svg></div>";
 }
 
 // ── render_stats: top-of-page summary tiles ──────────────────────
@@ -175,19 +176,15 @@ export fn render_stats(stats): string {
 //
 // Each item gets the same shape: [label] [bar] [free/total] + 30-min
 // sparkline beneath. Same color tokens for everything.
-export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_seconds: i32): string {
+export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_by_node, stale_seconds: i32): string {
 	if (nodes_data.length == 0) {
 		return "<p class=\"empty\">No nodes registered.</p>";
 	}
-	let html = "<table>\n"
-		+ "<thead><tr>"
-		+ "<th>node</th><th>state</th><th>last seen</th>"
-		+ "<th>hardware (free / total · 30 min trend)</th><th></th>"
-		+ "</tr></thead>\n<tbody>\n";
+	let html = "<div class=\"node-cards\">\n";
 	for (n in nodes_data) {
 		let stale = n.age_seconds > stale_seconds;
-		let last_class = "";
-		if (stale) { last_class = " class=\"stale\""; }
+		let age_class = "node-card-age";
+		if (stale) { age_class = "node-card-age stale"; }
 
 		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
 		let unmanaged = unmanaged_by_node?[n.node_id] ?? {};
@@ -208,14 +205,14 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 		let ar_badge = "";
 		let ar_btn = "";
 		if (ar == true) {
-			ar_badge = "<br><span class=\"badge badge-state-active\" "
-				+ "style=\"margin-top:4px\" title=\"dead services are respawned automatically\">⟳ auto</span>";
+			ar_badge = "<span class=\"badge badge-state-active\" "
+				+ "title=\"dead services are respawned automatically\">⟳ auto</span>";
 			ar_btn = "<button class=\"row-action\" "
 				+ "onclick=\"toggleAutoRestart('" + esc(n.node_id) + "',false)\" "
 				+ "title=\"stop auto-restarting this node's services\">disable auto-restart</button>";
 		} else if (ar == false) {
-			ar_badge = "<br><span class=\"badge badge-state-disabled\" "
-				+ "style=\"margin-top:4px\" title=\"dead services are NOT respawned\">⟳ manual</span>";
+			ar_badge = "<span class=\"badge badge-state-disabled\" "
+				+ "title=\"dead services are NOT respawned\">⟳ manual</span>";
 			ar_btn = "<button class=\"row-action\" "
 				+ "onclick=\"toggleAutoRestart('" + esc(n.node_id) + "',true)\" "
 				+ "title=\"respawn this node's services automatically on crash/reboot\">enable auto-restart</button>";
@@ -226,17 +223,42 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 		let runtime_line = "";
 		let lv = n?.runtime?.llama_server;
 		if (lv != null) {
-			runtime_line = "<br><span class=\"id\">llama-server " + esc(lv?.version ?? "?")
+			runtime_line = "<span class=\"id\">llama-server " + esc(lv?.version ?? "?")
 				+ " <span class=\"meta\">(" + esc(lv?.build_hash ?? "?") + ")</span></span>";
 		}
 
-		html = html + "<tr>"
-			+ "<td><strong>" + esc(n.node_id) + "</strong>"
-				+ "<br><span class=\"id\">" + esc(n.hostname) + " · " + esc(n.role) + "</span>"
-				+ runtime_line + "</td>"
-			+ "<td><span class=\"badge " + state_class + "\">" + esc(state) + "</span>" + ar_badge + "</td>"
-			+ "<td" + last_class + ">" + n.age_seconds + "s ago</td>"
-			+ "<td>";
+		// Agent version line + fleet-drift indicator. null = an agent too old
+		// to report its version (→ "update" hint, e.g. the macOS box that
+		// can't cross-build). A reported version that differs from the CP's
+		// own is flagged as drift.
+		let av = n?.agent_version;
+		let agent_line = "";
+		let drift_badge = "";
+		if (av == null) {
+			agent_line = "<span class=\"id\">agent <span class=\"meta\">— update to report version</span></span>";
+			drift_badge = "<span class=\"badge badge-state-draining\" title=\"this node runs an agent too old to report its version — roll the latest agent\">agent: update</span>";
+		} else {
+			agent_line = "<span class=\"id\">agent " + esc(av) + "</span>";
+			if (av != WITCHGRID_VERSION) {
+				drift_badge = "<span class=\"badge badge-state-draining\" title=\"agent " + esc(av)
+					+ " ≠ control plane " + esc(WITCHGRID_VERSION) + " — version drift\">drift: agent " + esc(av) + "</span>";
+			}
+		}
+
+		html = html + "<details class=\"node-card\" open data-detail-key=\"node-" + esc(n.node_id) + "\">"
+			+ "<summary class=\"node-card-head\">"
+				+ "<span class=\"node-card-chevron\">›</span>"
+				+ "<div class=\"node-card-id\"><strong>" + esc(n.node_id) + "</strong>"
+					+ "<span class=\"id\">" + esc(n.hostname) + " · " + esc(n.role) + "</span>"
+					+ runtime_line + agent_line + "</div>"
+				+ "<div class=\"node-card-status\">"
+					+ "<span class=\"badge " + state_class + "\">" + esc(state) + "</span>"
+					+ ar_badge
+					+ drift_badge
+					+ "<span class=\"" + age_class + "\">" + n.age_seconds + "s ago</span>"
+				+ "</div>"
+			+ "</summary>"
+			+ "<div class=\"node-card-hw\">";
 
 		// CPU — single line, no bar (we don't probe utilization yet,
 		// just core count). Acts as a separator anchor before the
@@ -284,22 +306,9 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 				+ "</div>"
 				+ render_sparkline(series, g.total_mb, kind);
 
-			// Unmanaged GPU processes on this GPU index. Each emitted
-			// as an amber sub-row so it's obvious that vram is held by
-			// something witchgrid didn't spawn.
-			let umlist = unmanaged?["" + g.index] ?? [];
-			for (u in umlist) {
-				let owner = u?.owner_name ?? "?";
-				let pname = u?.process_name ?? "?";
-				html = html + "<div class=\"hw-row hw-row-sub hw-row-warn\">"
-					+ "<span class=\"hw-name\">↳ unmanaged</span>"
-					+ "<span class=\"hw-fill\">"
-						+ "<code>" + esc(pname) + "</code>"
-						+ " <span class=\"meta\">pid " + u.pid + " · " + esc(owner) + "</span>"
-					+ "</span>"
-					+ "<span class=\"gpu-mem\">" + fmt_mb(u.vram_mb) + "</span>"
-					+ "</div>";
-			}
+			// (Unmanaged GPU procs used to render inline here; they now live
+			// in the unified process list at the bottom of the card, next to
+			// managed services — see node-card-procs below.)
 
 			// Power draw sub-row (NVIDIA only — Apple Metal exposes no
 			// power sensor without sudo, so g.power_draw_w is null and
@@ -355,15 +364,160 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, stale_sec
 			html = html + "<span class=\"empty\">—</span>";
 		}
 
-		// Per-row "options" button → opens the node editor modal.
+		html = html + "</div>";  // close .node-card-hw
+
+		// ── unified process list: managed services + unmanaged procs ───
+		// Both render identically — a <details> row (status · name · GPU ·
+		// port · model, click to expand) — grouped under "services"
+		// (witchgrid-spawned) and "unmanaged" (holding VRAM we didn't
+		// spawn). Keeps the hardware section to bars only and makes the
+		// two process kinds visually consistent.
+		let node_svcs = services_by_node?[n.node_id] ?? [];
+
+		// Flatten unmanaged (keyed by gpu index) into one list, tagging
+		// each with the GPU it was observed on.
+		let um_flat = [];
+		let um_keys = unmanaged.keys();
+		for (uk in um_keys) {
+			for (u in unmanaged[uk]) {
+				u["gpu_index"] = i32(uk);
+				um_flat.push(u);
+			}
+		}
+
+		if (node_svcs.length > 0 || um_flat.length > 0) {
+			html = html + "<div class=\"node-card-procs\">";
+
+			// ── managed services ──
+			if (node_svcs.length > 0) {
+				html = html + "<div class=\"proc-head\">services</div>";
+				for (s in node_svcs) {
+					let alive_cls = "alive-no";
+					let alive_txt = "dead";
+					if (s?.alive) { alive_cls = "alive-yes"; alive_txt = "live"; }
+					else if (s?.state == "failed") { alive_txt = "failed"; }
+
+					let dev = s?.device ?? "";
+					let dev_badge = "";
+					if (dev == "gpu") {
+						let gused = s?.gpus ?? [];
+						let glabel = "GPU";
+						if (gused.length > 0) {
+							glabel = "GPU ";
+							let gi = 0;
+							while (gi < gused.length) {
+								if (gi > 0) { glabel = glabel + ","; }
+								glabel = glabel + gused[gi];
+								gi = gi + 1;
+							}
+						}
+						dev_badge = "<span class=\"badge badge-state-active\">" + glabel + "</span>";
+					} else if (dev == "cpu") { dev_badge = "<span class=\"badge\">CPU</span>"; }
+
+					let mp = s?.model_path ?? "";
+					let model = mp;
+					let mparts = mp.split("/");
+					if (mparts.length > 0) {
+						let tail = mparts[mparts.length - 1];
+						if (tail.length > 0) { model = tail; }
+					}
+
+					let sid = esc(s.id);
+					let log_js  = "showServiceLog('" + sid + "','" + esc(s.profile) + "','" + esc(n.node_id) + "')";
+					let stop_js = "stopService('" + sid + "','" + esc(s.profile) + "','" + esc(n.node_id) + "')";
+
+					html = html + "<details class=\"proc-item\">"
+						+ "<summary class=\"proc-summary\">"
+							+ "<span class=\"proc-dot " + alive_cls + "\">●</span>"
+							+ "<strong class=\"proc-name\">" + esc(s.profile) + "</strong>"
+							+ dev_badge
+							+ "<code class=\"proc-port\">:" + s.port + "</code>"
+							+ "<code class=\"proc-model\">" + esc(model) + "</code>"
+							+ "<span class=\"proc-chevron\">›</span>"
+						+ "</summary>"
+						+ "<div class=\"detail-grid\">"
+							+ "<div><span class=\"dk\">id</span><code>" + esc(s.id.substr(0, 8)) + "…</code></div>"
+							+ "<div><span class=\"dk\">pid</span><code>" + (s?.pid ?? 0) + "</code></div>"
+							+ "<div><span class=\"dk\">device</span>" + (dev_badge == "" ? "<span class=\"meta\">—</span>" : dev_badge) + "</div>"
+							+ "<div><span class=\"dk\">port</span><code>:" + s.port + "</code></div>"
+							+ "<div><span class=\"dk\">state</span><span class=\"" + alive_cls + "\">" + alive_txt + "</span></div>"
+							+ "<div><span class=\"dk\">started</span><span class=\"meta\">" + esc(s?.started_at ?? "—") + "</span></div>"
+							+ "<div class=\"detail-wide\"><span class=\"dk\">model</span><code>" + esc(mp) + "</code></div>"
+							+ "<div class=\"detail-wide svc-actions\">"
+								+ "<button class=\"row-action\" onclick=\"" + log_js + "\">logs</button>"
+								+ "<button class=\"row-action row-action-danger\" onclick=\"" + stop_js + "\">stop</button>"
+							+ "</div>"
+						+ "</div>"
+						+ "</details>";
+				}
+			}
+
+			// ── unmanaged procs ──
+			if (um_flat.length > 0) {
+				html = html + "<div class=\"proc-head\">unmanaged</div>";
+				for (u in um_flat) {
+					let owner = u?.owner_name ?? "?";
+					let pname = u?.process_name ?? "?";
+					let gidx = u?.gpu_index ?? -1;
+					let gpu_badge = "";
+					if (gidx >= 0) { gpu_badge = "<span class=\"badge badge-state-active\">GPU " + gidx + "</span>"; }
+
+					let ports = u?.ports ?? [];
+					let port_str = "";
+					let pi = 0;
+					while (pi < ports.length) {
+						if (pi > 0) { port_str = port_str + ", "; }
+						port_str = port_str + ":" + ports[pi];
+						pi = pi + 1;
+					}
+					let port_badge = "";
+					if (port_str != "") { port_badge = "<code class=\"proc-port\">" + esc(port_str) + "</code>"; }
+
+					html = html + "<details class=\"proc-item proc-unmanaged\">"
+						+ "<summary class=\"proc-summary\">"
+							+ "<span class=\"proc-tag\">unmanaged</span>"
+							+ "<strong class=\"proc-name\">" + esc(pname) + "</strong>"
+							+ gpu_badge
+							+ port_badge
+							+ "<span class=\"meta proc-model\">" + esc(owner) + " · " + fmt_mb(u.vram_mb) + "</span>"
+							+ "<span class=\"proc-chevron\">›</span>"
+						+ "</summary>"
+						+ "<div class=\"detail-grid\">"
+							+ "<div><span class=\"dk\">gpu</span>" + (gpu_badge == "" ? "<span class=\"meta\">—</span>" : gpu_badge) + "</div>"
+							+ "<div><span class=\"dk\">port</span><code>" + (port_str == "" ? "—" : esc(port_str)) + "</code></div>"
+							+ "<div><span class=\"dk\">pid</span><code>" + u.pid + "</code></div>"
+							+ "<div><span class=\"dk\">owner</span>" + esc(owner)
+								+ (u?.owner_uid != null && u.owner_uid >= 0 ? " <span class=\"meta\">(uid " + u.owner_uid + ")</span>" : "") + "</div>"
+							+ "<div><span class=\"dk\">vram</span>" + fmt_mb(u.vram_mb) + "</div>"
+							+ "<div class=\"detail-wide\"><span class=\"dk\">cmdline</span><code>"
+								+ (u?.cmdline != null && u.cmdline != "" ? esc(u.cmdline) : "—") + "</code></div>"
+							+ "<div class=\"detail-wide svc-actions\">"
+								+ ((pname.find("llama-server") >= 0 && u?.cmdline != null && u.cmdline != "")
+									? "<button class=\"row-action\" onclick=\"adoptUnmanaged(this)\" data-node=\""
+										+ esc(n.node_id) + "\" data-cmdline=\"" + esc(u.cmdline) + "\">adopt as profile</button>"
+									: "")
+								+ "<button class=\"row-action row-action-danger\" onclick=\"killUnmanaged('"
+									+ esc(n.node_id) + "'," + u.pid + ")\">kill</button>"
+							+ "</div>"
+						+ "</div>"
+						+ "</details>";
+				}
+			}
+
+			html = html + "</div>";
+		}
+
+		// Per-node "options" button → opens the node editor modal.
 		// Pass current state so the modal pre-selects it.
 		let opts_btn = "<button class=\"row-action\" "
 			+ "onclick=\"editNode('" + esc(n.node_id) + "','" + esc(state) + "')\""
 			+ ">options</button>";
 
-		html = html + "</td><td class=\"row-actions\">" + opts_btn + ar_btn + "</td></tr>\n";
+		html = html
+			+ "<div class=\"node-card-actions\">" + opts_btn + ar_btn + "</div>"
+			+ "</details>\n";
 	}
-	html = html + "</tbody></table>";
+	html = html + "</div>";
 	return html;
 }
 
@@ -620,7 +774,18 @@ export fn render_services(services_data, live_profiles): string {
 		let dev = s?.device ?? "";
 		let dev_badge = "";
 		if (dev == "gpu") {
-			dev_badge = "<span class=\"badge badge-state-active\">GPU</span>";
+			let gused = s?.gpus ?? [];
+			let glabel = "GPU";
+			if (gused.length > 0) {
+				glabel = "GPU ";
+				let gi = 0;
+				while (gi < gused.length) {
+					if (gi > 0) { glabel = glabel + ","; }
+					glabel = glabel + gused[gi];
+					gi = gi + 1;
+				}
+			}
+			dev_badge = "<span class=\"badge badge-state-active\">" + glabel + "</span>";
 		} else if (dev == "cpu") {
 			dev_badge = "<span class=\"badge\">CPU</span>";
 		} else {

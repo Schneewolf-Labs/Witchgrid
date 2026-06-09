@@ -30,7 +30,7 @@
 
 import { open_db, exec, exec as db_exec, query, close_db } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
-import { post_json, post, get, request as http_request, stream as http_stream, request_timeout as http_request_timeout } from "@stdlib/http";
+import { post_json, post, get, request as http_request, stream as http_stream, request_timeout as http_request_timeout, url_encode } from "@stdlib/http";
 import { sleep, time_ms as unix_ms } from "@stdlib/time";
 import { exists, make_dirs, list_dir, remove_file } from "@stdlib/fs";
 import { getenv } from "@stdlib/env";
@@ -38,7 +38,7 @@ import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { WITCHGRID_VERSION } from "../version";
 import { on_shutdown } from "@stdlib/signal";
-import { exit } from "@stdlib/process";
+import { exit, exec_argv } from "@stdlib/process";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
          OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
@@ -186,6 +186,34 @@ fn cp_get(url: string) {
 	if (secret != "") { h.push("Authorization: Bearer " + secret); }
 	return http_request_timeout("GET", url, "", h, CP_AGENT_TIMEOUT_MS);
 }
+// Short-timeout GET for DASHBOARD fan-outs (events/services snapshots).
+// These hit every agent; one slow/just-unreachable node (e.g. a box that
+// fell asleep but is still inside the 90s stale window) would otherwise
+// stall the whole snapshot ~20s on the OS connect timeout — making the
+// dashboard (and the SSE stream every page opens) appear to hang.
+//
+// Uses curl, NOT the lws client: lws's request timeout does NOT bound the
+// TCP connect, so a SYN black-hole still blocks ~20s. curl --connect-timeout
+// caps it hard at 3s. All fan-out callers try/catch, so a connect failure
+// (curl exit 28) just skips that node from the snapshot.
+fn cp_get_fast(url: string): object {
+	let args = ["curl", "-sS", "--connect-timeout", "3", "--max-time", "6",
+		"-w", "\n%{http_code}"];
+	let secret = shared_secret();
+	if (secret != "") { args.push("-H"); args.push("Authorization: Bearer " + secret); }
+	args.push(url);
+	let r = exec_argv(args);
+	if (r.exit_code != 0) { throw "curl exit " + r.exit_code + " for " + url; }
+	let out = r.output;
+	let nl = -1;
+	let i = 0;
+	while (i < out.length) { if (out.substr(i, 1) == "\n") { nl = i; } i = i + 1; }
+	let body = (nl >= 0) ? out.substr(0, nl) : out;
+	let code_str = (nl >= 0) ? out.substr(nl + 1, out.length - nl - 1).trim() : "";
+	let code = 0;
+	try { code = i32(code_str); } catch (e) { code = 0; }
+	return { status_code: code, body: body };
+}
 fn cp_put_json(url: string, data) {
 	let secret = shared_secret();
 	let payload = data;
@@ -219,6 +247,10 @@ fn init_db(db): null {
 	// heartbeat (1/0, null for agents too old to report it). Display +
 	// the toggle endpoint read this; the agent stays the source of truth.
 	try { exec(db, "alter table nodes add column auto_restart integer", []); } catch (e) { }
+	// agent_version: the witchgrid agent build each node runs, mirrored from
+	// register. null = an agent too old to report it (→ "update" hint). Lets
+	// the dashboard surface fleet version drift instead of it being silent.
+	try { exec(db, "alter table nodes add column agent_version text", []); } catch (e) { }
 	// Per-node GGUF catalog. Replaced wholesale on each /register so we
 	// don't accumulate stale entries when an operator deletes a model
 	// from disk. Indexed on alias for the placement-time "which nodes
@@ -269,9 +301,15 @@ fn init_db(db): null {
 		+ "gpu_index integer,"
 		+ "owner_uid integer,"
 		+ "owner_name text,"
+		+ "ports text,"               // JSON array of listening ports (newer agents)
+		+ "cmdline text,"             // full argv (newer agents)
 		+ "observed_at text not null,"
 		+ "primary key (node_id, pid)"
 		+ ")", []);
+	// Migrate pre-existing DBs: add the ports/cmdline columns if absent.
+	// sqlite errors when the column already exists — swallow that.
+	try { exec(db, "alter table node_unmanaged_procs add column ports text", []); } catch (e) { }
+	try { exec(db, "alter table node_unmanaged_procs add column cmdline text", []); } catch (e) { }
 
 	// Profiles. CP-owned now (was baked into agent binaries pre-v0.7).
 	// CRUD via /api/profiles[/{name}]; spawns get the full profile JSON
@@ -468,6 +506,26 @@ fn handle_list_settings(req): object {
 		out[r.key] = { value: r.value, updated_at: r.updated_at };
 	}
 	return { status: 200, body: stringify(out),
+		headers: { "content-type": "application/json" } };
+}
+
+// GET /api/config — unified config snapshot for the settings page:
+// the editable cp_settings plus the read-only, env-derived runtime knobs
+// (bind, auth posture, stale threshold, version). The secret itself is
+// never exposed — only whether auth is on.
+fn handle_get_config(req): object {
+	let settings = {};
+	let rows = query(DB, "select key, value from cp_settings order by key", []);
+	for (r in rows) { settings[r.key] = r.value; }
+	let cfg = {
+		version:            WITCHGRID_VERSION,
+		host:               HOST,
+		port:               PORT,
+		auth_enabled:       shared_secret().length > 0,
+		stale_node_seconds: STALE_NODE_SECONDS,
+		settings:           settings,
+	};
+	return { status: 200, body: stringify(cfg),
 		headers: { "content-type": "application/json" } };
 }
 
@@ -907,16 +965,18 @@ fn handle_register(req): object {
 	// clobbering it to null on every heartbeat.
 	let ar = payload?.auto_restart;
 	let ar_val = (ar == null) ? null : (ar == true ? 1 : 0);
+	let agent_ver = payload?.agent_version;
 	exec(DB,
-		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json, auto_restart) "
-		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json, auto_restart, agent_version) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
 		+ "on conflict(node_id) do update set "
 		+ "hostname=excluded.hostname, role=excluded.role, "
 		+ "hardware_json=excluded.hardware_json, agent_url=excluded.agent_url, "
 		+ "last_seen_at=excluded.last_seen_at, "
 		+ "runtime_json=excluded.runtime_json, "
-		+ "auto_restart=coalesce(excluded.auto_restart, nodes.auto_restart)",
-		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json, ar_val]
+		+ "auto_restart=coalesce(excluded.auto_restart, nodes.auto_restart), "
+		+ "agent_version=coalesce(excluded.agent_version, nodes.agent_version)",
+		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json, ar_val, agent_ver]
 	);
 
 	// Catalog ingest. Replace-all-for-this-node so deleted models drop
@@ -948,13 +1008,18 @@ fn handle_register(req): object {
 		exec(DB, "delete from node_unmanaged_procs where node_id = ?",
 			[node_id]);
 		for (u in unmanaged) {
+			// ports comes as an array from newer agents; persist as JSON.
+			// Older agents omit ports/cmdline → store null (rendered as "—").
+			let ports_json = null;
+			if (u?.ports != null) { ports_json = stringify(u.ports); }
 			exec(DB,
 				"insert into node_unmanaged_procs "
 				+ "(node_id, pid, process_name, vram_mb, gpu_index, "
-				+ " owner_uid, owner_name, observed_at) "
-				+ "values (?, ?, ?, ?, ?, ?, ?, ?)",
+				+ " owner_uid, owner_name, ports, cmdline, observed_at) "
+				+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 				[node_id, u.pid, u.process_name, u.vram_mb,
-				 u?.gpu_index, u?.owner_uid, u?.owner_name, now]);
+				 u?.gpu_index, u?.owner_uid, u?.owner_name,
+				 ports_json, u?.cmdline, now]);
 		}
 	}
 
@@ -1001,7 +1066,7 @@ fn handle_register(req): object {
 fn handle_list_nodes(req): object {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
-		+ "registered_at, last_seen_at, state, runtime_json, auto_restart "
+		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, agent_version "
 		+ "from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
@@ -1022,6 +1087,7 @@ fn handle_list_nodes(req): object {
 			// tri-state: true/false from the agent, null when the agent
 			// predates auto_restart reporting.
 			auto_restart: (row?.auto_restart == null) ? null : (row.auto_restart == 1),
+			agent_version: row?.agent_version,
 		});
 	}
 	return { status: 200, body: stringify(out) };
@@ -1805,6 +1871,74 @@ fn handle_stop_proxy(req): object {
 	}
 }
 
+// POST /unmanaged/kill { node_id, pid } → proxy to the node's agent to
+// SIGTERM an unmanaged process. Best-effort (cross-user kills hit EPERM).
+fn handle_kill_unmanaged_proxy(req): object {
+	let payload = parse(req.body);
+	let pid = payload?.pid;
+	let node_id = payload?.node_id;
+	if (pid == null || node_id == null) {
+		return { status: 400, body: "{\"error\":\"pid+node_id required\"}" };
+	}
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
+	}
+	try {
+		let resp = cp_post_json(agent_url + "/unmanaged/kill", { pid: pid });
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
+// POST /api/scan-dirs { node_id, extra? } → proxy to the node's agent.
+// With `extra` (array) it sets the editable scan dirs (+ rescans); without
+// it, returns the current dirs. (No query-string parsing in the router,
+// so GET-as-POST.)
+fn handle_scan_dirs_proxy(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let node_id = payload?.node_id;
+	if (node_id == null) {
+		return { status: 400, body: "{\"error\":\"node_id required\"}" };
+	}
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
+	}
+	try {
+		if (payload.has("extra")) {
+			let resp = cp_post_json(agent_url + "/scan-dirs", { extra: payload.extra });
+			return { status: resp.status_code, body: resp.body };
+		}
+		let resp = cp_get(agent_url + "/scan-dirs");
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
+// POST /models/delete { node_id, path } → proxy to the node's agent to
+// delete a GGUF from disk (agent guards: .gguf + under a scan dir).
+fn handle_model_delete_proxy(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let node_id = payload?.node_id;
+	let path = payload?.path;
+	if (node_id == null || path == null) {
+		return { status: 400, body: "{\"error\":\"node_id+path required\"}" };
+	}
+	let agent_url = lookup_agent(node_id);
+	if (agent_url == null) {
+		return { status: 404, body: stringify({ error: "no agent for node_id: " + node_id }) };
+	}
+	try {
+		let resp = cp_post_json(agent_url + "/models/delete", { path: path });
+		return { status: resp.status_code, body: resp.body };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "agent unreachable: " + e }) };
+	}
+}
+
 fn handle_list_services(req): object {
 	// Aggregate from every registered agent. Each service is tagged with
 	// its owning node_id so subsequent stop calls know where to route.
@@ -1812,7 +1946,7 @@ fn handle_list_services(req): object {
 	let merged = [];
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) {
@@ -1859,7 +1993,7 @@ fn find_service_for_profile(profile_name: string) {
 	let agents = list_all_agents();
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
 			let entries = parse(resp.body);
 			for (e in entries) {
@@ -2220,7 +2354,7 @@ fn handle_llama_proxy(req): object {
 fn nodes_for_dashboard(): array {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
-		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, "
+		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, agent_version, "
 		+ "cast((julianday('now') - julianday(last_seen_at)) * 86400 as integer) as age_seconds "
 		+ "from nodes order by registered_at desc", []);
 	let out = [];
@@ -2240,7 +2374,29 @@ fn nodes_for_dashboard(): array {
 			state: row?.state ?? "active",
 			runtime: runtime,
 			auto_restart: (row?.auto_restart == null) ? null : (row.auto_restart == 1),
+			agent_version: row?.agent_version,
 		});
+	}
+	return out;
+}
+
+// Fan out to every agent's /services and group the live list by node, so
+// the node cards can show each box's managed services inline under its
+// hardware. Same source the fleet-wide /ui/services panel uses; a dead
+// agent just contributes no entry (its services show as none).
+fn services_by_node(): object {
+	let agents = list_all_agents();
+	let out = {};
+	for (a in agents) {
+		try {
+			let resp = cp_get_fast(a.agent_url + "/services");
+			if (resp.status_code >= 200 && resp.status_code < 300) {
+				let entries = parse(resp.body);
+				let list = [];
+				for (e in entries) { list.push(e); }
+				out[a.node_id] = list;
+			}
+		} catch (e) { }
 	}
 	return out;
 }
@@ -2249,7 +2405,8 @@ fn handle_ui_nodes(req): object {
 	let nodes = nodes_for_dashboard();
 	let samples = samples_for_dashboard(nodes);
 	let unmanaged = unmanaged_by_node();
-	let body = render_nodes(nodes, samples, unmanaged, STALE_NODE_SECONDS);
+	let svcs = services_by_node();
+	let body = render_nodes(nodes, samples, unmanaged, svcs, STALE_NODE_SECONDS);
 	return { status: 200, body: body,
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
@@ -2260,18 +2417,25 @@ fn handle_ui_nodes(req): object {
 //   { node_id → { gpu_index_str → [{pid, process_name, vram_mb, owner_name}, ...] } }
 fn unmanaged_by_node(): object {
 	let rows = query(DB,
-		"select node_id, pid, process_name, vram_mb, gpu_index, owner_name "
+		"select node_id, pid, process_name, vram_mb, gpu_index, owner_name, "
+		+ "owner_uid, ports, cmdline "
 		+ "from node_unmanaged_procs order by vram_mb desc", []);
 	let out = {};
 	for (r in rows) {
 		if (!out.has(r.node_id)) { out[r.node_id] = {}; }
 		let key = "" + (r?.gpu_index ?? -1);
 		if (!out[r.node_id].has(key)) { out[r.node_id][key] = []; }
+		// ports stored as JSON text by newer agents; null/garbage → [].
+		let ports = [];
+		if (r?.ports != null) { try { ports = parse(r.ports); } catch (e) { ports = []; } }
 		out[r.node_id][key].push({
 			pid:          r.pid,
 			process_name: r.process_name,
 			vram_mb:      r.vram_mb,
 			owner_name:   r?.owner_name,
+			owner_uid:    r?.owner_uid,
+			ports:        ports,
+			cmdline:      r?.cmdline,
 		});
 	}
 	return out;
@@ -2286,7 +2450,7 @@ fn handle_ui_services(req): object {
 	let merged = [];
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) {
@@ -2319,7 +2483,7 @@ fn events_snapshot(): object {
 	let svcs = [];
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				for (e in parse(resp.body)) {
 					svcs.push({ id: e.id, profile: e.profile, node: a.node_id,
@@ -2651,6 +2815,30 @@ fn handle_distribute(req): object {
 
 let HF_API_BASE = "https://huggingface.co/api";
 
+// HF API fetches go through curl rather than the in-process http client:
+// lws's TLS client wedges after the first HTTPS request in a process
+// (first request 200, every subsequent one fails instantly), which broke
+// repeated catalog searches. curl opens a fresh connection per call.
+// Args pass via exec_argv (array form, no shell) so the URL can't inject.
+// -w appends "\n<http_code>" so the last line is the status; everything
+// before the final newline is the response body.
+fn hf_get(url: string): object {
+	let r = exec_argv(["curl", "-sSL", "--max-time", "30",
+		"-w", "\n%{http_code}", url]);
+	if (r.exit_code != 0) {
+		throw "curl exit " + r.exit_code + ": " + r.output;
+	}
+	let out = r.output;
+	let nl = -1;
+	let i = 0;
+	while (i < out.length) { if (out.substr(i, 1) == "\n") { nl = i; } i = i + 1; }
+	let body = (nl >= 0) ? out.substr(0, nl) : out;
+	let code_str = (nl >= 0) ? out.substr(nl + 1, out.length - nl - 1).trim() : "";
+	let code = 0;
+	try { code = i32(code_str); } catch (e) { code = 0; }
+	return { status_code: code, body: body };
+}
+
 fn handle_hf_search(req): object {
 	let payload = parse(req?.body ?? "{}");
 	let q = payload?.q;
@@ -2659,9 +2847,12 @@ fn handle_hf_search(req): object {
 	}
 	// HF supports search + filter=gguf to narrow to GGUF-bearing repos.
 	// limit=20 is plenty for a UI picker.
-	let url = HF_API_BASE + "/models?search=" + q + "&filter=gguf&limit=20";
+	// URL-encode the query — unencoded spaces/specials make a malformed
+	// URL that fails instantly (the "HF unreachable" report). Use the
+	// explicit-timeout GET (bare get() carries Hemlock's 5s default).
+	let url = HF_API_BASE + "/models?search=" + url_encode(q) + "&filter=gguf&limit=20";
 	try {
-		let resp = get(url, []);
+		let resp = hf_get(url);
 		if (resp.status_code != 200) {
 			return { status: 502, body: stringify({
 				error: "HF search " + resp.status_code, body: resp.body }) };
@@ -2689,9 +2880,11 @@ fn handle_hf_files(req): object {
 	if (repo == null || repo == "") {
 		return { status: 400, body: stringify({ error: "repo required" })};
 	}
+	// repo is "org/name" — slashes are real path separators, so it goes in
+	// as-is; only the explicit timeout matters here (bare get() = 5s).
 	let url = HF_API_BASE + "/models/" + repo + "/tree/main?recursive=true";
 	try {
-		let resp = get(url, []);
+		let resp = hf_get(url);
 		if (resp.status_code != 200) {
 			return { status: 502, body: stringify({
 				error: "HF tree " + resp.status_code, body: resp.body }) };
@@ -3368,7 +3561,7 @@ fn handle_delete_profile(req): object {
 	let in_use = [];
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let services = parse(resp.body);
 				for (s in services) {
@@ -3474,7 +3667,7 @@ fn compute_stats(): object {
 	let running = 0;
 	for (a in agents) {
 		try {
-			let resp = cp_get(a.agent_url + "/services");
+			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
 				for (e in entries) { if (e?.alive == true) { running = running + 1; } }
@@ -3614,6 +3807,7 @@ fn main(): null {
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
+		{ method: "POST", path: "/unmanaged/kill", handler: handle_kill_unmanaged_proxy },
 		{ method: "GET",  path: "/services/log/", prefix: true, handler: handle_service_log, public: true },
 		// Control-plane location lookup — consumers resolve a profile/
 		// alias to a live llama-server host:port and connect directly
@@ -3626,6 +3820,7 @@ fn main(): null {
 		{ method: "GET",  path: "/transfers",              handler: handle_page_transfers,   public: true },
 		{ method: "GET",  path: "/profiles",               handler: handle_page_profiles,    public: true },
 		{ method: "GET",  path: "/bench",                  handler: handle_page_bench,       public: true },
+		{ method: "GET",  path: "/utilities",              handler: handle_page_bench,       public: true },
 		{ method: "GET",  path: "/deploy",                 handler: handle_page_deploy,      public: true },
 		{ method: "GET",  path: "/settings",               handler: handle_page_settings,    public: true },
 		{ method: "GET",  path: "/assets/styles.css",      handler: handle_dashboard_css,    public: true },
@@ -3651,6 +3846,7 @@ fn main(): null {
 		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2, public: true },
 		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
 		{ method: "GET",  path: "/api/settings",    handler: handle_list_settings,    public: true },
+		{ method: "GET",  path: "/api/config",      handler: handle_get_config,       public: true },
 		{ method: "PUT",  path: "/api/settings",    handler: handle_update_settings },
 		{ method: "GET",  path: "/api/profile-aliases",  handler: handle_list_profile_aliases,   public: true },
 		{ method: "PUT",  path: "/api/profile-aliases",  handler: handle_upsert_profile_alias },
@@ -3661,6 +3857,8 @@ fn main(): null {
 		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog,     public: true },
 		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog,       public: true },
 		{ method: "POST", path: "/models/distribute", handler: handle_distribute },
+		{ method: "POST", path: "/models/delete",   handler: handle_model_delete_proxy },
+		{ method: "POST", path: "/api/scan-dirs",   handler: handle_scan_dirs_proxy },
 		// HF search + pull (slice C4) — operator types a name in the
 		// catalog page, picks a quant, kicks off a transfer to a node.
 		{ method: "POST", path: "/api/hf/search",   handler: handle_hf_search },

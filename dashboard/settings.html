@@ -25,13 +25,13 @@
       <div class="brand">
         <img src="/assets/logo.svg" alt="witchgrid">
         <h1>witchgrid<span class="cursor">_</span></h1>
+        <span id="wg-version" class="meta" style="align-self:flex-end; padding-bottom:0.3rem"></span>
       </div>
       <nav class="page-nav">
         <a href="/">overview</a>
         <a href="/catalog">catalog</a>
-        <a href="/transfers">transfers</a>
         <a href="/profiles">profiles</a>
-        <a href="/bench">bench</a>
+        <a href="/utilities">utilities</a>
         <a href="/deploy">deploy</a>
         <a href="/settings">settings</a>
       </nav>
@@ -40,49 +40,85 @@
       </button>
     </div>
 
-    <section x-data="settingsPage()">
-      <h2>Settings</h2>
-      <p class="meta" style="margin: 0 0 0.75rem 0">
-        Runtime knobs. Changes take effect on the next interval boundary — no CP restart needed.
-      </p>
+    <div x-data="settingsPage()">
+      <section>
+        <h2>sqlite auto-backup</h2>
+        <p class="meta" style="margin: 0 0 0.5rem 0">
+          Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
+          Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
+          Changes take effect on the next interval boundary — no CP restart needed.
+        </p>
 
-      <h3 style="margin-top:1.25rem; font-size:1rem">sqlite auto-backup</h3>
-      <p class="meta" style="margin: 0 0 0.5rem 0">
-        Periodic <code>VACUUM INTO</code> of <code>witchgrid.db</code> into a fresh <code>.bak</code> file.
-        Atomic from sqlite's POV (no torn pages even mid-write). 0 disables the loop.
-      </p>
+        <form class="spawn" @submit.prevent="save()">
+          <div>
+            <label for="bi">interval (minutes)</label>
+            <input id="bi" type="number" x-model="form.db_backup_interval_min" min="0" max="1440">
+          </div>
+          <div>
+            <label for="bd">backup dir</label>
+            <input id="bd" type="text" x-model="form.db_backup_dir" placeholder="./backups">
+          </div>
+          <div>
+            <label for="bk">keep last N</label>
+            <input id="bk" type="number" x-model="form.db_backup_keep" min="1" max="100">
+          </div>
+          <button type="submit" :disabled="busy" x-text="busy ? '…' : 'save'"></button>
 
-      <form class="spawn" @submit.prevent="save()">
-        <div>
-          <label for="bi">interval (minutes)</label>
-          <input id="bi" type="number" x-model="form.db_backup_interval_min" min="0" max="1440">
-        </div>
-        <div>
-          <label for="bd">backup dir</label>
-          <input id="bd" type="text" x-model="form.db_backup_dir" placeholder="./backups">
-        </div>
-        <div>
-          <label for="bk">keep last N</label>
-          <input id="bk" type="number" x-model="form.db_backup_keep" min="1" max="100">
-        </div>
-        <button type="submit" :disabled="busy" x-text="busy ? '…' : 'save'"></button>
+          <p class="msg" :class="msgErr ? 'err' : 'ok'" x-show="msg" x-text="msg"></p>
 
-        <p class="msg" :class="msgErr ? 'err' : 'ok'" x-show="msg" x-text="msg"></p>
+          <div style="grid-column: 1 / -1; padding-top: 0.5rem; border-top: 1px solid var(--border-soft); font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--fg-dim)">
+            <div>last backup: <span x-text="lastAt || '—'"></span></div>
+            <div x-show="lastPath">last path:  <code x-text="lastPath"></code></div>
+          </div>
+        </form>
+      </section>
 
-        <div style="grid-column: 1 / -1; padding-top: 0.5rem; border-top: 1px solid var(--border-soft); font-family: ui-monospace, monospace; font-size: 0.78rem; color: var(--fg-dim)">
-          <div>last backup: <span x-text="lastAt || '—'"></span></div>
-          <div x-show="lastPath">last path:  <code x-text="lastPath"></code></div>
+      <section>
+        <h2>Runtime config</h2>
+        <p class="meta" style="margin: 0 0 0.5rem 0">
+          Read-only — set via environment on the CP (systemd unit / <code>cp.env</code>). Shown here for visibility.
+        </p>
+        <dl class="hw-dl" style="max-width:520px">
+          <dt>version</dt>      <dd><code x-text="cfg.version || '—'"></code></dd>
+          <dt>bind</dt>         <dd><code x-text="(cfg.host || '—') + ':' + (cfg.port ?? '—')"></code></dd>
+          <dt>auth</dt>         <dd>
+            <span class="badge" :class="cfg.auth_enabled ? 'badge-state-active' : 'badge-state-disabled'"
+                  x-text="cfg.auth_enabled ? 'shared-secret' : 'disabled (LAN-trust)'"></span>
+          </dt>
+          <dt>stale after</dt>  <dd><code x-text="(cfg.stale_node_seconds ?? '—') + 's'"></code></dd>
+        </dl>
+      </section>
+
+      <section>
+        <h2>Import / export</h2>
+        <p class="meta" style="margin: 0 0 0.5rem 0">
+          Download the editable config as JSON to back it up or copy to another CP, or upload one to apply it.
+          Import applies recognized keys and skips the rest.
+        </p>
+        <div style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center">
+          <button type="button" class="row-action" @click="exportConfig()">⇩ export config</button>
+          <label class="row-action" style="cursor:pointer">
+            ⇧ import config
+            <input type="file" accept="application/json,.json" @change="importConfig($event)" style="display:none">
+          </label>
         </div>
-      </form>
-    </section>
+        <p class="msg" :class="ioErr ? 'err' : 'ok'" x-show="ioMsg" x-text="ioMsg" style="margin-top:0.5rem"></p>
+      </section>
+    </div>
   </main>
+  <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
+    made with love 💜 by <a href="https://schneewolflabs.com/" target="_blank" rel="noopener" style="color:#a855f7">schneewolf labs</a>
+    <div id="wg-footer-info" class="meta" style="margin-top:0.3rem; font-size:0.72rem"></div>
+  </footer>
 
   <script>
     function settingsPage() {
       return {
         form: { db_backup_interval_min: '0', db_backup_dir: './backups', db_backup_keep: '24' },
         lastAt: '', lastPath: '',
+        cfg: {},                 // /api/config snapshot (runtime + settings)
         busy: false, msg: '', msgErr: false,
+        ioMsg: '', ioErr: false,
         async init() {
           await this.refresh();
         },
@@ -96,6 +132,46 @@
             this.lastAt   = d.db_backup_last_at ? d.db_backup_last_at.value : '';
             this.lastPath = d.db_backup_last_path ? d.db_backup_last_path.value : '';
           } catch (e) { this.msgErr = true; this.msg = 'load failed: ' + e; }
+          try {
+            const rc = await fetch('/api/config');
+            if (rc.ok) this.cfg = await rc.json();
+          } catch (e) { /* runtime panel just shows — */ }
+        },
+        exportConfig() {
+          // Export the editable settings as a flat {key:value} JSON so it
+          // round-trips cleanly through import (PUT /api/settings).
+          const settings = this.cfg.settings || {};
+          const blob = new Blob([JSON.stringify(settings, null, 2)], { type: 'application/json' });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'witchgrid-config.json';
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(a.href);
+        },
+        async importConfig(ev) {
+          const file = ev.target.files && ev.target.files[0];
+          ev.target.value = '';                  // allow re-selecting the same file
+          if (!file) return;
+          this.ioMsg = ''; this.ioErr = false;
+          let data;
+          try { data = JSON.parse(await file.text()); }
+          catch (e) { this.ioErr = true; this.ioMsg = 'invalid JSON: ' + e; return; }
+          // Accept either a flat {k:v} or a {settings:{k:v}} wrapper.
+          const settings = (data && data.settings) ? data.settings : data;
+          try {
+            const r = await fetch('/api/settings', {
+              method: 'PUT',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(settings),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.ioErr = true; this.ioMsg = d.error || ('HTTP ' + r.status); return; }
+            const applied = (d.updated || []);
+            const skipped = Object.keys(settings).filter(k => !applied.includes(k));
+            this.ioMsg = 'imported: ' + (applied.join(', ') || '(none)') +
+                         (skipped.length ? ' · skipped: ' + skipped.join(', ') : '');
+            await this.refresh();
+          } catch (e) { this.ioErr = true; this.ioMsg = 'import failed: ' + e; }
         },
         async save() {
           this.busy = true; this.msg = ''; this.msgErr = false;
