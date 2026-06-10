@@ -99,6 +99,26 @@
         </table>
       </div>
 
+      <p class="meta" x-show="cardLoading" style="margin-top:1rem">loading model card…</p>
+      <div x-show="card" class="hf-card">
+        <template x-if="card && card.image">
+          <img class="hf-card-art" :src="card.image" alt="" loading="lazy" referrerpolicy="no-referrer">
+        </template>
+        <div class="hf-card-meta">
+          <strong class="hf-card-title" x-text="card?.id"></strong>
+          <p class="meta" x-show="card?.summary" x-text="card?.summary"></p>
+          <div class="hf-card-stats">
+            <span class="badge badge-state-active" x-show="card?.pipeline_tag" x-text="card?.pipeline_tag"></span>
+            <span class="badge badge-scan" x-show="card?.license" x-text="'license: ' + (card?.license)"></span>
+            <span class="meta">⬇ <span x-text="(card?.downloads || 0).toLocaleString()"></span></span>
+            <span class="meta">♥ <span x-text="card?.likes || 0"></span></span>
+          </div>
+          <div class="hf-card-tags">
+            <template x-for="t in (card?.tags || [])" :key="t"><span class="badge badge-scan" x-text="t"></span></template>
+          </div>
+        </div>
+      </div>
+
       <div x-show="files.length > 0" style="margin-top:1rem">
         <h3 style="margin:0 0 0.5rem 0">files in <code x-text="selectedRepo"></code></h3>
         <table>
@@ -293,6 +313,7 @@
         q: '',
         repos: [], files: [], nodes: [], targets: {},
         selectedRepo: '',
+        card: null, cardLoading: false,
         searching: false, loadingFiles: false,
         pullingPath: '', pullMsg: '', err: '',
         async init() {
@@ -314,7 +335,7 @@
         },
         async search() {
           if (!this.q.trim()) return;
-          this.searching = true; this.err = ''; this.repos = []; this.files = []; this.selectedRepo = '';
+          this.searching = true; this.err = ''; this.repos = []; this.files = []; this.selectedRepo = ''; this.card = null;
           try {
             const r = await fetch('/api/hf/search', {
               method: 'POST',
@@ -328,8 +349,23 @@
           } catch (e) { this.err = 'error: ' + e; }
           this.searching = false;
         },
+        // Scrape the model-card metadata + (HF-hosted, sanitized) image for
+        // the "album art" panel. Server validates the image source.
+        async loadCard(repoId) {
+          this.card = null; this.cardLoading = true;
+          try {
+            const r = await fetch('/api/hf/card', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ repo: repoId }),
+            });
+            if (r.ok) this.card = await r.json();
+          } catch (e) { /* card is best-effort; files still work */ }
+          this.cardLoading = false;
+        },
         async loadFiles(repoId) {
           this.loadingFiles = true; this.selectedRepo = repoId; this.files = []; this.pullMsg = '';
+          this.loadCard(repoId);   // fire-and-forget; album art fills in
           try {
             const r = await fetch('/api/hf/files', {
               method: 'POST',

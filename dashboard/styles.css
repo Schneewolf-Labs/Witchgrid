@@ -1165,3 +1165,34 @@ p.note-lg { margin: 0 0 0.75rem; }
 }
 .catalog-controls label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; }
 .catalog-controls select { margin: 0; width: auto; }
+
+/* HuggingFace model-card "album art" panel. The image is server-validated
+   (HF host + raster ext only) before it ever reaches this <img>. */
+.hf-card {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+.hf-card-art {
+  flex: 0 0 auto;
+  width: 140px;
+  height: 140px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.hf-card-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+.hf-card-title { font-size: 1rem; color: var(--fg-1); word-break: break-all; }
+.hf-card-meta p { margin: 0; }
+.hf-card-stats { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.hf-card-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+@media (max-width: 640px) {
+  .hf-card { flex-direction: column; }
+  .hf-card-art { width: 100%; height: auto; max-height: 240px; }
+}

@@ -350,6 +350,26 @@ export let CATALOG_HTML = "<!doctype html>
         </table>
       </div>
 
+      <p class=\"meta\" x-show=\"cardLoading\" style=\"margin-top:1rem\">loading model card…</p>
+      <div x-show=\"card\" class=\"hf-card\">
+        <template x-if=\"card && card.image\">
+          <img class=\"hf-card-art\" :src=\"card.image\" alt=\"\" loading=\"lazy\" referrerpolicy=\"no-referrer\">
+        </template>
+        <div class=\"hf-card-meta\">
+          <strong class=\"hf-card-title\" x-text=\"card?.id\"></strong>
+          <p class=\"meta\" x-show=\"card?.summary\" x-text=\"card?.summary\"></p>
+          <div class=\"hf-card-stats\">
+            <span class=\"badge badge-state-active\" x-show=\"card?.pipeline_tag\" x-text=\"card?.pipeline_tag\"></span>
+            <span class=\"badge badge-scan\" x-show=\"card?.license\" x-text=\"'license: ' + (card?.license)\"></span>
+            <span class=\"meta\">⬇ <span x-text=\"(card?.downloads || 0).toLocaleString()\"></span></span>
+            <span class=\"meta\">♥ <span x-text=\"card?.likes || 0\"></span></span>
+          </div>
+          <div class=\"hf-card-tags\">
+            <template x-for=\"t in (card?.tags || [])\" :key=\"t\"><span class=\"badge badge-scan\" x-text=\"t\"></span></template>
+          </div>
+        </div>
+      </div>
+
       <div x-show=\"files.length > 0\" style=\"margin-top:1rem\">
         <h3 style=\"margin:0 0 0.5rem 0\">files in <code x-text=\"selectedRepo\"></code></h3>
         <table>
@@ -544,6 +564,7 @@ export let CATALOG_HTML = "<!doctype html>
         q: '',
         repos: [], files: [], nodes: [], targets: {},
         selectedRepo: '',
+        card: null, cardLoading: false,
         searching: false, loadingFiles: false,
         pullingPath: '', pullMsg: '', err: '',
         async init() {
@@ -565,7 +586,7 @@ export let CATALOG_HTML = "<!doctype html>
         },
         async search() {
           if (!this.q.trim()) return;
-          this.searching = true; this.err = ''; this.repos = []; this.files = []; this.selectedRepo = '';
+          this.searching = true; this.err = ''; this.repos = []; this.files = []; this.selectedRepo = ''; this.card = null;
           try {
             const r = await fetch('/api/hf/search', {
               method: 'POST',
@@ -579,8 +600,23 @@ export let CATALOG_HTML = "<!doctype html>
           } catch (e) { this.err = 'error: ' + e; }
           this.searching = false;
         },
+        // Scrape the model-card metadata + (HF-hosted, sanitized) image for
+        // the \"album art\" panel. Server validates the image source.
+        async loadCard(repoId) {
+          this.card = null; this.cardLoading = true;
+          try {
+            const r = await fetch('/api/hf/card', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ repo: repoId }),
+            });
+            if (r.ok) this.card = await r.json();
+          } catch (e) { /* card is best-effort; files still work */ }
+          this.cardLoading = false;
+        },
         async loadFiles(repoId) {
           this.loadingFiles = true; this.selectedRepo = repoId; this.files = []; this.pullMsg = '';
+          this.loadCard(repoId);   // fire-and-forget; album art fills in
           try {
             const r = await fetch('/api/hf/files', {
               method: 'POST',
@@ -3112,6 +3148,37 @@ p.note-lg { margin: 0 0 0.75rem; }
 }
 .catalog-controls label { display: inline-flex; align-items: center; gap: 0.35rem; margin: 0; }
 .catalog-controls select { margin: 0; width: auto; }
+
+/* HuggingFace model-card \"album art\" panel. The image is server-validated
+   (HF host + raster ext only) before it ever reaches this <img>. */
+.hf-card {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+.hf-card-art {
+  flex: 0 0 auto;
+  width: 140px;
+  height: 140px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+}
+.hf-card-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.45rem; }
+.hf-card-title { font-size: 1rem; color: var(--fg-1); word-break: break-all; }
+.hf-card-meta p { margin: 0; }
+.hf-card-stats { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.hf-card-tags { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+@media (max-width: 640px) {
+  .hf-card { flex-direction: column; }
+  .hf-card-art { width: 100%; height: auto; max-height: 240px; }
+}
 ";
 
 export let DASHBOARD_JS = "// Witchgrid dashboard JS — Alpine.js components + small UX glue.
