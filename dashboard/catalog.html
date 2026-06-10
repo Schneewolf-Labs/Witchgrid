@@ -211,7 +211,7 @@
          x-text="q ? 'no models match “' + q + '”' : 'No models in any node catalog. Set WITCHGRID_MODEL_DIR on an agent.'"></p>
       <div class="node-card-procs" style="border-top:none; margin-top:0; padding-top:0" x-show="filtered.length > 0">
         <template x-for="m in filtered" :key="m.alias">
-          <details class="proc-item">
+          <details class="proc-item" @toggle="$event.target.open && loadModelCard(m)">
             <summary class="proc-summary">
               <strong class="proc-name" x-text="m.alias"></strong>
               <span class="badge badge-scan" x-text="m.architecture || '?'"></span>
@@ -219,6 +219,18 @@
               <span class="meta proc-model" x-text="(m.on_nodes ? m.on_nodes.length : 0) + ' node' + ((m.on_nodes && m.on_nodes.length === 1) ? '' : 's')"></span>
               <span class="proc-chevron">›</span>
             </summary>
+            <template x-if="modelCards[m.alias] && modelCards[m.alias].image">
+              <div class="hf-card" style="margin:0 0 0.6rem">
+                <img class="hf-card-art" style="width:96px; height:96px" :src="modelCards[m.alias].image" alt="" loading="lazy" referrerpolicy="no-referrer">
+                <div class="hf-card-meta">
+                  <span class="meta" x-show="modelCards[m.alias].summary" x-text="modelCards[m.alias].summary"></span>
+                  <div class="hf-card-stats">
+                    <span class="meta" x-show="modelCards[m.alias].likes">♥ <span x-text="modelCards[m.alias].likes"></span></span>
+                    <span class="meta" x-show="modelCards[m.alias].downloads">⬇ <span x-text="(modelCards[m.alias].downloads||0).toLocaleString()"></span></span>
+                  </div>
+                </div>
+              </div>
+            </template>
             <div class="detail-grid">
               <div><span class="dk">name</span><span x-text="m.general_name || '—'"></span></div>
               <div><span class="dk">arch</span><code x-text="m.architecture || '—'"></code></div>
@@ -446,7 +458,7 @@
     function catalogBrowser() {
       return {
         models: [], nodes: [], profiles: {}, q: '', sortBy: 'alias', archFilter: '', loading: true,
-        copyTo: {}, msg: {}, spawnSel: {}, spawnMsg: {},
+        copyTo: {}, msg: {}, spawnSel: {}, spawnMsg: {}, modelCards: {},
         async init() {
           await this.load();
           setInterval(() => this.load(), 15000);
@@ -533,6 +545,30 @@
         fmtSize(mb) {
           if (mb == null) return '—';
           return mb >= 1024 ? (mb / 1024).toFixed(1) + ' GB' : mb + ' MB';
+        },
+
+        // Derive the HF repo (org/name) from a catalog model's source_url.
+        hfRepoFor(m) {
+          const u = m.source_url || '';
+          const i = u.indexOf('huggingface.co/');
+          if (i < 0) return null;
+          let rest = u.slice(i + 'huggingface.co/'.length)
+            .replace(/\/(tree|resolve|blob)\/.*$/, '').replace(/\/+$/, '');
+          const p = rest.split('/');
+          return (p.length >= 2 && p[0] && p[1]) ? p[0] + '/' + p[1] : null;
+        },
+        // Lazy-load + cache the model card (album art) when a row expands.
+        // Server caches the scrape, so repeat expands are instant.
+        loadModelCard(m) {
+          const repo = this.hfRepoFor(m);
+          if (!repo || this.modelCards[m.alias] !== undefined) return;
+          this.modelCards[m.alias] = null;   // mark in-flight
+          fetch('/api/hf/card', {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ repo }),
+          }).then(r => r.ok ? r.json() : null)
+            .then(c => { this.modelCards[m.alias] = c; })
+            .catch(() => {});
         },
 
         // ── quant suggestions: strip the quant tag to a base model name,

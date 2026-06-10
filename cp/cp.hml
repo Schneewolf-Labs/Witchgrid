@@ -372,6 +372,15 @@ fn init_db(db): null {
 		+ "updated_at text not null"
 		+ ")", []);
 
+	// Cache of scraped HF model cards (metadata + validated image URL), so
+	// browsing/expanding the same repo doesn't re-hit HuggingFace each time.
+	// Keyed by repo; refreshed when older than the TTL (see handle_hf_card).
+	exec(db, "create table if not exists hf_card_cache ("
+		+ "repo text primary key,"
+		+ "card_json text not null,"
+		+ "fetched_at text not null"
+		+ ")", []);
+
 	seed_default_profiles(db);
 	seed_default_settings(db);
 	reap_stale_bench_runs(db);
@@ -3047,6 +3056,14 @@ fn handle_hf_card(req): object {
 	if (!valid_hf_repo(repo)) {
 		return { status: 400, body: stringify({ error: "invalid repo" }) };
 	}
+	// Cache hit (fresh within 14d) → serve the stored card, no HF round-trip.
+	let cached = query(DB,
+		"select card_json from hf_card_cache where repo = ? "
+		+ "and fetched_at > datetime('now', '-14 days')", [repo]);
+	if (cached.length > 0) {
+		return { status: 200, body: cached[0].card_json,
+			headers: { "content-type": "application/json" } };
+	}
 	let meta = {};
 	try {
 		let resp = hf_get(HF_API_BASE + "/models/" + repo);
@@ -3069,7 +3086,7 @@ fn handle_hf_card(req): object {
 			summary = card_summary(rr.body);
 		}
 	} catch (e) { }
-	return { status: 200, body: stringify({
+	let card = stringify({
 		id: repo,
 		downloads: meta?.downloads ?? 0,
 		likes: meta?.likes ?? 0,
@@ -3078,7 +3095,12 @@ fn handle_hf_card(req): object {
 		tags: disp_tags,
 		summary: summary,
 		image: image,
-	}) };
+	});
+	exec(DB,
+		"insert into hf_card_cache (repo, card_json, fetched_at) values (?, ?, ?) "
+		+ "on conflict(repo) do update set card_json=excluded.card_json, fetched_at=excluded.fetched_at",
+		[repo, card, iso_now()]);
+	return { status: 200, body: card, headers: { "content-type": "application/json" } };
 }
 
 // Default alias for a freshly-pulled HF file: filename minus `.gguf`,
