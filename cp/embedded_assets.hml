@@ -331,14 +331,34 @@ export let CATALOG_HTML = "<!doctype html>
         <p class=\"msg err\" x-show=\"err\" x-text=\"err\"></p>
       </form>
 
+      <div class=\"catalog-controls\" style=\"margin-top:0.4rem\">
+        <span class=\"meta\">discover</span>
+        <label class=\"meta\">sort
+          <select x-model=\"discoverSort\">
+            <option value=\"trending\">trending</option>
+            <option value=\"newest\">newest</option>
+            <option value=\"likes\">most liked</option>
+            <option value=\"downloads\">most downloaded</option>
+          </select>
+        </label>
+        <label class=\"meta\">from
+          <select x-model=\"discoverAuthor\">
+            <option value=\"\">anyone</option>
+            <template x-for=\"a in trustedAuthors\" :key=\"a\"><option :value=\"a\" x-text=\"a\"></option></template>
+          </select>
+        </label>
+        <button type=\"button\" class=\"row-action\" @click=\"discover()\" :disabled=\"discovering\" x-text=\"discovering ? '…' : 'discover'\"></button>
+        <span class=\"meta\">trusted authors set in <a href=\"/settings\">settings</a></span>
+      </div>
+
       <div x-show=\"repos.length > 0\" style=\"margin-top:1rem\">
         <table>
           <thead><tr><th>repo</th><th>downloads</th><th>likes</th><th></th></tr></thead>
           <tbody>
             <template x-for=\"r in repos\" :key=\"r.id\">
               <tr :class=\"r.id === selectedRepo ? 'row-selected' : ''\">
-                <td><code x-text=\"r.id\"></code></td>
-                <td><span class=\"meta\" x-text=\"r.downloads.toLocaleString()\"></span></td>
+                <td><code x-text=\"r.id\"></code> <span x-show=\"r.trusted\" class=\"badge badge-state-active\" title=\"trusted quanter\">trusted</span></td>
+                <td><span class=\"meta\" x-text=\"(r.downloads||0).toLocaleString()\"></span></td>
                 <td><span class=\"meta\" x-text=\"r.likes\"></span></td>
                 <td><button type=\"button\" class=\"row-action\"
                             @click=\"loadFiles(r.id)\"
@@ -577,6 +597,7 @@ export let CATALOG_HTML = "<!doctype html>
         repos: [], files: [], nodes: [], targets: {},
         selectedRepo: '',
         card: null, cardLoading: false,
+        discoverSort: 'trending', discoverAuthor: '', trustedAuthors: [], discovering: false,
         searching: false, loadingFiles: false,
         pullingPath: '', pullMsg: '', err: '',
         async init() {
@@ -584,12 +605,37 @@ export let CATALOG_HTML = "<!doctype html>
             const r = await fetch('/nodes');
             this.nodes = (await r.json()).filter(n => (n.state || 'active') !== 'disabled');
           } catch (e) { /* nodes optional for search */ }
+          try {
+            const rc = await fetch('/api/config');
+            if (rc.ok) {
+              const cfg = await rc.json();
+              this.trustedAuthors = (cfg.hf_trusted_authors || '').split(',').map(s => s.trim()).filter(Boolean);
+            }
+          } catch (e) { /* discover author filter just won't list trusted handles */ }
           // \"find other quants\" hand-off from a catalog model: prefill the
           // search with the base model name and run it (repos = sources).
           window.addEventListener('wg-find-quants', (e) => {
             this.q = (e.detail && e.detail.base) || '';
             if (this.q) this.search();
           });
+        },
+        // Discover: top GGUF repos by sort, optionally from one trusted author.
+        // Populates the same `repos` list the search uses → reuses the whole
+        // list-files → card-art → pull flow.
+        async discover() {
+          this.discovering = true; this.err = '';
+          this.repos = []; this.files = []; this.selectedRepo = ''; this.card = null;
+          try {
+            const r = await fetch('/api/hf/discover', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sort: this.discoverSort, author: this.discoverAuthor }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.err = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else if (d.length === 0) { this.err = 'no models found'; }
+            else { this.repos = d; }
+          } catch (e) { this.err = 'error: ' + e; }
+          this.discovering = false;
         },
         // Extract the quant tag from a GGUF filename (Q4_K_M, IQ4_XS, F16…).
         ggufQuant(path) {
@@ -1923,6 +1969,22 @@ export let SETTINGS_HTML = "<!doctype html>
         </div>
         <p class=\"msg\" :class=\"ioErr ? 'err' : 'ok'\" x-show=\"ioMsg\" x-text=\"ioMsg\" style=\"margin-top:0.5rem\"></p>
       </section>
+
+      <section>
+        <h2>Trusted HuggingFace authors</h2>
+        <p class=\"meta note\">
+          Comma-separated HF org/user handles you trust for GGUF quants. Drives the
+          catalog <strong>Discover</strong> filter and the \"trusted\" badge on results.
+        </p>
+        <form class=\"spawn\" @submit.prevent=\"saveTrusted()\">
+          <div style=\"grid-column: 1 / -1\">
+            <label for=\"ta\">trusted authors</label>
+            <input id=\"ta\" type=\"text\" x-model=\"trusted\" placeholder=\"bartowski,mradermacher,unsloth,…\">
+          </div>
+          <button type=\"submit\" :disabled=\"trustedBusy\" x-text=\"trustedBusy ? '…' : 'save'\"></button>
+          <p class=\"msg\" :class=\"trustedErr ? 'err' : 'ok'\" x-show=\"trustedMsg\" x-text=\"trustedMsg\"></p>
+        </form>
+      </section>
     </div>
   </main>
   <footer style=\"text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)\">
@@ -1938,6 +2000,7 @@ export let SETTINGS_HTML = "<!doctype html>
         cfg: {},                 // /api/config snapshot (runtime + settings)
         busy: false, msg: '', msgErr: false,
         ioMsg: '', ioErr: false,
+        trusted: '', trustedBusy: false, trustedMsg: '', trustedErr: false,
         async init() {
           await this.refresh();
         },
@@ -1953,8 +2016,23 @@ export let SETTINGS_HTML = "<!doctype html>
           } catch (e) { this.msgErr = true; this.msg = 'load failed: ' + e; }
           try {
             const rc = await fetch('/api/config');
-            if (rc.ok) this.cfg = await rc.json();
+            if (rc.ok) { this.cfg = await rc.json(); this.trusted = this.cfg.hf_trusted_authors || ''; }
           } catch (e) { /* runtime panel just shows — */ }
+        },
+        async saveTrusted() {
+          this.trustedBusy = true; this.trustedMsg = ''; this.trustedErr = false;
+          // normalize: trim handles, drop blanks
+          const list = this.trusted.split(',').map(s => s.trim()).filter(Boolean).join(',');
+          try {
+            const r = await fetch('/api/settings', {
+              method: 'PUT', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ hf_trusted_authors: list }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.trustedErr = true; this.trustedMsg = d.error || ('HTTP ' + r.status); }
+            else { this.trusted = list; this.trustedMsg = 'saved'; }
+          } catch (e) { this.trustedErr = true; this.trustedMsg = 'save failed: ' + e; }
+          this.trustedBusy = false;
         },
         exportConfig() {
           // Export the editable settings as a flat {key:value} JSON so it

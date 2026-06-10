@@ -405,6 +405,9 @@ fn seed_default_settings(db): null {
 		// dashboard so operators can see the loop is alive.
 		{ k: "db_backup_last_at",      v: "" },
 		{ k: "db_backup_last_path",    v: "" },
+		// Trusted HuggingFace quant authors — drives the catalog discovery
+		// filter. Comma-separated org/user handles.
+		{ k: "hf_trusted_authors",     v: "bartowski,mradermacher,TheBloke,unsloth,QuantFactory,lmstudio-community" },
 	];
 	for (d in defaults) {
 		exec(db,
@@ -532,6 +535,7 @@ fn handle_get_config(req): object {
 		port:               PORT,
 		auth_enabled:       shared_secret().length > 0,
 		stale_node_seconds: STALE_NODE_SECONDS,
+		hf_trusted_authors: setting_get("hf_trusted_authors", ""),
 		settings:           settings,
 	};
 	return { status: 200, body: stringify(cfg),
@@ -542,7 +546,7 @@ fn handle_get_config(req): object {
 // values stored as strings; consumers parse to their own type.
 // Allowed keys gated by an explicit allowlist so the operator can't
 // accidentally set arbitrary keys (and to make removal safe later).
-let SETTING_KEYS_ALLOWED = ["db_backup_interval_min", "db_backup_dir", "db_backup_keep"];
+let SETTING_KEYS_ALLOWED = ["db_backup_interval_min", "db_backup_dir", "db_backup_keep", "hf_trusted_authors"];
 
 fn handle_update_settings(req): object {
 	let payload = parse(req?.body ?? "{}");
@@ -3103,6 +3107,72 @@ fn handle_hf_card(req): object {
 	return { status: 200, body: card, headers: { "content-type": "application/json" } };
 }
 
+fn valid_hf_author(a): bool {
+	if (a == null || a.length == 0 || a.length > 60) { return false; }
+	let i = 0;
+	while (i < a.length) {
+		let c = a.substr(i, 1);
+		let ok = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z")
+			|| (c >= "0" && c <= "9") || c == "-" || c == "_" || c == ".";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// POST /api/hf/discover { sort, author? } → top GGUF repos by trending /
+// newest / likes / downloads, optionally scoped to one author. Marks each
+// result trusted=true if its author is in the configured trusted list.
+// sort + author are allowlisted/char-validated before hitting the API.
+fn handle_hf_discover(req): object {
+	let payload = parse(req?.body ?? "{}");
+	let sort_in = payload?.sort ?? "trending";
+	let sort = "trendingScore";
+	if (sort_in == "newest") { sort = "createdAt"; }
+	else if (sort_in == "likes") { sort = "likes"; }
+	else if (sort_in == "downloads") { sort = "downloads"; }
+	let url = HF_API_BASE + "/models?filter=gguf&sort=" + sort + "&direction=-1&limit=24";
+	let author = payload?.author;
+	if (author != null && author != "") {
+		if (!valid_hf_author(author)) {
+			return { status: 400, body: stringify({ error: "invalid author" }) };
+		}
+		url = url + "&author=" + author;
+	}
+	// trusted set from settings
+	let trusted = {};
+	let csv = setting_get("hf_trusted_authors", "");
+	for (a in csv.split(",")) {
+		let aa = a.trim().to_lower();
+		if (aa != "") { trusted[aa] = true; }
+	}
+	try {
+		let resp = hf_get(url);
+		if (resp.status_code != 200) {
+			return { status: 502, body: stringify({ error: "HF discover " + resp.status_code }) };
+		}
+		let raw = parse(resp.body);
+		let out = [];
+		for (m in raw) {
+			let id = m?.id ?? "";
+			let auth = "";
+			let sl = id.find("/");
+			if (sl > 0) { auth = id.substr(0, sl); }
+			out.push({
+				id:        id,
+				author:    auth,
+				downloads: m?.downloads ?? 0,
+				likes:     m?.likes ?? 0,
+				updated:   m?.lastModified,
+				trusted:   trusted.has(auth.to_lower()),
+			});
+		}
+		return { status: 200, body: stringify(out) };
+	} catch (e) {
+		return { status: 502, body: stringify({ error: "HF unreachable: " + e }) };
+	}
+}
+
 // Default alias for a freshly-pulled HF file: filename minus `.gguf`,
 // lowercased, dashes for underscores. Operator can override in the
 // pull body. Sharded files (`…-00001-of-00003.gguf`) lose the shard
@@ -4056,6 +4126,7 @@ fn main(): null {
 		{ method: "POST", path: "/api/hf/search",   handler: handle_hf_search },
 		{ method: "POST", path: "/api/hf/files",    handler: handle_hf_files },
 		{ method: "POST", path: "/api/hf/card",     handler: handle_hf_card },
+		{ method: "POST", path: "/api/hf/discover", handler: handle_hf_discover },
 		{ method: "POST", path: "/models/pull_hf",  handler: handle_pull_hf },
 		{ method: "POST", path: "/api/placement_preview", handler: handle_placement_preview, public: true },
 		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   public: true },

@@ -104,6 +104,22 @@
         </div>
         <p class="msg" :class="ioErr ? 'err' : 'ok'" x-show="ioMsg" x-text="ioMsg" style="margin-top:0.5rem"></p>
       </section>
+
+      <section>
+        <h2>Trusted HuggingFace authors</h2>
+        <p class="meta note">
+          Comma-separated HF org/user handles you trust for GGUF quants. Drives the
+          catalog <strong>Discover</strong> filter and the "trusted" badge on results.
+        </p>
+        <form class="spawn" @submit.prevent="saveTrusted()">
+          <div style="grid-column: 1 / -1">
+            <label for="ta">trusted authors</label>
+            <input id="ta" type="text" x-model="trusted" placeholder="bartowski,mradermacher,unsloth,…">
+          </div>
+          <button type="submit" :disabled="trustedBusy" x-text="trustedBusy ? '…' : 'save'"></button>
+          <p class="msg" :class="trustedErr ? 'err' : 'ok'" x-show="trustedMsg" x-text="trustedMsg"></p>
+        </form>
+      </section>
     </div>
   </main>
   <footer style="text-align:center; padding:1.5rem; font-size:0.82rem; color:var(--fg-dim)">
@@ -119,6 +135,7 @@
         cfg: {},                 // /api/config snapshot (runtime + settings)
         busy: false, msg: '', msgErr: false,
         ioMsg: '', ioErr: false,
+        trusted: '', trustedBusy: false, trustedMsg: '', trustedErr: false,
         async init() {
           await this.refresh();
         },
@@ -134,8 +151,23 @@
           } catch (e) { this.msgErr = true; this.msg = 'load failed: ' + e; }
           try {
             const rc = await fetch('/api/config');
-            if (rc.ok) this.cfg = await rc.json();
+            if (rc.ok) { this.cfg = await rc.json(); this.trusted = this.cfg.hf_trusted_authors || ''; }
           } catch (e) { /* runtime panel just shows — */ }
+        },
+        async saveTrusted() {
+          this.trustedBusy = true; this.trustedMsg = ''; this.trustedErr = false;
+          // normalize: trim handles, drop blanks
+          const list = this.trusted.split(',').map(s => s.trim()).filter(Boolean).join(',');
+          try {
+            const r = await fetch('/api/settings', {
+              method: 'PUT', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ hf_trusted_authors: list }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.trustedErr = true; this.trustedMsg = d.error || ('HTTP ' + r.status); }
+            else { this.trusted = list; this.trustedMsg = 'saved'; }
+          } catch (e) { this.trustedErr = true; this.trustedMsg = 'save failed: ' + e; }
+          this.trustedBusy = false;
         },
         exportConfig() {
           // Export the editable settings as a flat {key:value} JSON so it

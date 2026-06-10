@@ -80,14 +80,34 @@
         <p class="msg err" x-show="err" x-text="err"></p>
       </form>
 
+      <div class="catalog-controls" style="margin-top:0.4rem">
+        <span class="meta">discover</span>
+        <label class="meta">sort
+          <select x-model="discoverSort">
+            <option value="trending">trending</option>
+            <option value="newest">newest</option>
+            <option value="likes">most liked</option>
+            <option value="downloads">most downloaded</option>
+          </select>
+        </label>
+        <label class="meta">from
+          <select x-model="discoverAuthor">
+            <option value="">anyone</option>
+            <template x-for="a in trustedAuthors" :key="a"><option :value="a" x-text="a"></option></template>
+          </select>
+        </label>
+        <button type="button" class="row-action" @click="discover()" :disabled="discovering" x-text="discovering ? '…' : 'discover'"></button>
+        <span class="meta">trusted authors set in <a href="/settings">settings</a></span>
+      </div>
+
       <div x-show="repos.length > 0" style="margin-top:1rem">
         <table>
           <thead><tr><th>repo</th><th>downloads</th><th>likes</th><th></th></tr></thead>
           <tbody>
             <template x-for="r in repos" :key="r.id">
               <tr :class="r.id === selectedRepo ? 'row-selected' : ''">
-                <td><code x-text="r.id"></code></td>
-                <td><span class="meta" x-text="r.downloads.toLocaleString()"></span></td>
+                <td><code x-text="r.id"></code> <span x-show="r.trusted" class="badge badge-state-active" title="trusted quanter">trusted</span></td>
+                <td><span class="meta" x-text="(r.downloads||0).toLocaleString()"></span></td>
                 <td><span class="meta" x-text="r.likes"></span></td>
                 <td><button type="button" class="row-action"
                             @click="loadFiles(r.id)"
@@ -326,6 +346,7 @@
         repos: [], files: [], nodes: [], targets: {},
         selectedRepo: '',
         card: null, cardLoading: false,
+        discoverSort: 'trending', discoverAuthor: '', trustedAuthors: [], discovering: false,
         searching: false, loadingFiles: false,
         pullingPath: '', pullMsg: '', err: '',
         async init() {
@@ -333,12 +354,37 @@
             const r = await fetch('/nodes');
             this.nodes = (await r.json()).filter(n => (n.state || 'active') !== 'disabled');
           } catch (e) { /* nodes optional for search */ }
+          try {
+            const rc = await fetch('/api/config');
+            if (rc.ok) {
+              const cfg = await rc.json();
+              this.trustedAuthors = (cfg.hf_trusted_authors || '').split(',').map(s => s.trim()).filter(Boolean);
+            }
+          } catch (e) { /* discover author filter just won't list trusted handles */ }
           // "find other quants" hand-off from a catalog model: prefill the
           // search with the base model name and run it (repos = sources).
           window.addEventListener('wg-find-quants', (e) => {
             this.q = (e.detail && e.detail.base) || '';
             if (this.q) this.search();
           });
+        },
+        // Discover: top GGUF repos by sort, optionally from one trusted author.
+        // Populates the same `repos` list the search uses → reuses the whole
+        // list-files → card-art → pull flow.
+        async discover() {
+          this.discovering = true; this.err = '';
+          this.repos = []; this.files = []; this.selectedRepo = ''; this.card = null;
+          try {
+            const r = await fetch('/api/hf/discover', {
+              method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ sort: this.discoverSort, author: this.discoverAuthor }),
+            });
+            const d = await r.json();
+            if (!r.ok) { this.err = 'error: ' + (d.error || 'HTTP ' + r.status); }
+            else if (d.length === 0) { this.err = 'no models found'; }
+            else { this.repos = d; }
+          } catch (e) { this.err = 'error: ' + e; }
+          this.discovering = false;
         },
         // Extract the quant tag from a GGUF filename (Q4_K_M, IQ4_XS, F16…).
         ggufQuant(path) {
