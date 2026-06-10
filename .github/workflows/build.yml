@@ -54,8 +54,28 @@ on:
 #           0-/1-arg handlers both run. Activates the CP's graceful
 #           WAL-checkpoint-on-shutdown (dormant on 2.6.0/2.6.1). (2.6.1 was
 #           released before the fix landed; skip straight to 2.6.2.)
+#   2.7.0 — language/networking parity batch; load-bearing for us:
+#           1. HTTP client hardening: requests with CR/LF in custom headers
+#              are rejected (header-injection / request-splitting), and URL
+#              ports are validated to 1-65535. Tightens the inference proxy's
+#              forwarding path.
+#           2. HTTPS context leak + timeout-misreport fix in
+#              http_request/*_timeout (every HTTPS call leaked an lws context;
+#              a request completing on the final poll was misreported as a
+#              timeout). We still curl out for HF/fan-out (robust + bounds the
+#              TCP connect), but this de-risks any in-process HTTPS we add back.
+#           3. Socket I/O now retries EINTR instead of throwing a spurious
+#              "Interrupted system call" — matters because CP+agent install
+#              @stdlib/signal handlers and a signal mid-accept/recv used to
+#              surface as an error.
+#           4. Interpreter UAF passing sockets to spawn() + websocket/type-
+#              registry refcount/race fixes — stabilizes `hemlock tests/run.hml`
+#              (the suite runs interpreted; prod binaries are compiled).
+#           BEHAVIORAL: string.find() now returns a CODEPOINT index (was a
+#           byte index); our path/URL parsing is ASCII so unaffected, and the
+#           unit+integration suites pass clean on 2.7.0.
 env:
-  HEMLOCK_VERSION: 2.6.2
+  HEMLOCK_VERSION: 2.7.0
 
 jobs:
   build:

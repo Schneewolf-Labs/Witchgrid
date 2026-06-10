@@ -19,7 +19,7 @@ AGENT_BIN="${AGENT_BIN:-$ROOT/agent/witchgrid-agent}"
 FAKE="$ROOT/tests/integration/fake_llama_server.py"
 MODEL="$ROOT/tests/fixtures/nemo_llama.gguf"   # a valid GGUF for any metadata read
 
-CP_PORT=8765                                    # default bind (override: WITCHGRID_CP_PORT)
+CP_PORT="${CP_PORT:-8765}"                      # default bind (override: CP_PORT=… to dodge a live CP)
 AGENT_PORT="${AGENT_PORT:-8766}"
 NODE_ID="test-agent"
 SVC_PORT=18950
@@ -27,7 +27,7 @@ HEARTBEAT_SECS=1                                # fast agent heartbeat (liveness
 STALE_SECS=4                                    # CP evicts a silent node after ~4x heartbeat
 CP_URL="http://127.0.0.1:${CP_PORT}"
 AGENT_URL="http://127.0.0.1:${AGENT_PORT}"
-AGENT2_PORT=8767                                # 2nd agent for the multi-node test (#2)
+AGENT2_PORT="${AGENT2_PORT:-8767}"             # 2nd agent for the multi-node test (#2)
 NODE_ID2="test-agent-2"
 AGENT2_URL="http://127.0.0.1:${AGENT2_PORT}"
 

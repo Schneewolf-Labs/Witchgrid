@@ -2756,6 +2756,12 @@ fn handle_distribute(req): object {
 			error: "alias + target_node required",
 		})};
 	}
+	// alias becomes a filename on the target node — validate at the edge.
+	if (!valid_pull_alias(alias)) {
+		return { status: 400, body: stringify({
+			error: "invalid alias: single segment of [A-Za-z0-9._-], no '..'",
+		})};
+	}
 	let target_url = lookup_agent(target_node);
 	if (target_url == null) {
 		return { status: 404, body: stringify({
@@ -2894,7 +2900,11 @@ fn handle_hf_files(req): object {
 		return { status: 400, body: stringify({ error: "repo required" })};
 	}
 	// repo is "org/name" — slashes are real path separators, so it goes in
-	// as-is; only the explicit timeout matters here (bare get() = 5s).
+	// as-is. Validate first so a crafted repo can't inject extra URL path/
+	// query segments against the HF API.
+	if (!valid_hf_repo(repo)) {
+		return { status: 400, body: stringify({ error: "invalid repo (expected org/name)" })};
+	}
 	let url = HF_API_BASE + "/models/" + repo + "/tree/main?recursive=true";
 	try {
 		let resp = hf_get(url);
@@ -2937,6 +2947,7 @@ fn handle_hf_files(req): object {
 
 fn valid_hf_repo(repo): bool {
 	if (repo == null || repo.length == 0 || repo.length > 120) { return false; }
+	if (repo.substr(0, 1) == "-") { return false; }   // no flag injection downstream
 	let slashes = 0;
 	let i = 0;
 	while (i < repo.length) {
@@ -2947,7 +2958,51 @@ fn valid_hf_repo(repo): bool {
 		if (c == "/") { slashes = slashes + 1; }
 		i = i + 1;
 	}
-	return slashes == 1;
+	if (slashes != 1) { return false; }
+	// Both segments must be non-empty and not dot-only — "org/.." would
+	// otherwise pass the char filter and traverse the upstream URL path.
+	let sl = repo.find("/");
+	let org = repo.substr(0, sl);
+	let name = repo.substr(sl + 1, repo.length - sl - 1);
+	if (org.length == 0 || name.length == 0) { return false; }
+	if (org == "." || org == ".." || name == "." || name == "..") { return false; }
+	return true;
+}
+
+// A pull alias becomes a filename component on the target node
+// (canonical/<alias>.gguf). Mirror the agent's valid_alias() so a bad
+// alias is rejected at the CP edge too. Single safe segment only.
+fn valid_pull_alias(alias): bool {
+	if (alias == null || alias.length == 0 || alias.length > 128) { return false; }
+	if (alias.find("/") >= 0) { return false; }
+	if (alias.find("..") >= 0) { return false; }
+	if (alias.substr(0, 1) == "-") { return false; }
+	let i = 0;
+	while (i < alias.length) {
+		let c = alias.substr(i, 1);
+		let ok = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z")
+			|| (c >= "0" && c <= "9") || c == "." || c == "_" || c == "-";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// A repo-relative file path inside an HF tree (may be nested). Same
+// charset as a repo, plus must reject '..' anywhere and a leading '-'.
+fn valid_hf_file(file): bool {
+	if (file == null || file.length == 0 || file.length > 256) { return false; }
+	if (file.substr(0, 1) == "-") { return false; }
+	if (file.find("..") >= 0) { return false; }
+	let i = 0;
+	while (i < file.length) {
+		let c = file.substr(i, 1);
+		let ok = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z")
+			|| (c >= "0" && c <= "9") || c == "/" || c == "-" || c == "_" || c == ".";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
 }
 
 fn hf_host_ok(url): bool {
@@ -3201,8 +3256,21 @@ fn handle_pull_hf(req): object {
 		return { status: 400, body: stringify({
 			error: "repo + file + target_node required" })};
 	}
+	// Validate here too (belt + suspenders — the agent re-checks at the
+	// filesystem boundary, but reject early so a bad request never reaches
+	// a node). repo/file flow into `hf download` argv + a local path.
+	if (!valid_hf_repo(repo)) {
+		return { status: 400, body: stringify({ error: "invalid repo (expected org/name)" })};
+	}
+	if (!valid_hf_file(file)) {
+		return { status: 400, body: stringify({ error: "invalid file path" })};
+	}
 	let alias = payload?.alias;
 	if (alias == null || alias == "") { alias = default_alias_for_hf(file); }
+	if (!valid_pull_alias(alias)) {
+		return { status: 400, body: stringify({
+			error: "invalid alias: single segment of [A-Za-z0-9._-], no '..'" })};
+	}
 
 	let target_url = lookup_agent(target_node);
 	if (target_url == null) {

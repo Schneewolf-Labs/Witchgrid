@@ -20,9 +20,10 @@
 //   POST /services/stop       { id }                              → 204
 //   GET  /profiles                                                → [profile names]
 
-import { posix_spawn, kill } from "@stdlib/process";
+import { posix_spawn, kill, get_pid } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
+import { SpinLock } from "@stdlib/atomic";
 import { open, open_fd, file_stat, list_dir, exists } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
@@ -572,6 +573,12 @@ fn read_log_tail(path: string, max_bytes: i32): string {
 // noise on top.
 let SPAWN_FAILURE_GRACE_SECONDS = 2.0;
 
+// Serializes the process-global env mutation (CUDA_VISIBLE_DEVICES /
+// LD_LIBRARY_PATH) around posix_spawn so concurrent spawns on the
+// multi-threaded agent can't cross-contaminate each other's GPU pin.
+// See spawn_service() for the critical section.
+let SPAWN_ENV_LOCK = SpinLock();
+
 // Multimodal autoload: a llama.cpp vision model is a normal chat GGUF
 // plus a separate projector (mmproj) GGUF. The catalog can't track the
 // mmproj (no arch metadata — same reason SD ggufs are skipped), so we
@@ -723,51 +730,74 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	//   neither (auto, no constraint)          → CVD untouched (child sees all)
 	let pinned   = (gpus != null && gpus.length > 0);
 	let cpu_only = (!pinned && prof?.intent?.gpu_layers == 0);
-	if (pinned) {
-		let csv = "";
-		let g = 0;
-		while (g < gpus.length) {
-			if (g > 0) { csv = csv + ","; }
-			csv = csv + gpus[g];
-			g = g + 1;
+
+	// The env mutation below is PROCESS-GLOBAL but the agent serves each
+	// connection on its own thread, so two concurrent spawns could
+	// cross-contaminate the GPU pin (a service landing on the wrong GPU,
+	// or a cpu_only service inheriting a stale CUDA_VISIBLE_DEVICES).
+	// Serialize the whole setenv→posix_spawn→unsetenv window under a
+	// module lock. The critical section is microseconds (posix_spawn is
+	// fork+exec, not the model load), so spin contention is negligible.
+	// try/catch guarantees the lock + env are released even if
+	// posix_spawn throws — otherwise one failure would deadlock all
+	// future spawns.
+	SPAWN_ENV_LOCK.acquire();
+	let result = null;
+	try {
+		if (pinned) {
+			let csv = "";
+			let g = 0;
+			while (g < gpus.length) {
+				if (g > 0) { csv = csv + ","; }
+				csv = csv + gpus[g];
+				g = g + 1;
+			}
+			setenv("CUDA_VISIBLE_DEVICES", csv);
+		} else if (cpu_only) {
+			setenv("CUDA_VISIBLE_DEVICES", "");
 		}
-		setenv("CUDA_VISIBLE_DEVICES", csv);
-	} else if (cpu_only) {
-		setenv("CUDA_VISIBLE_DEVICES", "");
-	}
 
-	// sd-server can't find libstable-diffusion.so on its own: the
-	// upstream prebuilt's RUNPATH is the dead GitHub-Actions build dir
-	// (no $ORIGIN), and even a source build keeps the lib next to the
-	// binary rather than in a system path. Point LD_LIBRARY_PATH at the
-	// binary's own directory so the co-located .so (and any ggml libs)
-	// resolve. Same transient-parent-env trick as CUDA_VISIBLE_DEVICES.
-	// The agent's launch env doesn't set LD_LIBRARY_PATH, so a plain
-	// set→unset (no prior-value restore) is safe here.
-	if (is_sd) {
-		let li = -1;
-		let bi = 0;
-		while (bi < binary_path.length) {
-			if (binary_path.substr(bi, 1) == "/") { li = bi; }
-			bi = bi + 1;
+		// sd-server can't find libstable-diffusion.so on its own: the
+		// upstream prebuilt's RUNPATH is the dead GitHub-Actions build dir
+		// (no $ORIGIN), and even a source build keeps the lib next to the
+		// binary rather than in a system path. Point LD_LIBRARY_PATH at the
+		// binary's own directory so the co-located .so (and any ggml libs)
+		// resolve. Same transient-parent-env trick as CUDA_VISIBLE_DEVICES.
+		// The agent's launch env doesn't set LD_LIBRARY_PATH, so a plain
+		// set→unset (no prior-value restore) is safe here.
+		if (is_sd) {
+			let li = -1;
+			let bi = 0;
+			while (bi < binary_path.length) {
+				if (binary_path.substr(bi, 1) == "/") { li = bi; }
+				bi = bi + 1;
+			}
+			let libdir = li >= 0 ? binary_path.substr(0, li) : ".";
+			setenv("LD_LIBRARY_PATH", libdir);
 		}
-		let libdir = li >= 0 ? binary_path.substr(0, li) : ".";
-		setenv("LD_LIBRARY_PATH", libdir);
-	}
 
-	let result = posix_spawn(argv, {
-		stdin: null_fd,
-		stdout: log_fd,
-		stderr: log_fd,
-		setsid: true,
-	});
+		result = posix_spawn(argv, {
+			stdin: null_fd,
+			stdout: log_fd,
+			stderr: log_fd,
+			setsid: true,
+		});
 
-	if (pinned || cpu_only) {
-		unsetenv("CUDA_VISIBLE_DEVICES");
+		if (pinned || cpu_only) {
+			unsetenv("CUDA_VISIBLE_DEVICES");
+		}
+		if (is_sd) {
+			unsetenv("LD_LIBRARY_PATH");
+		}
+	} catch (e) {
+		try { unsetenv("CUDA_VISIBLE_DEVICES"); } catch (e2) { }
+		try { unsetenv("LD_LIBRARY_PATH"); } catch (e2) { }
+		SPAWN_ENV_LOCK.release();
+		fd_close(log_fd);
+		fd_close(null_fd);
+		throw e;
 	}
-	if (is_sd) {
-		unsetenv("LD_LIBRARY_PATH");
-	}
+	SPAWN_ENV_LOCK.release();
 	fd_close(log_fd);
 	fd_close(null_fd);
 
@@ -1130,9 +1160,20 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 		// fails with EPERM — surfaced as a 502 so the UI can say so.
 		kill_unmanaged: fn(req): object {
 			let payload = parse(req.body);
-			let pid = payload?.pid;
-			if (pid == null) {
+			let pid_in = payload?.pid;
+			if (pid_in == null) {
 				return { status: 400, body: "{\"error\":\"pid required\"}" };
+			}
+			let pid = i32(pid_in);
+			// kill(2) makes small/negative pids catastrophic: 0 = our whole
+			// process group, -1 = EVERY process this user owns, other
+			// negatives = that process group. And our own pid would be the
+			// agent killing itself via its own API. Refuse all of these.
+			if (pid < 2) {
+				return { status: 400, body: "{\"error\":\"pid must be >= 2 (group/broadcast kills refused)\"}" };
+			}
+			if (pid == get_pid()) {
+				return { status: 400, body: "{\"error\":\"refusing to kill the agent itself\"}" };
 			}
 			let mine = query(db,
 				"select id from services where pid = ? and state = 'running'", [pid]);
@@ -1140,7 +1181,7 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				return { status: 409, body: "{\"error\":\"that pid is a managed witchgrid service \\u2014 use stop\"}" };
 			}
 			try {
-				kill(i32(pid), SIGTERM);
+				kill(pid, SIGTERM);
 			} catch (e) {
 				return { status: 502, body: stringify({ error: "kill failed: " + e }) };
 			}

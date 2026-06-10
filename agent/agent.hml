@@ -596,6 +596,25 @@ fn main(): null {
 		return { status: 200, body: stringify({
 			canonical: canonical_dir, extra: scan_dirs_ref.extra }) };
 	}
+	// Path-safety helpers for the operator-facing path inputs below.
+	// has_dotdot: any '..' segment lets a prefix-checked path escape the
+	// scan dir, so reject outright. path_under: prefix check WITH a '/'
+	// boundary — `path.find(dir)==0` alone would accept /x/models-evil
+	// under /x/models.
+	fn has_dotdot(p): bool {
+		if (p == "..") { return true; }
+		if (p.find("/../") >= 0) { return true; }
+		if (p.find("../") == 0) { return true; }
+		if (p.ends_with("/..")) { return true; }
+		return false;
+	}
+	fn path_under(dir, p): bool {
+		if (dir == null || dir.length == 0) { return false; }
+		let d = dir;
+		if (d.ends_with("/")) { d = d.substr(0, d.length - 1); }
+		if (p == d) { return true; }
+		return p.find(d + "/") == 0;
+	}
 	fn scan_dirs_set(req): object {
 		let payload = parse(req.body);
 		let extra = payload?.extra;
@@ -605,7 +624,17 @@ fn main(): null {
 		let clean = [];
 		for (d in extra) {
 			let dd = ("" + d).trim();
-			if (dd.length > 0) { clean.push(dd); }
+			if (dd.length == 0) { continue; }
+			// Contract: absolute, traversal-free paths only. A relative dir
+			// would silently scan relative to the agent's CWD; '..' segments
+			// make the delete-guard prefix check meaningless.
+			if (dd.find("/") != 0) {
+				return { status: 400, body: stringify({ error: "scan dirs must be absolute paths: " + dd }) };
+			}
+			if (has_dotdot(dd)) {
+				return { status: 400, body: stringify({ error: "scan dirs must not contain '..': " + dd }) };
+			}
+			clean.push(dd);
 		}
 		scan_dirs_ref.extra = clean;
 		agent_setting_set(db, "scan_dirs_extra", stringify(clean));
@@ -623,9 +652,13 @@ fn main(): null {
 		if (!path.ends_with(".gguf")) {
 			return { status: 400, body: "{\"error\":\"only .gguf files can be deleted\"}" };
 		}
-		// Must live under a known scan dir — defence against arbitrary delete.
-		let allowed = (path.find(canonical_dir) == 0);
-		for (d in scan_dirs_ref.extra) { if (path.find(d) == 0) { allowed = true; } }
+		if (has_dotdot(path)) {
+			return { status: 400, body: "{\"error\":\"path must not contain '..'\"}" };
+		}
+		// Must live under a known scan dir — defence against arbitrary
+		// delete. Boundary-aware: /x/models-evil does NOT match /x/models.
+		let allowed = path_under(canonical_dir, path);
+		for (d in scan_dirs_ref.extra) { if (path_under(d, path)) { allowed = true; } }
 		if (!allowed) {
 			return { status: 403, body: "{\"error\":\"path is not under a scan dir\"}" };
 		}

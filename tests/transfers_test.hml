@@ -1,0 +1,74 @@
+// transfers_test.hml — coverage for the path-safety validators in
+// agent/transfers.hml.
+//
+// These are the LAST line of defence before a pull writes to disk: the
+// agent runs with auth off by default, so a malicious alias / repo / file
+// is unauthenticated input that becomes a filesystem path. The traversal
+// cases below are the actual exploit shapes (arbitrary file write), so
+// they're load-bearing — keep them green.
+
+import { describe, test, assert_eq } from "@stdlib/testing";
+import { valid_alias, valid_hf_component } from "../agent/transfers";
+
+export fn register(): null {
+	describe("transfers.valid_alias (filename-segment guard)", fn() {
+		test("accepts a normal quant alias", fn() {
+			assert_eq(valid_alias("mahou-1.5-nemo-q5_k_m"), true);
+		});
+		test("accepts dots, underscores, dashes, digits", fn() {
+			assert_eq(valid_alias("Llama-3.1_8B-v2"), true);
+		});
+		test("rejects empty / null", fn() {
+			assert_eq(valid_alias(""), false);
+			assert_eq(valid_alias(null), false);
+		});
+		test("rejects a slash (multi-segment path)", fn() {
+			assert_eq(valid_alias("sub/dir"), false);
+		});
+		test("rejects parent-dir traversal — the arbitrary-write exploit", fn() {
+			assert_eq(valid_alias(".."), false);
+			assert_eq(valid_alias("../../../etc/passwd"), false);
+			assert_eq(valid_alias("a..b"), false);   // any '..' substring out
+		});
+		test("rejects a leading '-' (downstream flag injection)", fn() {
+			assert_eq(valid_alias("-rf"), false);
+		});
+		test("rejects spaces and shell metacharacters", fn() {
+			assert_eq(valid_alias("a b"), false);
+			assert_eq(valid_alias("a;b"), false);
+			assert_eq(valid_alias("a$b"), false);
+			assert_eq(valid_alias("a`b"), false);
+		});
+		test("rejects an over-long alias (>128)", fn() {
+			let s = "";
+			let i = 0;
+			while (i < 130) { s = s + "a"; i = i + 1; }
+			assert_eq(valid_alias(s), false);
+		});
+	});
+
+	describe("transfers.valid_hf_component (repo/file guard)", fn() {
+		test("accepts an org/name repo", fn() {
+			assert_eq(valid_hf_component("bartowski/Meta-Llama-3.1-8B-GGUF"), true);
+		});
+		test("accepts a nested repo file path", fn() {
+			assert_eq(valid_hf_component("model-q4/part-00001-of-00003.gguf"), true);
+		});
+		test("rejects '..' anywhere (path escape on rename source)", fn() {
+			assert_eq(valid_hf_component("../../secret"), false);
+			assert_eq(valid_hf_component("org/../other"), false);
+		});
+		test("rejects a leading '-' (hf flag injection)", fn() {
+			assert_eq(valid_hf_component("--help"), false);
+		});
+		test("rejects spaces / metacharacters", fn() {
+			assert_eq(valid_hf_component("a b/c"), false);
+			assert_eq(valid_hf_component("a|b"), false);
+		});
+		test("rejects empty / null", fn() {
+			assert_eq(valid_hf_component(""), false);
+			assert_eq(valid_hf_component(null), false);
+		});
+	});
+	return null;
+}

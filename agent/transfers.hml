@@ -58,6 +58,49 @@ fn iso_now(db): string {
 	return r[0].ts;
 }
 
+// Alias safety: the alias becomes a filename component (canonical/<alias>.gguf),
+// so it must be a single safe path segment. Without this, a pull with
+// alias="../../../etc/foo" would write attacker bytes anywhere the agent
+// user can reach (arbitrary file write — critical, since auth is off by
+// default). Allow only [A-Za-z0-9._-], reject empty, '/', any '..', and a
+// leading '-' (which would also be read as a flag by `hf`/curl downstream).
+export fn valid_alias(alias): bool {
+	if (alias == null || alias.length == 0 || alias.length > 128) { return false; }
+	if (alias.find("/") >= 0) { return false; }
+	if (alias.find("..") >= 0) { return false; }
+	if (alias.substr(0, 1) == "-") { return false; }
+	let i = 0;
+	while (i < alias.length) {
+		let c = alias.substr(i, 1);
+		let ok = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z")
+			|| (c >= "0" && c <= "9") || c == "." || c == "_" || c == "-";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// HF repo/file safety. These are positional args to `hf download` and
+// `file` also forms a local path (canonical/<file>), so: reject any '..'
+// segment, a leading '-' (flag injection), control chars, spaces, and
+// shell-ish metacharacters. Slashes ARE allowed (repo is org/name, file
+// may be nested in the repo tree).
+export fn valid_hf_component(s): bool {
+	if (s == null || s.length == 0 || s.length > 256) { return false; }
+	if (s.substr(0, 1) == "-") { return false; }
+	if (s.find("..") >= 0) { return false; }
+	let i = 0;
+	while (i < s.length) {
+		let c = s.substr(i, 1);
+		let ok = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z")
+			|| (c >= "0" && c <= "9")
+			|| c == "." || c == "_" || c == "-" || c == "/";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
 // Pulls always land in canonical/<alias>.gguf. Filename derived from
 // alias (not the source filename) so a rescan re-derives the same
 // alias from the file we just wrote — round-trip stable.
@@ -129,6 +172,11 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: s
 		if (alias == null || source == null) {
 			return { status: 400, body: "{\"error\":\"alias + source required\"}" };
 		}
+		// alias is a filename component — reject traversal / unsafe chars
+		// before it ever touches the filesystem (see valid_alias).
+		if (!valid_alias(alias)) {
+			return { status: 400, body: "{\"error\":\"invalid alias: must be a single path segment of [A-Za-z0-9._-], no '..'\"}" };
+		}
 		let kind = source?.kind;
 		let id = new_id(db);
 		let target = target_path_for(canonical_dir, alias);
@@ -154,6 +202,14 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: s
 			let file = source?.file;
 			if (repo == null || file == null) {
 				return { status: 400, body: "{\"error\":\"source.repo + source.file required for kind=huggingface\"}" };
+			}
+			// repo/file are passed positionally to `hf download` AND `file`
+			// builds the post-download path (canonical/<file>). Reject '..'
+			// (path escape on the rename source) and a leading '-' on either
+			// (would be parsed as an `hf` flag). `valid_repo`/`valid_file`
+			// keep this to printable, slash-bearing repo paths only.
+			if (!valid_hf_component(repo) || !valid_hf_component(file)) {
+				return { status: 400, body: "{\"error\":\"invalid repo/file: no '..', no leading '-', printable path chars only\"}" };
 			}
 			let now = iso_now(db);
 			db_exec(db,
@@ -197,8 +253,12 @@ async fn pull_hf_task(db, transfer_id: string, repo: string, file: string,
 		// instead of materializing the file, which then breaks the
 		// rename/scan loop. Modern `hf` (>= 0.20) ignores this flag
 		// safely.
-		r = exec_argv(["hf", "download", repo, file,
-			"--local-dir", canonical_dir]);
+		// Flags BEFORE a `--` end-of-options marker, then the positional
+		// repo/file. Even though valid_hf_component already rejects a
+		// leading '-', the `--` makes flag-injection structurally
+		// impossible regardless of future validator changes.
+		r = exec_argv(["hf", "download", "--local-dir", canonical_dir,
+			"--", repo, file]);
 	} catch (e) {
 		db_exec(db,
 			"update model_transfers set status='error', error=? where id=?",
