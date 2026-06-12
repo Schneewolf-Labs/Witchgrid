@@ -26,6 +26,8 @@ import { stringify, parse } from "@stdlib/json";
 import { download_streaming } from "@stdlib/http";
 import { file_stat, exists, remove_file, rename } from "@stdlib/fs";
 import { exec_argv } from "@stdlib/process";
+import { getenv } from "@stdlib/env";
+import { sha256 } from "@stdlib/hash";
 
 export fn init_transfers_schema(db): null {
 	db_exec(db, "create table if not exists model_transfers ("
@@ -56,6 +58,50 @@ fn new_id(db): string {
 fn iso_now(db): string {
 	let r = query(db, "select datetime('now') as ts", []);
 	return r[0].ts;
+}
+
+// Peer-pull URL safety: source.url is CP-resolved in normal operation,
+// but it's still request input — pin it to plain http(s) so a crafted
+// pull can't point download_streaming at another scheme, and keep
+// CR/LF/space out of it (request-line injection on the fetch).
+export fn valid_peer_url(url): bool {
+	if (url == null || url.length == 0 || url.length > 2048) { return false; }
+	if (!(url.find("http://") == 0 || url.find("https://") == 0)) { return false; }
+	if (url.find(" ") >= 0 || url.find("\r") >= 0 || url.find("\n") >= 0) { return false; }
+	return true;
+}
+
+// Replace every occurrence of `needle` in `s` — used to scrub the peer
+// auth token out of error messages before they land in the transfers
+// table / log (a thrown download error typically embeds the URL).
+export fn scrub(s, needle, repl): string {
+	if (s == null || needle == null || needle.length == 0) { return s; }
+	let out = "";
+	let i = 0;
+	while (i < s.length) {
+		if (i + needle.length <= s.length
+			&& s.substr(i, needle.length) == needle) {
+			out = out + repl;
+			i = i + needle.length;
+		} else {
+			out = out + s.substr(i, 1);
+			i = i + 1;
+		}
+	}
+	return out;
+}
+
+// Peer-pull auth: the source agent's /models/{alias}/blob requires the
+// shared bearer when WITCHGRID_SHARED_SECRET is set, but Hemlock's
+// download_streaming() can't attach headers. The pulling side appends
+// ?token=<sha256(secret)> instead — URL-safe by construction, and the
+// raw secret never appears in a URL, a transfers row, or a log line.
+// The receiving agent compares against the same digest (see
+// agent_auth_check's query_token fallback). Empty when auth is off.
+fn peer_auth_token(): string {
+	let s = getenv("WITCHGRID_SHARED_SECRET");
+	if (s == null || s.length == 0) { return ""; }
+	return sha256(s);
 }
 
 // Alias safety: the alias becomes a filename component (canonical/<alias>.gguf),
@@ -123,8 +169,15 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 	db_exec(db,
 		"update model_transfers set status='downloading' where id=?",
 		[transfer_id]);
+	// Token appended at fetch time only — the DB row keeps the clean URL.
+	let tok = peer_auth_token();
+	let fetch_url = source_url;
+	if (tok != "") {
+		fetch_url = fetch_url
+			+ ((source_url.find("?") >= 0) ? "&" : "?") + "token=" + tok;
+	}
 	try {
-		let r = download_streaming(source_url, target);
+		let r = download_streaming(fetch_url, target);
 		let stat = file_stat(target);
 		let now = iso_now(db);
 		db_exec(db,
@@ -136,6 +189,9 @@ async fn pull_peer_task(db, transfer_id: string, source_url: string,
 			+ " (" + stat.size + " bytes, status " + r.status_code + ")");
 	} catch (e) {
 		let msg = "" + e;
+		// Download errors usually embed the fetch URL — keep the auth
+		// token out of the persisted row and the log line.
+		if (tok != "") { msg = scrub(msg, tok, "[token]"); }
 		db_exec(db,
 			"update model_transfers set status='error', error=? where id=?",
 			[msg, transfer_id]);
@@ -185,6 +241,9 @@ export fn make_pull_handler(db, canonical_dir: string, rescan_after, own_host: s
 			let url = source?.url;
 			if (url == null) {
 				return { status: 400, body: "{\"error\":\"source.url required for kind=peer\"}" };
+			}
+			if (!valid_peer_url(url)) {
+				return { status: 400, body: "{\"error\":\"source.url must be a plain http(s) URL\"}" };
 			}
 			let now = iso_now(db);
 			db_exec(db,

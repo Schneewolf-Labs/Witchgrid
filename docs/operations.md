@@ -186,6 +186,8 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 |-----|---------|---------|
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid.db` (+ `-wal`/`-shm`). Absolute, created if missing. **Set this** so the DB doesn't follow CWD — a stray fresh DB drops every node/profile/service from view. The CP logs `creating NEW database at …` when it makes a fresh one. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | Bearer secret required on inbound calls + sent on outbound. Unset = no auth (LAN-trusted). Must match on CP **and every agent**. See [`security.md`](security.md) for the full model (public vs protected routes, reverse-proxy guidance). |
+| `WITCHGRID_AUTH_PROTECT_READ` | *(unset)* | With the secret set, also require the bearer on the read-only surface (`/nodes`, `/ui/*`, `/api/state`, `/events`, `/metrics`, `/resolve/*`, service logs, …). The browser dashboard's live views will 401 (no login UI yet) — front it with a bearer-injecting reverse proxy. No effect without `WITCHGRID_SHARED_SECRET`. |
+| `WITCHGRID_AUTH_PROTECT_INFERENCE` | *(unset)* | With the secret set, require the bearer on the `/v1/llama/*` inference plane (otherwise it stays open to any LAN client). No effect without `WITCHGRID_SHARED_SECRET`. |
 | `WITCHGRID_STALE_NODE_SECONDS` | `90` | A node whose last heartbeat is older than this drops out of placement (and shows `node_up=0` in `/metrics`). Keep it ≳ 3× the agent's `WITCHGRID_HEARTBEAT_SECONDS` so one missed beat doesn't flap a node out. |
 | `WITCHGRID_CP_HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` and front it with an authenticating reverse proxy for anything beyond a trusted LAN. |
 | `WITCHGRID_CP_PORT` | `8765` | Bind port. |

@@ -33,7 +33,7 @@ import { parse, stringify } from "@stdlib/json";
 import { post_json, post, get, request as http_request, stream as http_stream, request_timeout as http_request_timeout, url_encode } from "@stdlib/http";
 import { sleep, time_ms as unix_ms } from "@stdlib/time";
 import { exists, make_dirs, list_dir, remove_file } from "@stdlib/fs";
-import { getenv } from "@stdlib/env";
+import { getenv, setenv, unsetenv } from "@stdlib/env";
 import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
 import { mcp_handle } from "./mcp";
@@ -79,7 +79,9 @@ fn resolve_data_path(name: string): string {
 // ── auth (slice 1: shared bearer for CP↔agent) ─────────────────────
 //
 // Single shared secret, env-injected. When set, every inbound request
-// EXCEPT routes flagged `public: true` must carry
+// EXCEPT routes flagged `public: true` (and, unless the protect knobs
+// below are on, routes flagged scope: "read" / scope: "inference")
+// must carry
 //   Authorization: Bearer <secret>
 // or it gets a 401. Same secret is sent on every CP→agent call so the
 // agent can validate us in turn.
@@ -103,15 +105,115 @@ fn shared_secret(): string {
 	return s;
 }
 
+// ── auth options ───────────────────────────────────────────────────
+//
+// Both no-ops unless WITCHGRID_SHARED_SECRET is also set (the secret
+// stays optional — LAN-first default is unchanged):
+//
+//   WITCHGRID_AUTH_PROTECT_READ       gate the read-only surface too
+//                                     (/nodes, /ui/*, /api/state, SSE,
+//                                     /metrics, /resolve/*, logs, …).
+//                                     The browser dashboard can't send
+//                                     the bearer yet, so its live views
+//                                     401 — front it with a header-
+//                                     injecting reverse proxy.
+//   WITCHGRID_AUTH_PROTECT_INFERENCE  gate /v1/llama/* (the inference
+//                                     data plane) behind the same
+//                                     bearer. Off = any LAN client can
+//                                     run inference even with a secret
+//                                     set (the historical behavior).
+//
+// Read fresh from env per request, same rationale as shared_secret().
+fn env_truthy(name: string): bool {
+	let v = getenv(name);
+	if (v == null) { return false; }
+	let s = v.trim().to_lower();
+	return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+fn auth_protect_read(): bool {
+	return env_truthy("WITCHGRID_AUTH_PROTECT_READ");
+}
+
+fn auth_protect_inference(): bool {
+	return env_truthy("WITCHGRID_AUTH_PROTECT_INFERENCE");
+}
+
+// curl auth config: cp_get_fast shells out to curl for the dashboard
+// fan-outs, and `-H "Authorization: Bearer <secret>"` in argv leaks the
+// secret to every local user via /proc/<pid>/cmdline (world-readable)
+// on every fan-out. Instead the bearer lives in a 0600 curl config file
+// (`-K <path>`) under the data dir. The content reaches the writing
+// shell via the environment — also not argv-visible — so the secret
+// never appears on any command line. Rewritten on every boot; removed
+// when auth is off.
+fn curl_auth_cfg_path(): string {
+	return resolve_data_path("curl_auth.cfg");
+}
+
+fn write_curl_auth_cfg(): null {
+	let path = curl_auth_cfg_path();
+	let secret = shared_secret();
+	if (secret == "") {
+		try { if (exists(path)) { remove_file(path); } } catch (e) { }
+		return null;
+	}
+	// curl config syntax: header = "value" — escape \ and " in the value.
+	let esc = "";
+	let i = 0;
+	while (i < secret.length) {
+		let c = secret.substr(i, 1);
+		if (c == "\\" || c == "\"") { esc = esc + "\\"; }
+		esc = esc + c;
+		i = i + 1;
+	}
+	setenv("WITCHGRID_CURL_CFG_LINE",
+		"header = \"Authorization: Bearer " + esc + "\"");
+	setenv("WITCHGRID_CURL_CFG_PATH", path);
+	try {
+		// rm first so the file is recreated under umask 077 even if an
+		// old copy exists with looser permissions.
+		let r = exec_argv(["sh", "-c",
+			"umask 077 && rm -f \"$WITCHGRID_CURL_CFG_PATH\""
+			+ " && printf '%s\\n' \"$WITCHGRID_CURL_CFG_LINE\""
+			+ " > \"$WITCHGRID_CURL_CFG_PATH\""]);
+		if (r.exit_code != 0) {
+			eprint("[auth] could not write curl auth config at " + path
+				+ " (exit " + r.exit_code
+				+ ") — fan-outs fall back to header-in-argv");
+		}
+	} catch (e) {
+		eprint("[auth] could not write curl auth config at " + path
+			+ ": " + e + " — fan-outs fall back to header-in-argv");
+	}
+	unsetenv("WITCHGRID_CURL_CFG_LINE");
+	unsetenv("WITCHGRID_CURL_CFG_PATH");
+	return null;
+}
+
 fn init_auth(): null {
 	let s = shared_secret();
 	if (s.length > 0) {
 		print("[auth] enabled (shared bearer; "
 			+ s.length + "-char secret)");
+		print("[auth] read surface (/nodes, /ui/*, /api/state, …): "
+			+ (auth_protect_read()
+				? "bearer required (WITCHGRID_AUTH_PROTECT_READ)"
+				: "public — set WITCHGRID_AUTH_PROTECT_READ=1 to gate"));
+		print("[auth] inference plane (/v1/llama/*): "
+			+ (auth_protect_inference()
+				? "bearer required (WITCHGRID_AUTH_PROTECT_INFERENCE)"
+				: "public — set WITCHGRID_AUTH_PROTECT_INFERENCE=1 to gate"));
 	} else {
 		print("[auth] DISABLED — set WITCHGRID_SHARED_SECRET on CP "
 			+ "and every agent to enable");
+		if (auth_protect_read() || auth_protect_inference()) {
+			eprint("[auth] WARNING: WITCHGRID_AUTH_PROTECT_READ/"
+				+ "_INFERENCE set without WITCHGRID_SHARED_SECRET "
+				+ "— they have no effect until a secret is set");
+		}
 	}
+	write_curl_auth_cfg();
 	return null;
 }
 
@@ -127,8 +229,18 @@ fn auth_match(provided: string): bool {
 }
 
 // Dispatcher hook. Returns null when the request may proceed, or a
-// 401 response object when not. Routes flagged `public: true` always
-// pass; everything else needs the bearer (when SHARED_SECRET is set).
+// 401 response object when not. Three route tiers (when SHARED_SECRET
+// is set):
+//
+//   public: true        always open — health, static dashboard shell/
+//                       assets (baked-in, no fleet data).
+//   scope: "read"       data-bearing read-only surface — open by
+//                       default, gated when WITCHGRID_AUTH_PROTECT_READ
+//                       is set.
+//   scope: "inference"  /v1/llama/* data plane — open by default, gated
+//                       when WITCHGRID_AUTH_PROTECT_INFERENCE is set.
+//   (no flag)           the mutating control surface — always needs
+//                       the bearer.
 //
 // Two acceptable token locations:
 //   1. `Authorization: Bearer <secret>` header — preferred path used
@@ -141,6 +253,9 @@ fn auth_match(provided: string): bool {
 fn cp_auth_check(req, route) {
 	if (shared_secret() == "") { return null; }
 	if (route?.public == true) { return null; }
+	let scope = route?.scope;
+	if (scope == "read" && !auth_protect_read()) { return null; }
+	if (scope == "inference" && !auth_protect_inference()) { return null; }
 	let header = req?.headers?["authorization"] ?? "";
 	if (auth_match(header)) { return null; }
 	// Body fallback for Hemlock-originated POSTs.
@@ -201,7 +316,17 @@ fn cp_get_fast(url: string): object {
 	let args = ["curl", "-sS", "--connect-timeout", "3", "--max-time", "6",
 		"-w", "\n%{http_code}"];
 	let secret = shared_secret();
-	if (secret != "") { args.push("-H"); args.push("Authorization: Bearer " + secret); }
+	if (secret != "") {
+		// Bearer via the 0600 config file (see write_curl_auth_cfg) so
+		// the secret stays out of /proc/<pid>/cmdline. Header-in-argv
+		// only as a fallback when the config couldn't be written.
+		let cfg = curl_auth_cfg_path();
+		if (exists(cfg)) {
+			args.push("-K"); args.push(cfg);
+		} else {
+			args.push("-H"); args.push("Authorization: Bearer " + secret);
+		}
+	}
 	args.push(url);
 	let r = exec_argv(args);
 	if (r.exit_code != 0) { throw "curl exit " + r.exit_code + " for " + url; }
@@ -535,6 +660,8 @@ fn handle_get_config(req): object {
 		host:               HOST,
 		port:               PORT,
 		auth_enabled:       shared_secret().length > 0,
+		auth_protect_read:      auth_protect_read(),
+		auth_protect_inference: auth_protect_inference(),
 		stale_node_seconds: STALE_NODE_SECONDS,
 		hf_trusted_authors: setting_get("hf_trusted_authors", ""),
 		settings:           settings,
@@ -968,6 +1095,18 @@ fn handle_register(req): object {
 	let runtime_json = null;
 	if (payload?.runtime != null) { runtime_json = stringify(payload.runtime); }
 	let agent_url = payload?.agent_url;
+	// agent_url is where every CP→agent call (spawn, stop, fan-outs) gets
+	// sent — refuse anything that isn't a plain http(s) URL so a bogus
+	// register can't point the CP's outbound RPC at an arbitrary scheme.
+	if (agent_url != null && agent_url != "") {
+		let u = "" + agent_url;
+		if (!(u.starts_with("http://") || u.starts_with("https://"))
+			|| u.length > 2048 || u.find(" ") >= 0
+			|| u.find("\r") >= 0 || u.find("\n") >= 0) {
+			return { status: 400,
+				body: "{\"error\":\"agent_url must be a plain http(s) URL\"}" };
+		}
+	}
 	let now = iso_now();
 
 	// Note: we deliberately do NOT touch `state` on update — that's
@@ -4264,14 +4403,21 @@ fn main(): null {
 	let bk = spawn(db_backup_loop);
 	detach(bk);
 
-	// `public: true` flag opts a route OUT of the shared-secret check.
-	// Used for: dashboard HTML shell, static assets, /healthz, dashboard
-	// fragments + read-only JSON the dashboard JS hits (no operator
-	// cookie yet — slice 2 will lock these), and /v1/llama/* (consumer
-	// surface getting its own API tokens in slice 3).
+	// Route auth tiers (see cp_auth_check):
+	//   public: true        — always open: /healthz + the static dashboard
+	//                         shell/assets (baked into the binary, no
+	//                         fleet data).
+	//   scope: "read"       — dashboard fragments + read-only JSON: open
+	//                         by default, bearer-gated when
+	//                         WITCHGRID_AUTH_PROTECT_READ is set (no
+	//                         operator cookie yet — slice 2).
+	//   scope: "inference"  — /v1/llama/*: open by default, bearer-gated
+	//                         when WITCHGRID_AUTH_PROTECT_INFERENCE is
+	//                         set (per-consumer tokens are slice 3).
+	//   (no flag)           — mutating control surface, always gated.
 	let routes = [
 		{ method: "POST", path: "/register",      handler: handle_register },
-		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes,         public: true },
+		{ method: "GET",  path: "/nodes",         handler: handle_list_nodes,         scope: "read" },
 		{ method: "PATCH", path: "/api/nodes/",   prefix: true, handler: handle_patch_node },
 		// Node-scoped llama_cpp proxies (since v0.7 C2). Method = *
 		// so GET (list installed) + POST (install/activate) hit the
@@ -4289,7 +4435,7 @@ fn main(): null {
 			return { status: 404, body: "{\"error\":\"not found\"}" };
 		} },
 		{ method: "GET",  path: "/healthz",       handler: handle_health,             public: true },
-		{ method: "GET",  path: "/metrics",       handler: handle_metrics,            public: true },
+		{ method: "GET",  path: "/metrics",       handler: handle_metrics,            scope: "read" },
 		// MCP server (Model Context Protocol over Streamable HTTP). Lets an
 		// AI assistant introspect + drive the fleet as MCP tools. NOT public:
 		// it spawns/stops services, so it sits behind the shared bearer like
@@ -4301,12 +4447,12 @@ fn main(): null {
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
 		{ method: "POST", path: "/unmanaged/kill", handler: handle_kill_unmanaged_proxy },
-		{ method: "GET",  path: "/services/log/", prefix: true, handler: handle_service_log, public: true },
+		{ method: "GET",  path: "/services/log/", prefix: true, handler: handle_service_log, scope: "read" },
 		// Control-plane location lookup — consumers resolve a profile/
 		// alias to a live llama-server host:port and connect directly
 		// (CP stays off the inference data path). public: a location,
 		// not a secret, and workers hit it before any bearer exists.
-		{ method: "GET",  path: "/resolve/",      prefix: true, handler: handle_resolve, public: true },
+		{ method: "GET",  path: "/resolve/",      prefix: true, handler: handle_resolve, scope: "read" },
 		// Dashboard shell + static assets (all baked into the binary)
 		{ method: "GET",  path: "/",                       handler: handle_page_overview,    public: true },
 		{ method: "GET",  path: "/catalog",                handler: handle_page_catalog,     public: true },
@@ -4320,35 +4466,35 @@ fn main(): null {
 		{ method: "GET",  path: "/assets/dashboard.js",    handler: handle_dashboard_js,     public: true },
 		{ method: "GET",  path: "/assets/logo.svg",        handler: handle_logo,             public: true },
 		// Dashboard live fragments + JSON profiles (the form needs structured data)
-		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes,         public: true },
-		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      public: true },
-		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      public: true },
-		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  public: true },
+		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes,         scope: "read" },
+		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      scope: "read" },
+		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      scope: "read" },
+		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  scope: "read" },
 		// Live state stream (SSE) — pushes fleet snapshots on change so the
 		// dashboard updates without polling. Public, like the /ui fragments.
-		{ method: "GET",  path: "/events",          handler: handle_events,           public: true },
-		{ method: "GET",  path: "/api/state",        handler: handle_state,            public: true },
-		{ method: "GET",  path: "/api/ready/",       prefix: true, handler: handle_service_ready, public: true },
-		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, public: true },
+		{ method: "GET",  path: "/events",          handler: handle_events,           scope: "read" },
+		{ method: "GET",  path: "/api/state",        handler: handle_state,            scope: "read" },
+		{ method: "GET",  path: "/api/ready/",       prefix: true, handler: handle_service_ready, scope: "read" },
+		{ method: "GET",  path: "/api/capabilities", handler: handle_list_capabilities, scope: "read" },
 		// JSON API — moved under /api/ prefix in v0.6 because the
 		// human-facing pages now own /catalog, /transfers, /profiles
 		// at the URL roots. Spawn form's onProfileChange() fetch
 		// updated to match.
 		// Profiles CRUD lives under /api/profiles[/{name}] since v0.7
 		// (CP-owned storage, was baked into agent binaries before).
-		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2, public: true },
+		{ method: "GET",  path: "/api/profiles",    handler: handle_list_profiles_v2, scope: "read" },
 		{ method: "POST", path: "/api/profiles",    handler: handle_create_profile },
-		{ method: "GET",  path: "/api/settings",    handler: handle_list_settings,    public: true },
-		{ method: "GET",  path: "/api/config",      handler: handle_get_config,       public: true },
+		{ method: "GET",  path: "/api/settings",    handler: handle_list_settings,    scope: "read" },
+		{ method: "GET",  path: "/api/config",      handler: handle_get_config,       scope: "read" },
 		{ method: "PUT",  path: "/api/settings",    handler: handle_update_settings },
-		{ method: "GET",  path: "/api/profile-aliases",  handler: handle_list_profile_aliases,   public: true },
+		{ method: "GET",  path: "/api/profile-aliases",  handler: handle_list_profile_aliases,   scope: "read" },
 		{ method: "PUT",  path: "/api/profile-aliases",  handler: handle_upsert_profile_alias },
 		{ method: "DELETE", path: "/api/profile-aliases/", prefix: true, handler: handle_delete_profile_alias },
-		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile,    public: true },
+		{ method: "GET",  path: "/api/profiles/",   prefix: true, handler: handle_get_profile,    scope: "read" },
 		{ method: "PUT",  path: "/api/profiles/",   prefix: true, handler: handle_update_profile },
 		{ method: "DELETE", path: "/api/profiles/", prefix: true, handler: handle_delete_profile },
-		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog,     public: true },
-		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog,       public: true },
+		{ method: "GET",  path: "/api/catalog",     handler: handle_list_catalog,     scope: "read" },
+		{ method: "GET",  path: "/ui/catalog",      handler: handle_ui_catalog,       scope: "read" },
 		{ method: "POST", path: "/models/distribute", handler: handle_distribute },
 		{ method: "POST", path: "/models/delete",   handler: handle_model_delete_proxy },
 		{ method: "POST", path: "/api/scan-dirs",   handler: handle_scan_dirs_proxy },
@@ -4359,23 +4505,24 @@ fn main(): null {
 		{ method: "POST", path: "/api/hf/card",     handler: handle_hf_card },
 		{ method: "POST", path: "/api/hf/discover", handler: handle_hf_discover },
 		{ method: "POST", path: "/models/pull_hf",  handler: handle_pull_hf },
-		{ method: "POST", path: "/api/placement_preview", handler: handle_placement_preview, public: true },
-		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   public: true },
+		{ method: "POST", path: "/api/placement_preview", handler: handle_placement_preview, scope: "read" },
+		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   scope: "read" },
 		// Bench (v0.7+ slice C3): operator-triggered benchmarks of
 		// (node × profile × build) combos. POST kicks off async,
 		// GETs read history.
 		{ method: "POST", path: "/api/bench",       handler: handle_create_bench },
-		{ method: "GET",  path: "/api/bench",       handler: handle_list_bench,       public: true },
-		{ method: "GET",  path: "/api/bench/",      prefix: true, handler: handle_get_bench,      public: true },
-		{ method: "GET",  path: "/ui/bench",        handler: handle_ui_bench,         public: true },
-		{ method: "GET",  path: "/ui/transfers",    handler: handle_ui_transfers,     public: true },
-		{ method: "GET",  path: "/ui/missing",      handler: handle_ui_missing,       public: true },
-		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats,         public: true },
+		{ method: "GET",  path: "/api/bench",       handler: handle_list_bench,       scope: "read" },
+		{ method: "GET",  path: "/api/bench/",      prefix: true, handler: handle_get_bench,      scope: "read" },
+		{ method: "GET",  path: "/ui/bench",        handler: handle_ui_bench,         scope: "read" },
+		{ method: "GET",  path: "/ui/transfers",    handler: handle_ui_transfers,     scope: "read" },
+		{ method: "GET",  path: "/ui/missing",      handler: handle_ui_missing,       scope: "read" },
+		{ method: "GET",  path: "/ui/stats",        handler: handle_ui_stats,         scope: "read" },
 		// Inference routing — prefix-matches anything under /v1/llama/.
-		// method "*" means any HTTP method is forwarded. Public for now;
-		// slice 3 protects with per-consumer API tokens.
+		// method "*" means any HTTP method is forwarded. Open by default;
+		// WITCHGRID_AUTH_PROTECT_INFERENCE gates it behind the shared
+		// bearer (per-consumer API tokens are slice 3).
 		{ method: "*",    path: "/v1/llama/",     handler: handle_llama_proxy,
-		  prefix: true, public: true },
+		  prefix: true, scope: "inference" },
 	];
 
 	// Graceful shutdown: on a termination signal, checkpoint the WAL (TRUNCATE
