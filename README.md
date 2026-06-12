@@ -28,7 +28,7 @@ Built in [Hemlock](https://hemlang.dev) (2.5.7). Each binary is a single ~7 MB E
 - **Not a job queue.** Consumers bring their own (pgmq, RabbitMQ, …). Witchgrid answers "where does this request go *now*," not "when does this job run."
 - **Not a fine-tuning harness.** See [Merlina](https://github.com/Schneewolf-Labs/Merlina) — the intended composition is *Merlina trains, Witchgrid serves*.
 - **Not Kubernetes.** Single-binary CP + lightweight agents over plain HTTP. No pods, no manifests, no networking abstractions.
-- **Not multi-tenant (yet).** Single operator. Auth is an *optional* shared bearer secret (`WITCHGRID_SHARED_SECRET`); the design target is a trusted LAN — **don't expose the CP to the internet.**
+- **Not multi-tenant (yet).** Single operator. Auth is an *optional* shared bearer secret (`WITCHGRID_SHARED_SECRET`), with opt-in knobs to also gate the read-only surface (`WITCHGRID_AUTH_PROTECT_READ`) and the `/v1/llama/*` inference plane (`WITCHGRID_AUTH_PROTECT_INFERENCE`) — see [`docs/security.md`](docs/security.md). The design target is a trusted LAN — **don't expose the CP to the internet.**
 - **Not for single-node setups.** One machine? Just SSH and edit your scripts. The value kicks in at ≥2 nodes, or when sharing a GPU between workloads.
 
 ## Architecture

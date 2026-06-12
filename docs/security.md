@@ -10,7 +10,12 @@ control plane beyond that.
   endpoint is open to anyone who can reach the CP or an agent. Only run this on a
   network you fully trust.
 - **Set the shared secret** to authenticate CP↔agent and programmatic API
-  clients. It's a single bearer token shared across the fleet.
+  clients. It's a single bearer token shared across the fleet. The secret stays
+  **optional** — nothing changes until you set it.
+- **Two opt-in scope knobs** (no effect without the secret):
+  `WITCHGRID_AUTH_PROTECT_READ=1` gates the read-only surface (nodes, state,
+  fragments, logs, metrics, `/resolve/*`) behind the bearer too, and
+  `WITCHGRID_AUTH_PROTECT_INFERENCE=1` gates the `/v1/llama/*` data plane.
 - **HTTP only, no TLS.** The bearer travels in cleartext. Don't send it across an
   untrusted network without a TLS-terminating reverse proxy in front.
 - **The dashboard has no login.** With a secret set, the dashboard's *read-only*
@@ -45,40 +50,70 @@ Set the **same** `WITCHGRID_SHARED_SECRET` on the CP **and every agent**. Then:
 This authenticates the **machine-to-machine** surface. It does **not** give the
 dashboard a login (see below).
 
+When the secret is set, agents also require it for peer model pulls: the
+pulling agent appends `?token=<sha256(secret)>` to the source agent's
+`/models/{alias}/blob` URL (Hemlock's streaming downloader can't attach
+headers). The token is a derived, URL-safe digest — the raw secret never
+appears in a URL, a transfers row, or a log — and it only unlocks the blob
+route, never the rest of the API.
+
 ## What's public vs protected
 
-**Always public** (no auth even when the secret is set) — these are status,
-location, or read-only-render surfaces:
+Routes fall into **three tiers** when the secret is set:
 
-- `GET /healthz`, `GET /metrics`
-- The dashboard HTML pages + `/assets/*`
-- `GET /nodes`, the `/ui/*` fragments, `GET /api/state`, `GET /events` (SSE),
-  `GET /api/ready/*`, `GET /api/capabilities`, `GET /resolve/*`
+**Always public** — status + static surfaces with no fleet data:
+
+- `GET /healthz`
+- The dashboard HTML shell pages + `/assets/*` (baked into the binary)
+
+**Read surface** — public by default, bearer-gated when
+`WITCHGRID_AUTH_PROTECT_READ=1`:
+
+- `GET /metrics`, `GET /nodes`, the `/ui/*` fragments, `GET /api/state`,
+  `GET /events` (SSE), `GET /api/ready/*`, `GET /api/capabilities`,
+  `GET /resolve/*`
 - `GET /api/profiles`, `GET /api/catalog`, `POST /api/placement_preview`
-  (read-only computation), `GET /services/log/*`
-- `* /v1/llama/*` — the inference data plane (see below)
+  (read-only computation), `GET /services/log/*`, `GET /api/config`,
+  `GET /api/settings`, bench/transfer reads
 
-**Protected** (need the bearer when the secret is set) — the mutating control
-surface: `POST /register`, `POST /services`, `POST /services/stop`,
+**Protected** (always need the bearer when the secret is set) — the mutating
+control surface: `POST /register`, `POST /services`, `POST /services/stop`,
 `PATCH /api/nodes/*`, profile/alias/settings CRUD, `POST /models/*`,
-`POST /api/bench`.
+`POST /api/bench`, `POST /mcp`.
 
-> Because the read surface is public, anyone who can reach the CP can *see* the
-> fleet (nodes, services, GPU stats, model catalog) regardless of the secret.
-> Treat that as expected — it's a status console, not a vault. If even read
-> access must be restricted, put it behind a reverse proxy.
+> With `WITCHGRID_AUTH_PROTECT_READ` unset, anyone who can reach the CP can
+> *see* the fleet (nodes, services, GPU stats, model catalog) regardless of the
+> secret — it's a status console, not a vault. Setting it closes that, but the
+> browser dashboard's live views will `401` too (no login UI yet) — front the
+> dashboard with a reverse proxy that injects the bearer (see below). Note that
+> with the read surface gated, Prometheus needs `bearer_token` configured for
+> `/metrics`, and consumers calling `GET /resolve/*` need the bearer.
 
 ## The inference plane (`/v1/llama/*`)
 
-The `/v1/llama/{profile}/*` proxy is **public** today, so on a no-secret deploy
-any LAN client can run inference; with a secret set it requires the one shared
-bearer. There are **no per-consumer tokens** yet — every consumer shares the
+The `/v1/llama/{profile}/*` proxy is **public by default** — even with the
+shared secret set, any LAN client can run inference. Set
+`WITCHGRID_AUTH_PROTECT_INFERENCE=1` (with the secret) to require the bearer
+on it. There are **no per-consumer tokens** yet — every consumer shares the
 same secret, so you can't revoke one without rotating all. Per-consumer API
 tokens are planned (see roadmap).
 
 Most high-throughput consumers should skip the proxy entirely: `GET /resolve/
 {profile}` returns the live `host:port` and they connect to the llama-server
 directly, keeping the CP out of the hot path.
+
+## Secret handling details
+
+- The bearer is compared via SHA-256 digests, not raw bytes.
+- The CP's dashboard fan-outs shell out to `curl`; the bearer is passed via a
+  `0600` curl config file (`curl_auth.cfg` in the data dir, rewritten at every
+  boot, deleted when auth is off) — **not** via `-H` argv, which would be
+  world-readable through `/proc/<pid>/cmdline` on every fan-out.
+- `GET /api/config` reports *whether* auth and the scope knobs are on; the
+  secret itself is never exposed by any endpoint.
+- CP↔agent POSTs carry the secret as an in-band `_auth_token` body field (a
+  Hemlock libwebsockets workaround); agents strip it from anything they
+  persist — it never lands in `services.profile_json` or transfer rows.
 
 ## Exposing beyond a trusted LAN
 

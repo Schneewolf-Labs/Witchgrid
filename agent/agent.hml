@@ -131,6 +131,30 @@ fn agent_auth_check(req, route) {
 			if (tok != null && auth_match("Bearer " + tok)) { return null; }
 		} catch (e) { }
 	}
+	// Query-token fallback, opt-in per route (`query_token: true` — only
+	// /models/{alias}/blob). Peer pulls go through Hemlock's
+	// download_streaming(), which can't attach headers, so the pulling
+	// agent appends ?token=<sha256(secret)> (see transfers.peer_auth_token).
+	// The digest is a derived download credential: URL-safe, and the raw
+	// secret never travels in a URL — but it only ever unlocks routes
+	// flagged query_token, never the rest of the API.
+	if (route?.query_token == true) {
+		let qm = req.path.find("?");
+		if (qm >= 0) {
+			let qs = req.path.substr(qm + 1, req.path.length - qm - 1);
+			for (kv in qs.split("&")) {
+				if (kv.find("token=") == 0) {
+					let tok = kv.substr(6, kv.length - 6);
+					// Hash both sides before comparing — same timing
+					// posture as auth_match.
+					if (tok.length > 0
+						&& sha256(tok) == sha256(sha256(shared_secret()))) {
+						return null;
+					}
+				}
+			}
+		}
+	}
 	return { status: 401,
 		body: "{\"error\":\"unauthorized\"}",
 		headers: { "content-type": "application/json",
@@ -729,8 +753,14 @@ fn main(): null {
 		// streams from disk in 64KB chunks (see http_server.write_response)
 		// so we don't peg RAM on a 40GB model. Prefix-route because alias
 		// lives in the path; reject non-/blob suffixes with 404.
-		{ method: "GET",  path: "/models/",       prefix: true, handler: fn(req): object {
-			let after = req.path.substr(8, req.path.length - 8);  // strip "/models/"
+		// query_token: peer pulls authenticate via ?token=<sha256(secret)>
+		// because download_streaming() can't send headers — see
+		// agent_auth_check.
+		{ method: "GET",  path: "/models/",       prefix: true, query_token: true, handler: fn(req): object {
+			let p = req.path;
+			let qm = p.find("?");
+			if (qm >= 0) { p = p.substr(0, qm); }
+			let after = p.substr(8, p.length - 8);  // strip "/models/"
 			let slash = after.find("/");
 			if (slash < 0) {
 				return { status: 404, body: "{\"error\":\"expected /models/{alias}/blob\"}" };

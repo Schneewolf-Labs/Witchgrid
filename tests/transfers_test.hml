@@ -8,7 +8,7 @@
 // they're load-bearing — keep them green.
 
 import { describe, test, assert_eq } from "@stdlib/testing";
-import { valid_alias, valid_hf_component } from "../agent/transfers";
+import { valid_alias, valid_hf_component, valid_peer_url, scrub } from "../agent/transfers";
 
 export fn register(): null {
 	describe("transfers.valid_alias (filename-segment guard)", fn() {
@@ -68,6 +68,37 @@ export fn register(): null {
 		test("rejects empty / null", fn() {
 			assert_eq(valid_hf_component(""), false);
 			assert_eq(valid_hf_component(null), false);
+		});
+	});
+
+	describe("transfers.valid_peer_url (peer-pull fetch guard)", fn() {
+		test("accepts plain http and https URLs", fn() {
+			assert_eq(valid_peer_url("http://10.0.0.12:8766/models/mahou/blob"), true);
+			assert_eq(valid_peer_url("https://node-a.lan:8766/models/x/blob"), true);
+		});
+		test("rejects non-http schemes", fn() {
+			assert_eq(valid_peer_url("file:///etc/passwd"), false);
+			assert_eq(valid_peer_url("ftp://host/x"), false);
+			assert_eq(valid_peer_url("gopher://host/x"), false);
+		});
+		test("rejects CR/LF/space (request-line injection)", fn() {
+			assert_eq(valid_peer_url("http://h/x y"), false);
+			assert_eq(valid_peer_url("http://h/x\r\nHost: evil"), false);
+		});
+		test("rejects empty / null", fn() {
+			assert_eq(valid_peer_url(""), false);
+			assert_eq(valid_peer_url(null), false);
+		});
+	});
+
+	describe("transfers.scrub (token redaction in errors)", fn() {
+		test("replaces every occurrence", fn() {
+			assert_eq(scrub("x?token=abc and abc again", "abc", "[token]"),
+				"x?token=[token] and [token] again");
+		});
+		test("no-op when needle absent or empty", fn() {
+			assert_eq(scrub("hello", "zzz", "[token]"), "hello");
+			assert_eq(scrub("hello", "", "[token]"), "hello");
 		});
 	});
 	return null;
