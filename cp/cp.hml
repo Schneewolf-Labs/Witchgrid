@@ -36,6 +36,7 @@ import { exists, make_dirs, list_dir, remove_file } from "@stdlib/fs";
 import { getenv } from "@stdlib/env";
 import { sha256 } from "@stdlib/hash";
 import { serve } from "./http_server";
+import { mcp_handle } from "./mcp";
 import { WITCHGRID_VERSION } from "../version";
 import { on_shutdown } from "@stdlib/signal";
 import { exit, exec_argv } from "@stdlib/process";
@@ -4075,6 +4076,161 @@ fn handle_logo(req): object {
 			"cache-control": ASSET_CACHE } };
 }
 
+// ── MCP server (cp/mcp.hml) ──────────────────────────────────────────
+//
+// Each tool wraps an existing CP handler by synthesizing the request it
+// expects and passing its { status, body } straight back to the MCP layer.
+// No new business logic lives here — the MCP surface is a thin adapter
+// over the same HTTP API the dashboard uses, so it inherits its behavior
+// (and tests) for free.
+
+// Synthesize the in-process request each wrapped handler expects.
+fn mcp_req(verb: string, target: string, body: string): object {
+	return { method: verb, path: target, body: body, headers: {} };
+}
+
+// Tool dispatch. mcp.hml validates the tool name against mcp_tools() then
+// calls this with (name, arguments). One function (passed to mcp_handle as
+// an argument, like serve()'s auth_check) keeps function values off the
+// object-literal path hemlockc can't lower, and `stringify` runs here in a
+// plain module function rather than a captured closure. Each arm wraps an
+// existing CP handler — no new business logic.
+fn mcp_invoke(name: string, args): object {
+	if (name == "list_nodes") {
+		return handle_list_nodes(mcp_req("GET", "/nodes", ""));
+	}
+	if (name == "list_services") {
+		return handle_list_services(mcp_req("GET", "/services", ""));
+	}
+	if (name == "list_profiles") {
+		return handle_list_profiles_v2(mcp_req("GET", "/api/profiles", ""));
+	}
+	if (name == "list_catalog") {
+		return handle_list_catalog(mcp_req("GET", "/api/catalog", ""));
+	}
+	if (name == "fleet_status") {
+		return handle_state(mcp_req("GET", "/api/state", ""));
+	}
+	if (name == "resolve_profile") {
+		let profile = args?.profile ?? "";
+		return handle_resolve(mcp_req("GET", "/resolve/" + profile, ""));
+	}
+	if (name == "spawn_service") {
+		return handle_spawn_proxy(mcp_req("POST", "/services", stringify(args)));
+	}
+	if (name == "stop_service") {
+		return handle_stop_proxy(mcp_req("POST", "/services/stop", stringify(args)));
+	}
+	return { status: 404, body: stringify({ error: "unknown tool: " + name }) };
+}
+
+// The tool catalog — pure data (name + description + JSON Schema). Read-only
+// introspection + the two mutating fleet actions (spawn/stop). Kept
+// deliberately small: this is the operator's control surface, not the
+// consumer inference path (that stays on /v1/llama/* with its own flow).
+fn mcp_tools(): array {
+	return [
+		{
+			name: "list_nodes",
+			description: "List every registered node in the fleet with its "
+				+ "hardware (GPUs, VRAM, RAM), liveness, and state.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "list_services",
+			description: "List running inference services across the fleet, "
+				+ "each tagged with the node it runs on, its profile, port, and pid.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "list_profiles",
+			description: "List the configured service profiles (chat, image, "
+				+ "embedding, etc.) the fleet can spawn, with their intent + model.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "list_catalog",
+			description: "List the GGUF model catalog aggregated across all nodes, "
+				+ "by alias, with which nodes hold each model on disk.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "fleet_status",
+			description: "Get a single snapshot of overall fleet state (nodes + "
+				+ "services + recent events) as the dashboard sees it.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "resolve_profile",
+			description: "Resolve a profile (or alias) to a live inference "
+				+ "endpoint (host, port, base_url). Returns 404 if nothing is "
+				+ "running for it. Use this to find where to send inference.",
+			schema: {
+				"type": "object",
+				properties: {
+					profile: { "type": "string",
+						description: "Profile name or alias, e.g. 'chat-mahou'." },
+				},
+				required: ["profile"],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "spawn_service",
+			description: "Spawn a service for a profile. Omit node_id/gpus to let "
+				+ "the control plane do capacity-aware placement; pin them (and "
+				+ "supply model) to place manually. Returns the spawned service.",
+			schema: {
+				"type": "object",
+				properties: {
+					profile: { "type": "string",
+						description: "Profile name to spawn (required)." },
+					node_id: { "type": "string",
+						description: "Pin to a specific node. Optional; placement picks one if omitted." },
+					gpus:    { "type": "array", items: { "type": "integer" },
+						description: "GPU indices to use when pinning a node. Optional." },
+					model:   { "type": "string",
+						description: "Explicit GGUF path override. Required only when node_id+gpus are pinned." },
+					port:    { "type": "integer",
+						description: "Port override. Optional; one is picked if omitted." },
+					device:  { "type": "string", "enum": ["auto", "cpu", "gpu"],
+						description: "Force CPU/GPU placement. Optional, defaults to the profile's setting." },
+				},
+				required: ["profile"],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "stop_service",
+			description: "Stop a running service by its id and node_id "
+				+ "(both from list_services).",
+			schema: {
+				"type": "object",
+				properties: {
+					id:      { "type": "string", description: "Service id (required)." },
+					node_id: { "type": "string", description: "Owning node id (required)." },
+				},
+				required: ["id", "node_id"],
+				additionalProperties: false,
+			},
+		},
+	];
+}
+
+fn handle_mcp(req): object {
+	let server_info = { name: "witchgrid-cp", version: WITCHGRID_VERSION };
+	return mcp_handle(req, mcp_tools(), mcp_invoke, server_info);
+}
+
+// GET /mcp — we don't offer a server-initiated SSE stream (every reply is
+// a buffered POST response), so advertise that with 405 per the Streamable
+// HTTP spec instead of leaving the client hanging on an open GET.
+fn handle_mcp_get(req): object {
+	return { status: 405,
+		headers: { "content-type": "application/json", "allow": "POST" },
+		body: "{\"error\":\"GET not supported; POST JSON-RPC to /mcp\"}" };
+}
+
 // ── boot ─────────────────────────────────────────────────────────────
 
 fn main(): null {
@@ -4134,6 +4290,13 @@ fn main(): null {
 		} },
 		{ method: "GET",  path: "/healthz",       handler: handle_health,             public: true },
 		{ method: "GET",  path: "/metrics",       handler: handle_metrics,            public: true },
+		// MCP server (Model Context Protocol over Streamable HTTP). Lets an
+		// AI assistant introspect + drive the fleet as MCP tools. NOT public:
+		// it spawns/stops services, so it sits behind the shared bearer like
+		// the rest of the operator API. Clients pass Authorization: Bearer
+		// <WITCHGRID_SHARED_SECRET>.
+		{ method: "POST", path: "/mcp",           handler: handle_mcp },
+		{ method: "GET",  path: "/mcp",           handler: handle_mcp_get },
 		{ method: "POST", path: "/services",      handler: handle_spawn_proxy },
 		{ method: "GET",  path: "/services",      handler: handle_list_services },
 		{ method: "POST", path: "/services/stop", handler: handle_stop_proxy },
