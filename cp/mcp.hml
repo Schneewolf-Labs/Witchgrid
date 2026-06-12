@@ -1,0 +1,190 @@
+// mcp.hml — Model Context Protocol server for the Witchgrid control plane.
+//
+// Exposes the fleet as MCP tools so an AI assistant (Claude Desktop, an
+// agent SDK, an IDE) can introspect and drive Witchgrid the same way an
+// operator drives the dashboard: list nodes/services/profiles/catalog,
+// resolve a profile to a live endpoint, and spawn/stop services.
+//
+// Transport: MCP "Streamable HTTP" at a single endpoint (POST /mcp on the
+// CP). We answer every request with a buffered `application/json` body —
+// the spec's allowed non-streaming shape — so we don't need server-sent
+// events or session bookkeeping. A GET on the same endpoint advertises
+// "no server stream" with 405 (also spec-permitted).
+//
+// Wire protocol is JSON-RPC 2.0. Methods handled:
+//   initialize                 → server info + capabilities
+//   notifications/initialized  → ack (202, no body)
+//   ping                       → {}
+//   tools/list                 → the tool catalog
+//   tools/call                 → run a tool, return its JSON as text content
+//
+// This module is intentionally CP-agnostic: it knows nothing about nodes
+// or sqlite. cp.hml hands it two things:
+//   - `tools`:  an array of pure-data tool descriptors (name + description +
+//               JSON Schema), used for tools/list and to validate a call.
+//   - `invoke`: a single dispatch function (name, args) -> { status, body }
+//               that runs the named tool by wrapping an existing CP handler.
+//
+// Passing one dispatch function (rather than a closure per tool) keeps the
+// surface a thin adapter over the HTTP API already under test, sidesteps an
+// import cycle with cp.hml (which imports this), and stays within what
+// hemlockc lowers cleanly (function values cross call boundaries as
+// arguments, as `serve(..., cp_auth_check)` already relies on).
+//
+// Each tool descriptor:
+//   { name:        string,
+//     description: string,
+//     schema:      object }   // JSON Schema for the tool's arguments
+
+import { parse, stringify } from "@stdlib/json";
+
+// Protocol version we advertise when a client doesn't pin one. Matches a
+// widely-deployed MCP revision; when a client sends its own in
+// `initialize`, we echo theirs so negotiation succeeds without us tracking
+// a support matrix.
+let DEFAULT_PROTOCOL_VERSION = "2025-06-18";
+
+// ── JSON-RPC envelopes ───────────────────────────────────────────────
+
+fn rpc_result(id, result): object {
+	return { jsonrpc: "2.0", id: id, result: result };
+}
+
+fn rpc_error(id, code: i32, message: string): object {
+	return { jsonrpc: "2.0", id: id, error: { code: code, message: message } };
+}
+
+// Render a tool's { status, body } into an MCP tool result. The body is
+// already a JSON string from the wrapped CP handler; we pass it through as
+// a single text content block so the model sees the raw API payload.
+// isError flips on any non-2xx so the client surfaces failures instead of
+// treating an error envelope as a successful answer.
+fn tool_result(status: i32, body: string): object {
+	let is_error = (status < 200 || status >= 300);
+	return {
+		content: [ { "type": "text", text: body } ],
+		isError: is_error,
+	};
+}
+
+fn find_tool(tools, name: string) {
+	for (t in tools) {
+		if (t.name == name) { return t; }
+	}
+	return null;
+}
+
+// Build the tools/list payload — the public schema view.
+fn tools_catalog(tools): array {
+	let out = [];
+	for (t in tools) {
+		out.push({
+			name:        t.name,
+			description: t.description,
+			inputSchema: t.schema,
+		});
+	}
+	return out;
+}
+
+// Dispatch one decoded JSON-RPC message. Returns the response object to
+// serialize, or null when the message is a notification (no `id`) and
+// therefore takes no reply. Pure over its inputs — the only side effects
+// are whatever `invoke` does — which makes it unit-testable with a synthetic
+// tools list + invoke stub.
+export fn mcp_dispatch(msg, tools, invoke, server_info) {
+	if (msg == null) {
+		return rpc_error(null, -32600, "invalid request: not an object");
+	}
+	let method = msg?.method;
+	let id = msg?.id;
+
+	// No method member: a response, a batch array, or otherwise not a
+	// request we can act on. `msg?.method` is null for arrays/primitives
+	// too, so this also guards the `.has` below from running on a non-object.
+	if (method == null) {
+		if (msg?.id != null) {
+			return rpc_error(id, -32600, "invalid request: missing method");
+		}
+		return null;
+	}
+
+	// Notifications (a request shape with no `id` member) never get a reply,
+	// regardless of method. The only ones we expect are the lifecycle pings
+	// (initialized, cancelled); ack them all by staying silent.
+	if (!msg.has("id")) {
+		return null;
+	}
+
+	if (method == "initialize") {
+		let client_proto = msg?.params?.protocolVersion;
+		let proto = (client_proto == null) ? DEFAULT_PROTOCOL_VERSION : client_proto;
+		return rpc_result(id, {
+			protocolVersion: proto,
+			capabilities:    { tools: { listChanged: false } },
+			serverInfo:      server_info,
+		});
+	}
+	if (method == "ping") {
+		return rpc_result(id, {});
+	}
+	if (method == "tools/list") {
+		return rpc_result(id, { tools: tools_catalog(tools) });
+	}
+	if (method == "tools/call") {
+		let name = msg?.params?.name;
+		if (name == null) {
+			return rpc_error(id, -32602, "invalid params: tools/call needs a name");
+		}
+		let tool = find_tool(tools, name);
+		if (tool == null) {
+			return rpc_error(id, -32602, "unknown tool: " + name);
+		}
+		let args = msg?.params?.arguments ?? {};
+		// A tool that throws is a server bug, not a client one — surface it
+		// as an isError tool result so the model gets the message instead of
+		// the connection dying.
+		let outcome = null;
+		try {
+			outcome = invoke(name, args);
+		} catch (e) {
+			outcome = { status: 500,
+				body: stringify({ error: "tool '" + name + "' failed: " + e }) };
+		}
+		return rpc_result(id, tool_result(outcome.status, outcome?.body ?? ""));
+	}
+	return rpc_error(id, -32601, "method not found: " + method);
+}
+
+// HTTP entry point. Parses the JSON-RPC body and produces the CP's normal
+// { status, body, headers } response. Notifications get a bodyless 202
+// (the Streamable HTTP "accepted, nothing to say" reply); everything else
+// gets a 200 with the JSON-RPC response object.
+//
+// Batching (a JSON array of messages) was dropped in MCP 2025-06-18 and no
+// mainstream client relies on it, so a top-level array is refused rather
+// than half-supported.
+export fn mcp_handle(req, tools, invoke, server_info): object {
+	let json_headers = { "content-type": "application/json" };
+
+	let body_str = req?.body ?? "";
+	if (body_str.length == 0) {
+		return { status: 400, headers: json_headers,
+			body: stringify(rpc_error(null, -32700, "empty request body")) };
+	}
+
+	let msg = null;
+	try {
+		msg = parse(body_str);
+	} catch (e) {
+		return { status: 400, headers: json_headers,
+			body: stringify(rpc_error(null, -32700, "parse error: invalid JSON")) };
+	}
+
+	let resp = mcp_dispatch(msg, tools, invoke, server_info);
+	if (resp == null) {
+		// Notification — accepted, no content.
+		return { status: 202, headers: json_headers, body: "" };
+	}
+	return { status: 200, headers: json_headers, body: stringify(resp) };
+}

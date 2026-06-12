@@ -21,6 +21,7 @@ Built in [Hemlock](https://hemlang.dev) (2.5.7). Each binary is a single ~7 MB E
 - **Intent-driven argv** — profiles declare normalized intents (`flash_attention: true`, `kv_cache_k: "q4_0"`, `context: 131072`); the agent translates each into the binary's actual flag form from its parsed `--help`, so one profile produces the right argv across llama.cpp versions.
 - **Routing + SSE** — direct `/resolve/{profile}` for resolve-then-connect consumers (CP stays off the data path), or the `/v1/llama` proxy with **SSE passthrough** (`stream:true` streams `text/event-stream` straight through).
 - **Observability** — Prometheus `/metrics` (node liveness, per-GPU VRAM, watchdog state) + a live HTMX dashboard (nodes, services, profiles, capabilities, catalog, transfers, bench).
+- **MCP server** — the CP speaks the [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP at `POST /mcp`, exposing the fleet as tools (`list_nodes`, `list_services`, `list_profiles`, `list_catalog`, `fleet_status`, `resolve_profile`, `spawn_service`, `stop_service`). Point Claude (or any MCP client) at it to introspect and drive Witchgrid in natural language. Gated by the same shared bearer as the rest of the operator API.
 
 ## What it isn't
 
