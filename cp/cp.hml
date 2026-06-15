@@ -2828,8 +2828,20 @@ fn services_by_node(): object {
 			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
 				let entries = parse(resp.body);
+				let host = extract_host(a.agent_url);
 				let list = [];
-				for (e in entries) { list.push(e); }
+				for (e in entries) {
+					// Enrich each service with what the dashboard's "connect"
+					// modal needs but the agent doesn't carry: the host CP
+					// reaches the agent at (→ the service's direct base_url is
+					// http://{agent_host}:{port}) and the profile's engine
+					// binary (→ which API + example to show). Best-effort: a
+					// service whose profile was deleted just renders generic.
+					e["agent_host"] = host;
+					let prof = fetch_profile(e?.profile);
+					e["binary"] = prof?.binary ?? "llama-server";
+					list.push(e);
+				}
 				out[a.node_id] = list;
 			}
 		} catch (e) { }

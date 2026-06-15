@@ -425,6 +425,14 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_
 					let sid = esc(s.id);
 					let log_js  = "showServiceLog('" + sid + "','" + esc(s.profile) + "','" + esc(n.node_id) + "')";
 					let stop_js = "stopService('" + sid + "','" + esc(s.profile) + "','" + esc(n.node_id) + "')";
+					// connect: how a consumer reaches this service. agent_host +
+					// binary are enriched onto the service by services_by_node().
+					// preventDefault/stopPropagation so the button doesn't toggle
+					// the <details> it lives in.
+					let connect_js = "event.preventDefault();event.stopPropagation();showConnect('"
+						+ sid + "','" + esc(s.profile) + "','" + esc(n.node_id) + "','"
+						+ esc(s?.agent_host ?? "") + "'," + s.port + ",'"
+						+ esc(s?.binary ?? "llama-server") + "')";
 
 					html = html + "<details class=\"proc-item\">"
 						+ "<summary class=\"proc-summary\">"
@@ -433,6 +441,7 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_
 							+ dev_badge
 							+ "<code class=\"proc-port\">:" + s.port + "</code>"
 							+ "<code class=\"proc-model\">" + esc(model) + "</code>"
+							+ "<button class=\"row-action proc-connect\" onclick=\"" + connect_js + "\">connect</button>"
 							+ "<span class=\"proc-chevron\">›</span>"
 						+ "</summary>"
 						+ "<div class=\"detail-grid\">"

@@ -499,6 +499,25 @@ summary.node-card-head::marker { content: ""; }
 }
 .proc-item[open] .proc-chevron { transform: rotate(90deg); }
 
+/* connect button on the service summary row — pushed to the right,
+   chevron tucks in just after it */
+.proc-connect {
+  margin-left: auto;
+  padding: 0.1rem 0.5rem;
+  font-size: 0.72rem;
+}
+.proc-connect + .proc-chevron { margin-left: 0.4rem; }
+
+/* connect modal — one block per connection recipe */
+.connect-block { margin: 0.7rem 0; }
+.connect-block-head {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.connect-block-title { font-weight: 600; font-size: 0.85rem; color: var(--fg-1); }
+.connect-copy { margin-left: auto; padding: 0.1rem 0.55rem; font-size: 0.72rem; }
+
 /* unmanaged variant — amber tag instead of a status dot */
 .proc-tag {
   font-family: ui-monospace, monospace;

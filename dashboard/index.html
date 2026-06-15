@@ -178,6 +178,44 @@
           </div>
         </div>
       </div>
+
+      <!-- Connect modal — opens via showConnect() from the rendered
+           table's "connect" button. Engine-aware copy-paste recipes. -->
+      <div x-data="connectModal()">
+        <div class="modal-backdrop" x-show="open" x-cloak @click.self="close()" @keydown.escape.window="close()" style="display:none">
+          <div class="modal-card" @click.stop style="max-width:760px">
+            <h3 style="margin:0 0 0.25rem 0">
+              Connect to <span x-text="profile"></span>
+              <span class="meta" x-text="'· ' + binary + ' · ' + node + ' :' + port"></span>
+            </h3>
+            <p class="meta note" x-show="authEnabled" style="color:var(--accent)">
+              🔒 Auth is on — examples include a Bearer header. Export your secret first:
+              <code>export WITCHGRID_SECRET=…</code>
+            </p>
+            <p class="meta note">
+              Three ways in, most-robust first: the <strong>control plane</strong> proxy (auto-spawns + follows the
+              service across nodes), <strong>resolve-then-connect</strong> (CP off the data path), or a
+              <strong>direct</strong> pin to this process.
+            </p>
+
+            <template x-for="(b, i) in blocks" :key="i">
+              <div class="connect-block">
+                <div class="connect-block-head">
+                  <span class="connect-block-title" x-text="b.title"></span>
+                  <span class="badge badge-state-active" x-show="b.recommended">recommended</span>
+                  <button type="button" class="row-action connect-copy" @click="copyText(b.code, $event.target)">copy</button>
+                </div>
+                <p class="meta note" x-show="b.note" x-text="b.note" style="margin:0.15rem 0 0.35rem 0"></p>
+                <pre class="code-block" x-text="b.code"></pre>
+              </div>
+            </template>
+
+            <div style="display:flex; gap:0.5rem; justify-content:flex-end; margin-top:0.75rem">
+              <button type="button" @click="close()">close</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <details class="ov-collapse" data-detail-key="ov-spawn">

@@ -745,6 +745,144 @@ function showServiceLog(id, profile, node) {
   window.dispatchEvent(new CustomEvent('witchgrid:show-service-log', { detail: { id, profile, node } }));
 }
 
+// Copy helper for the code blocks in the connect modal (and anywhere
+// else). Uses the async clipboard API with a textarea fallback for
+// non-secure contexts (plain-http LAN). Flashes the button label.
+async function copyText(text, btn) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
+    if (btn) { const o = btn.textContent; btn.textContent = '✓ copied'; setTimeout(() => { btn.textContent = o; }, 1200); }
+  } catch (e) {
+    if (btn) { const o = btn.textContent; btn.textContent = 'copy failed'; setTimeout(() => { btn.textContent = o; }, 1200); }
+  }
+}
+
+// Connect modal — opened by the per-service "connect" button. Builds
+// copy-paste connection instructions tailored to the engine (llama /
+// sd / whisper / piper). Three ways in, in preference order:
+//   1. CP proxy  http://<cp>/v1/llama/<profile>/<suffix>  — auto-spawns,
+//      survives the service moving nodes; the route name is "llama" but
+//      it forwards to ANY engine's base_url.
+//   2. resolve-then-connect — GET /resolve/<profile> → base_url, then hit
+//      the node directly (CP stays off the data path; best for SDKs/workers).
+//   3. direct — http://<host>:<port>/<suffix>, pinned to this instance.
+function connectModal() {
+  return {
+    open: false,
+    profile: '', node: '', id: '', host: '', port: 0, binary: '',
+    authEnabled: false,
+    blocks: [],
+    init() {
+      window.addEventListener('witchgrid:show-connect', (e) => this.openFor(e.detail));
+      // Auth state decides whether examples carry an Authorization header.
+      fetch('/api/config').then(r => r.ok ? r.json() : null).then(c => {
+        if (c) this.authEnabled = !!c.auth_enabled;
+      }).catch(() => {});
+    },
+    openFor({ id, profile, node, host, port, binary }) {
+      this.id = id; this.profile = profile; this.node = node;
+      this.host = host || ''; this.port = port || 0; this.binary = binary || 'llama-server';
+      this.blocks = this.build();
+      this.open = true;
+    },
+    close() { this.open = false; },
+    engine() {
+      if (this.binary === 'sd-server') return 'image';
+      if (this.binary === 'whisper-server') return 'stt';
+      if (this.binary === 'piper') return 'tts';
+      return 'llm';
+    },
+    build() {
+      const cp = window.location.origin;
+      const prof = this.profile;
+      const proxy = cp + '/v1/llama/' + encodeURIComponent(prof);
+      const direct = (this.host && this.port) ? ('http://' + this.host + ':' + this.port) : null;
+      const resolveUrl = cp + '/resolve/' + encodeURIComponent(prof);
+      const auth = this.authEnabled ? ' \\\n  -H "Authorization: Bearer $WITCHGRID_SECRET"' : '';
+      const eng = this.engine();
+      const blocks = [];
+
+      // 1. The recommended example request, engine-specific, via the proxy.
+      if (eng === 'llm') {
+        blocks.push({ title: 'Chat completion (via control plane)', recommended: true,
+          note: 'Auto-spawns if not running and follows the service if it moves nodes. The model field is ignored — the profile selects the model.',
+          code: "curl -s " + proxy + "/v1/chat/completions" + auth + " \\\n"
+              + "  -H 'content-type: application/json' \\\n"
+              + "  -d '{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"stream\":false}'" });
+        blocks.push({ title: 'Raw completion',
+          code: "curl -s " + proxy + "/completion" + auth + " \\\n"
+              + "  -H 'content-type: application/json' \\\n"
+              + "  -d '{\"prompt\":\"hello\",\"n_predict\":64}'" });
+        blocks.push({ title: 'Embeddings (if this is an --embeddings profile)',
+          code: "curl -s " + proxy + "/v1/embeddings" + auth + " \\\n"
+              + "  -H 'content-type: application/json' \\\n"
+              + "  -d '{\"input\":\"hello world\"}'" });
+        blocks.push({ title: 'Python — OpenAI SDK', lang: 'python',
+          note: this.authEnabled
+            ? 'api_key must be your WITCHGRID_SHARED_SECRET (it becomes the Bearer token).'
+            : 'auth is off, so api_key can be any non-empty string.',
+          code: "from openai import OpenAI\n"
+              + "client = OpenAI(\n"
+              + "    base_url=\"" + proxy + "/v1\",\n"
+              + "    api_key=\"" + (this.authEnabled ? '<your-witchgrid-secret>' : 'none') + "\",\n"
+              + ")\n"
+              + "r = client.chat.completions.create(\n"
+              + "    model=\"" + prof + "\",\n"
+              + "    messages=[{\"role\": \"user\", \"content\": \"hello\"}],\n"
+              + ")\n"
+              + "print(r.choices[0].message.content)" });
+      } else if (eng === 'image') {
+        blocks.push({ title: 'Generate an image (A1111-compatible, via control plane)', recommended: true,
+          note: 'sd-server speaks the AUTOMATIC1111 API. Decode the base64 result to a PNG.',
+          code: "curl -s " + proxy + "/sdapi/v1/txt2img" + auth + " \\\n"
+              + "  -H 'content-type: application/json' \\\n"
+              + "  -d '{\"prompt\":\"a red fox in autumn, anime style\",\"steps\":24,\"width\":768,\"height\":768}' \\\n"
+              + "  | jq -r '.images[0]' | base64 -d > out.png" });
+      } else if (eng === 'stt') {
+        blocks.push({ title: 'Transcribe audio (OpenAI-compatible, via control plane)', recommended: true,
+          note: 'whisper-server exposes the OpenAI /v1/audio/transcriptions endpoint. Send an audio file as multipart form data.',
+          code: "curl -s " + proxy + "/v1/audio/transcriptions" + auth + " \\\n"
+              + "  -F file=@audio.wav \\\n"
+              + "  -F response_format=json" });
+      } else if (eng === 'tts') {
+        blocks.push({ title: 'Synthesize speech (via control plane)', recommended: true,
+          note: 'piper --http returns WAV bytes for the posted text.',
+          code: "curl -s " + proxy + "/" + auth + " \\\n"
+              + "  --data 'Hello from witchgrid.' > out.wav" });
+      }
+
+      // 2. resolve-then-connect (engine-agnostic).
+      blocks.push({ title: 'Resolve then connect (keep CP off the data path)',
+        note: 'Returns {host, port, base_url} for the running instance. Workers resolve once, then hit the node directly. 404 when nothing is running (then POST /services or back off).',
+        code: "curl -s " + resolveUrl + "\n"
+            + "# → {\"profile\":\"" + prof + "\",\"host\":\"" + (this.host || '<node>') + "\",\"port\":" + (this.port || 0) + ",\"base_url\":\"" + (direct || 'http://<node>:<port>') + "\"}" });
+
+      // 3. direct (pinned to this instance).
+      if (direct) {
+        blocks.push({ title: 'Direct to this instance (no CP, pinned to this process)',
+          note: 'Fastest, but does not auto-spawn or fail over — if this service stops, the URL is dead.',
+          code: direct + (eng === 'llm' ? '/v1/chat/completions'
+            : eng === 'image' ? '/sdapi/v1/txt2img'
+            : eng === 'stt' ? '/v1/audio/transcriptions' : '/') });
+      }
+
+      return blocks;
+    },
+  };
+}
+
+function showConnect(id, profile, node, host, port, binary) {
+  window.dispatchEvent(new CustomEvent('witchgrid:show-connect', {
+    detail: { id, profile, node, host, port, binary } }));
+}
+
 // Inline test-prompt panel (Overview page). Lets the operator send
 // a single completion request through the routing layer without
 // leaving the dashboard — closes the loop on "spawn → verify it
