@@ -828,9 +828,14 @@ fn reap_stale_bench_runs(db): null {
 // the set — edits via the dashboard don't get clobbered by a CP
 // restart. To re-seed, drop the rows manually and restart.
 fn seed_default_profiles(db): null {
-	let r = query(db, "select count(*) as n from profiles", []);
-	if (r[0].n > 0) { return null; }
-
+	// insert-or-ignore per name (see the loop below) rather than an
+	// all-or-nothing "skip if any profile exists" guard. This means a CP
+	// upgrade picks up newly-curated default profiles without clobbering
+	// any an operator has edited (name is the PK; ON CONFLICT DO NOTHING
+	// leaves an existing row untouched). Same precedent as
+	// seed_default_settings. Trade-off: a default an operator deliberately
+	// deleted reappears on the next boot — re-delete it, or set its
+	// visibility to taste.
 	let now = iso_now();
 	let defaults = [
 		{
@@ -1060,14 +1065,292 @@ fn seed_default_profiles(db): null {
 				default_device: "auto",
 			},
 		},
+
+		// ─── General-purpose starter profiles ─────────────────────────
+		// Vendor-neutral, broadly-useful llama-server configs pointed at
+		// well-known GGUFs from bartowski (a default-trusted quanter). The
+		// flammen.ai profiles above are real production config kept as
+		// worked examples; these are the "what would I actually run"
+		// starters: VRAM tiers for general chat, a reasoning model, a
+		// coding model, plus two trade-off variants on the 8B workhorse.
+		// All default_device "auto" (GPU when present; clone with
+		// device=cpu for a CPU-only node). All Q4_K_M unless the name says
+		// otherwise — the quality/size sweet spot. VRAM figures in the
+		// comments are weights + a modest KV at the stated context.
+
+		// Small chat — ~2 GB weights. Runs on a CPU box or any 8 GB GPU,
+		// fast. The "always fits" baseline. q8_0 KV (cheap at 3B) keeps
+		// quality high.
+		{
+			name: "chat-llama3.2-3b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q8_0",
+					kv_cache_v: "q8_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18100,
+				context: 32768,
+				kv_type: "q8_0",
+				model_alias: "llama-3.2-3b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
+					file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Mid chat — ~5 GB weights, the default workhorse. Comfortable on
+		// a 12-16 GB GPU at 32k context with q4_0 KV + flash attention.
+		{
+			name: "chat-llama3.1-8b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18101,
+				context: 32768,
+				kv_type: "q4_0",
+				model_alias: "meta-llama-3.1-8b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+					file: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Large chat — ~9 GB weights. A clear quality step up from 8B;
+		// targets a 24 GB GPU at 32k context.
+		{
+			name: "chat-qwen2.5-14b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18102,
+				context: 32768,
+				kv_type: "q4_0",
+				model_alias: "qwen2.5-14b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Qwen2.5-14B-Instruct-GGUF",
+					file: "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// XL chat — ~20 GB weights, trades speed for quality. Tight on a
+		// single 24 GB card (drop context if it won't place), comfortable
+		// on 32-48 GB. Context kept at 16k so the KV cache fits alongside.
+		{
+			name: "chat-qwen2.5-32b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 16384,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18103,
+				context: 16384,
+				kv_type: "q4_0",
+				model_alias: "qwen2.5-32b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Qwen2.5-32B-Instruct-GGUF",
+					file: "Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Same 8B, tuned for QUALITY over speed: Q6_K weights (~6.6 GB,
+		// near-lossless vs Q4_K_M) and an f16-class q8_0 KV cache. Slower
+		// and hungrier than chat-llama3.1-8b; reach for it when answer
+		// fidelity matters more than tokens/sec or context length.
+		{
+			name: "chat-llama3.1-8b-quality",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 16384,
+					kv_cache_k: "q8_0",
+					kv_cache_v: "q8_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18104,
+				context: 16384,
+				kv_type: "q8_0",
+				model_alias: "meta-llama-3.1-8b-instruct-q6_k",
+				hf_source: {
+					repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+					file: "Meta-Llama-3.1-8B-Instruct-Q6_K.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Same 8B, tuned for THROUGHPUT: 4 parallel slots so the server
+		// handles concurrent requests, with an 8k window per slot (32k of
+		// KV total). Trades single-request latency for aggregate
+		// tokens/sec across users — the config for a shared serving box.
+		// Reuses the Q4_K_M file (shares the alias with chat-llama3.1-8b,
+		// so one pull covers both).
+		{
+			name: "chat-llama3.1-8b-serving",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 8192,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 4,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18105,
+				context: 8192,
+				kv_type: "q4_0",
+				model_alias: "meta-llama-3.1-8b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+					file: "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Reasoning — DeepSeek-R1 distilled into Qwen 14B (~9 GB weights).
+		// Emits <think>…</think> chains, so give it room: 32k context.
+		// Consumers should strip/handle the thinking block. Targets 24 GB.
+		{
+			name: "reason-deepseek-r1-14b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18110,
+				context: 32768,
+				kv_type: "q4_0",
+				model_alias: "deepseek-r1-distill-qwen-14b-q4_k_m",
+				hf_source: {
+					repo: "bartowski/DeepSeek-R1-Distill-Qwen-14B-GGUF",
+					file: "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Coding (accessible) — Qwen2.5-Coder 7B (~4.7 GB weights). Strong
+		// code model that fits a 12 GB GPU. 32k context for whole-file work;
+		// q8_0 KV to keep code tokens crisp.
+		{
+			name: "code-qwen2.5-7b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 32768,
+					kv_cache_k: "q8_0",
+					kv_cache_v: "q8_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18120,
+				context: 32768,
+				kv_type: "q8_0",
+				model_alias: "qwen2.5-coder-7b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Qwen2.5-Coder-7B-Instruct-GGUF",
+					file: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
+
+		// Coding (quality) — Qwen2.5-Coder 32B (~20 GB weights). The
+		// near-frontier local coding model; targets 32-48 GB. Context at
+		// 16k so the KV cache fits beside the weights.
+		{
+			name: "code-qwen2.5-32b",
+			profile: {
+				binary: "llama-server",
+				intent: {
+					context: 16384,
+					kv_cache_k: "q4_0",
+					kv_cache_v: "q4_0",
+					parallel_slots: 1,
+					gpu_layers: 99,
+					flash_attention: true,
+				},
+				extra_flags: [],
+				default_port: 18121,
+				context: 16384,
+				kv_type: "q4_0",
+				model_alias: "qwen2.5-coder-32b-instruct-q4_k_m",
+				hf_source: {
+					repo: "bartowski/Qwen2.5-Coder-32B-Instruct-GGUF",
+					file: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
+				},
+				default_model: null,
+				default_device: "auto",
+			},
+		},
 	];
 	for (d in defaults) {
+		// insert-or-ignore: only fills in default profiles whose name
+		// doesn't already exist, so operator edits to a same-named profile
+		// survive upgrades. See the note at the top of this function.
 		exec(db,
-			"insert into profiles (name, profile_json, version, created_at, updated_at) "
+			"insert or ignore into profiles (name, profile_json, version, created_at, updated_at) "
 			+ "values (?, ?, 1, ?, ?)",
 			[d.name, stringify(d.profile), now, now]);
 	}
-	print("[cp] seeded " + defaults.length + " default profiles");
+	print("[cp] ensured " + defaults.length + " default profiles (insert-or-ignore)");
 	return null;
 }
 

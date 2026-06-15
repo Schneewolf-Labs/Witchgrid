@@ -76,10 +76,18 @@ WITCHGRID_DATA_DIR=$HOME/.witchgrid \
 
 # Drive it
 curl -s http://<cp-host>:8765/nodes | jq            # who's in the grid
-curl -X POST http://<cp-host>:8765/v1/llama/chat-mahou/completion \
+curl -X POST http://<cp-host>:8765/v1/llama/chat-llama3.1-8b/completion \
   -H 'content-type: application/json' \
   -d '{"prompt":"hello","n_predict":32}'             # auto-place + spawn + complete
 ```
+
+A fresh CP seeds a set of ready-to-use **default profiles** — no config to write before the first request. General-purpose starters (all auto-pull their GGUF from a trusted quanter on first spawn):
+
+- **Chat by VRAM tier** — `chat-llama3.2-3b` (CPU/8 GB), `chat-llama3.1-8b` (12-16 GB), `chat-qwen2.5-14b` (24 GB), `chat-qwen2.5-32b` (32-48 GB).
+- **Trade-offs on the 8B workhorse** — `chat-llama3.1-8b-quality` (Q6_K, fidelity over speed) and `chat-llama3.1-8b-serving` (4 slots, throughput over latency).
+- **Specialists** — `reason-deepseek-r1-14b` (reasoning), `code-qwen2.5-7b` / `code-qwen2.5-32b` (coding), `embed-nomic` (embeddings), `vision-qwen` (multimodal), `audio-whisper-base` (STT), `tts-piper-en` (TTS).
+
+Plus the flammen.ai production profiles (`chat-mahou`, `designer-cpu`, `memory-phoenix`, `image-niku`) kept as worked examples. Clone any of them in the dashboard's profile wizard to retune for your hardware. Defaults are filled in with insert-or-ignore, so upgrades pick up new ones without touching profiles you've edited.
 
 Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub release](https://github.com/hemlang/witchgrid/releases); installing the matching [Hemlock](https://hemlang.dev) runtime is only needed to *build*.
 
