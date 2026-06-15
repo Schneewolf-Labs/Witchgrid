@@ -74,8 +74,18 @@ on:
 #           BEHAVIORAL: string.find() now returns a CODEPOINT index (was a
 #           byte index); our path/URL parsing is ASCII so unaffected, and the
 #           unit+integration suites pass clean on 2.7.0.
+#   2.8.1 — 2.8.0 + 2.8.1 are overwhelmingly Windows (MinGW-w64) support —
+#           irrelevant to our Linux/macOS deploy. The one POSIX-relevant
+#           piece is a 2.8.1 compiler-correctness batch surfaced by a new
+#           stdlib-compile-check lane: a `let`-bound module function called
+#           from an object method emitted a nonexistent `_modN_fn_*` symbol,
+#           plus @stdlib/mmap arity + method-dispatch fixes. Pure bug fixes
+#           (no Witchgrid pattern regressed — both binaries already compiled
+#           clean on 2.7.0). No breaking changes for POSIX. Bumped to ride
+#           the compiler fixes + stay current; unit+integration suites pass
+#           clean on 2.8.1. (2.8.0 skipped — same-day predecessor of 2.8.1.)
 env:
-  HEMLOCK_VERSION: 2.7.0
+  HEMLOCK_VERSION: 2.8.1
 
 jobs:
   build:
