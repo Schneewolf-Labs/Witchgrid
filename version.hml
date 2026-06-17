@@ -1,4 +1,4 @@
 // Single source of truth for the Witchgrid version. Bumped at release time;
 // surfaced by the CP (/healthz, /metrics, dashboard) and reported by each
 // agent at /register. Imported cross-dir as "../version".
-export let WITCHGRID_VERSION = "0.9.1";
+export let WITCHGRID_VERSION = "0.9.2";
