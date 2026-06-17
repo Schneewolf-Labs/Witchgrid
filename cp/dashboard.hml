@@ -76,6 +76,20 @@ fn util_class(free, total): string {
 	return "err";
 }
 
+// Color class for a temperature reading (°C). Unlike util_class (more =
+// better), higher temp = worse, so thresholds run the other way. Tuned
+// for silicon: comfortable < 65, warm 65–83, hot ≥ 83 (near throttle).
+fn temp_class(temp_c): string {
+	if (temp_c == null) { return "ok"; }
+	if (temp_c < 65) { return "ok"; }
+	if (temp_c < 83) { return "warn"; }
+	return "err";
+}
+
+// Sparkline y-scale for temps — a fixed 100 °C ceiling so the trace
+// height reads as an absolute temperature, comparable across nodes.
+let TEMP_SCALE_C = 100;
+
 // ── server-rendered SVG sparkline ────────────────────────────────
 //
 // Single-color filled-area sparkline. Pure inline SVG so it ships
@@ -186,7 +200,7 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_
 		let age_class = "node-card-age";
 		if (stale) { age_class = "node-card-age stale"; }
 
-		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, ram: [], disk: {} };
+		let bundle = samples_by_node?[n.node_id] ?? { gpu: {}, gpu_power: {}, gpu_temp: {}, ram: [], cpu_temp: [], disk: {} };
 		let unmanaged = unmanaged_by_node?[n.node_id] ?? {};
 		let hw = n.hardware ?? {};
 
@@ -271,6 +285,23 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_
 					+ cpu_cores + " core" + (cpu_cores == 1 ? "" : "s")
 				+ "</span>"
 				+ "</div>";
+
+			// CPU temp sub-row — only when the agent reported it (Linux
+			// with a readable sensor; null on macOS, so the row is skipped).
+			// Bar fills toward the 100 °C ceiling, colored by temp_class.
+			let cpu_temp = hw?.cpu_temp_c;
+			if (cpu_temp != null) {
+				let ct_pct = (f64(cpu_temp) / f64(TEMP_SCALE_C)) * 100.0;
+				if (ct_pct > 100.0) { ct_pct = 100.0; }
+				let ct_kind = temp_class(cpu_temp);
+				html = html + "<div class=\"hw-row hw-row-sub\">"
+					+ "<span class=\"hw-name\">↳ temp</span>"
+					+ "<div class=\"gpu-bar\"><div class=\"bar-" + ct_kind
+						+ "\" style=\"width: " + ct_pct + "%;\"></div></div>"
+					+ "<span class=\"gpu-mem\">" + cpu_temp + " °C</span>"
+					+ "</div>"
+					+ render_sparkline(bundle?.cpu_temp ?? [], TEMP_SCALE_C, ct_kind);
+			}
 		}
 
 		// RAM
@@ -334,6 +365,22 @@ export fn render_nodes(nodes_data, samples_by_node, unmanaged_by_node, services_
 						+ " / " + i32(g.power_limit_w) + " W</span>"
 					+ "</div>"
 					+ render_sparkline(pwr_series, limit_i, pwr_kind);
+			}
+
+			// GPU temp sub-row (NVIDIA + AMD; null on Apple Metal → skipped).
+			// Bar fills toward the 100 °C ceiling, colored by temp_class.
+			if (g?.temp_c != null) {
+				let gt_pct = (f64(g.temp_c) / f64(TEMP_SCALE_C)) * 100.0;
+				if (gt_pct > 100.0) { gt_pct = 100.0; }
+				let gt_kind = temp_class(g.temp_c);
+				let gt_series = bundle?.gpu_temp?["" + g.index] ?? [];
+				html = html + "<div class=\"hw-row hw-row-sub\">"
+					+ "<span class=\"hw-name\">↳ temp</span>"
+					+ "<div class=\"gpu-bar\"><div class=\"bar-" + gt_kind
+						+ "\" style=\"width: " + gt_pct + "%;\"></div></div>"
+					+ "<span class=\"gpu-mem\">" + g.temp_c + " °C</span>"
+					+ "</div>"
+					+ render_sparkline(gt_series, TEMP_SCALE_C, gt_kind);
 			}
 		}
 

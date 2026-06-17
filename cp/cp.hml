@@ -402,8 +402,9 @@ fn init_db(db): null {
 	// per heartbeat. Pruned to last 1hr each ingest. Tiny table —
 	// 1 node × (4 GPUs + 1 RAM + N disks) × 120 samples ≈ 700 rows.
 	//
-	//   metric: 'gpu_free_mb' | 'ram_free_mb' | 'disk_free_mb'
-	//   series: gpu_index as text, disk path, or null for ram
+	//   metric: 'gpu_free_mb' | 'gpu_power_w' | 'gpu_temp_c'
+	//         | 'ram_free_mb' | 'cpu_temp_c' | 'disk_free_mb'
+	//   series: gpu_index as text, disk path, or null for ram/cpu
 	exec(db, "create table if not exists node_samples ("
 		+ "node_id text not null,"
 		+ "metric text not null,"
@@ -1475,12 +1476,24 @@ fn handle_register(req): object {
 					+ "values (?, 'gpu_power_w', ?, ?, ?)",
 					[node_id, "" + g.index, g.power_draw_w, now]);
 			}
+			// temp °C per GPU; null on sensorless / Apple Metal cards.
+			if (g?.temp_c != null) {
+				exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+					+ "values (?, 'gpu_temp_c', ?, ?, ?)",
+					[node_id, "" + g.index, g.temp_c, now]);
+			}
 		}
 	}
 	if (hw?.ram_free_mb != null) {
 		exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
 			+ "values (?, 'ram_free_mb', null, ?, ?)",
 			[node_id, hw.ram_free_mb, now]);
+	}
+	// CPU package temp °C; null on macOS / sensorless boxes.
+	if (hw?.cpu_temp_c != null) {
+		exec(DB, "insert into node_samples (node_id, metric, series, value, sampled_at) "
+			+ "values (?, 'cpu_temp_c', null, ?, ?)",
+			[node_id, hw.cpu_temp_c, now]);
 	}
 	if (hw?.disks != null) {
 		for (d in hw.disks) {
@@ -1676,6 +1689,8 @@ fn handle_metrics(req): object {
 	let m_gpu_total  = "";
 	let m_gpu_used   = "";
 	let m_gpu_power  = "";
+	let m_gpu_temp   = "";
+	let m_cpu_temp   = "";
 
 	for (n in nodes) {
 		let nl = "{node=\"" + n.node_id + "\"}";
@@ -1698,6 +1713,9 @@ fn handle_metrics(req): object {
 		if (hw?.cpu_cores != null) {
 			m_cpu_cores = m_cpu_cores + "witchgrid_node_cpu_cores" + nl + " " + hw.cpu_cores + "\n";
 		}
+		if (hw?.cpu_temp_c != null) {
+			m_cpu_temp = m_cpu_temp + "witchgrid_node_cpu_temp_celsius" + nl + " " + hw.cpu_temp_c + "\n";
+		}
 
 		let gpus = hw?.gpus ?? [];
 		for (g in gpus) {
@@ -1707,6 +1725,9 @@ fn handle_metrics(req): object {
 			m_gpu_used  = m_gpu_used  + "witchgrid_gpu_used_mb"  + gl + " " + (g.total_mb - g.free_mb) + "\n";
 			if (g?.power_draw_w != null) {
 				m_gpu_power = m_gpu_power + "witchgrid_gpu_power_watts" + gl + " " + g.power_draw_w + "\n";
+			}
+			if (g?.temp_c != null) {
+				m_gpu_temp = m_gpu_temp + "witchgrid_gpu_temp_celsius" + gl + " " + g.temp_c + "\n";
 			}
 		}
 	}
@@ -1740,7 +1761,11 @@ fn handle_metrics(req): object {
 		+ "# HELP witchgrid_gpu_used_mb Used VRAM per GPU (MB)\n"
 		+ "# TYPE witchgrid_gpu_used_mb gauge\n" + m_gpu_used
 		+ "# HELP witchgrid_gpu_power_watts Current GPU power draw (W)\n"
-		+ "# TYPE witchgrid_gpu_power_watts gauge\n" + m_gpu_power;
+		+ "# TYPE witchgrid_gpu_power_watts gauge\n" + m_gpu_power
+		+ "# HELP witchgrid_gpu_temp_celsius Current GPU temperature (C)\n"
+		+ "# TYPE witchgrid_gpu_temp_celsius gauge\n" + m_gpu_temp
+		+ "# HELP witchgrid_node_cpu_temp_celsius Current CPU package temperature (C)\n"
+		+ "# TYPE witchgrid_node_cpu_temp_celsius gauge\n" + m_cpu_temp;
 
 	return { status: 200, body: out,
 		headers: { "content-type": "text/plain; version=0.0.4; charset=utf-8" } };
@@ -4388,15 +4413,19 @@ let SAMPLE_HISTORY_POINTS = 60;
 fn samples_for_dashboard(nodes_data): object {
 	let out = {};
 	for (n in nodes_data) {
-		let bundle = { gpu: {}, gpu_power: {}, ram: [], disk: {} };
+		let bundle = { gpu: {}, gpu_power: {}, gpu_temp: {}, ram: [], cpu_temp: [], disk: {} };
 		let gpus = n.hardware?.gpus ?? [];
 		for (g in gpus) {
 			bundle.gpu["" + g.index] = fetch_samples(n.node_id,
 				"gpu_free_mb", "" + g.index, SAMPLE_HISTORY_POINTS);
 			bundle.gpu_power["" + g.index] = fetch_samples(n.node_id,
 				"gpu_power_w", "" + g.index, SAMPLE_HISTORY_POINTS);
+			bundle.gpu_temp["" + g.index] = fetch_samples(n.node_id,
+				"gpu_temp_c", "" + g.index, SAMPLE_HISTORY_POINTS);
 		}
 		bundle.ram = fetch_samples(n.node_id, "ram_free_mb", null,
+			SAMPLE_HISTORY_POINTS);
+		bundle.cpu_temp = fetch_samples(n.node_id, "cpu_temp_c", null,
 			SAMPLE_HISTORY_POINTS);
 		let disks = n.hardware?.disks ?? [];
 		for (d in disks) {

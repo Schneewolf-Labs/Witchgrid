@@ -35,7 +35,7 @@ fn probe_gpus_nvidia(): array {
 	let r = null;
 	try {
 		r = exec_argv(["nvidia-smi",
-			"--query-gpu=index,name,memory.total,memory.free,uuid,power.draw,power.limit",
+			"--query-gpu=index,name,memory.total,memory.free,uuid,power.draw,power.limit,temperature.gpu",
 			"--format=csv,noheader,nounits"]);
 	} catch (e) {
 		return [];
@@ -62,6 +62,13 @@ fn probe_gpus_nvidia(): array {
 			if (pd != "[N/A]" && pd.length > 0) { power_draw = f64(pd); }
 			if (pl != "[N/A]" && pl.length > 0) { power_limit = f64(pl); }
 		}
+		// temperature.gpu — integer °C, always present on NVIDIA but guard
+		// for "[N/A]" the same way as power so a sensorless card stays null.
+		let temp_c = null;
+		if (parts.length >= 8) {
+			let tc = parts[7].trim();
+			if (tc != "[N/A]" && tc.length > 0) { temp_c = i32(tc); }
+		}
 		gpus.push({
 			index:        i32(parts[0].trim()),
 			name:         parts[1].trim(),
@@ -70,6 +77,7 @@ fn probe_gpus_nvidia(): array {
 			uuid:         parts[4].trim(),
 			power_draw_w:  power_draw,
 			power_limit_w: power_limit,
+			temp_c:        temp_c,
 		});
 	}
 	return gpus;
@@ -94,6 +102,7 @@ fn probe_gpus_amd(start_index: i32): array {
 			"--showmeminfo", "vram",
 			"--showproductname",
 			"--showpower",
+			"--showtemp",
 			"--json"]);
 	} catch (e) { return []; }
 	if (r.exit_code != 0 || r.output.length == 0) { return []; }
@@ -127,6 +136,14 @@ fn probe_gpus_amd(start_index: i32): array {
 		if (pd_avg != null) { power_draw = f64(pd_avg); }
 		else if (pd_cur != null) { power_draw = f64(pd_cur); }
 
+		// Temp: prefer the edge sensor (die surface), fall back to junction
+		// (hotspot). rocm-smi labels vary slightly by version; try both.
+		let temp_c = null;
+		let t_edge = card?["Temperature (Sensor edge) (C)"];
+		let t_junc = card?["Temperature (Sensor junction) (C)"];
+		if (t_edge != null) { temp_c = i32(f64(t_edge)); }
+		else if (t_junc != null) { temp_c = i32(f64(t_junc)); }
+
 		// Name: "Card series" carries the human-readable label
 		// ("Navi 21 [Radeon RX 6800/6800 XT / 6900 XT]"). For APUs
 		// it's a hex device ID, which is uglier — fall back to
@@ -145,6 +162,7 @@ fn probe_gpus_amd(start_index: i32): array {
 			uuid:          key,                // card0/card1 — stable rocm-smi handle
 			power_draw_w:  power_draw,
 			power_limit_w: null,
+			temp_c:        temp_c,
 		});
 		next_index = next_index + 1;
 	}
@@ -522,6 +540,64 @@ export fn probe_unmanaged_procs(gpus, known_pids): array {
 	return out;
 }
 
+// CPU package temperature in °C, or null when unavailable.
+//
+// Linux only — reads sysfs. macOS has no sysfs thermal interface and
+// CPU temp there needs powermetrics (root) or a third-party tool, so we
+// return null (the dashboard skips the row, same as Apple-Metal power).
+//
+// Sources, most-accurate first, both gathered in one shell pass:
+//   - /sys/class/hwmon/hwmon*/  with name coretemp|k10temp|zenpower|
+//     cpu_thermal → temp*_input (Intel package/per-core, AMD Tctl/Tccd).
+//   - /sys/class/thermal/thermal_zone*/  type+temp as a fallback
+//     (x86_pkg_temp on Intel; acpitz elsewhere).
+// Both report milli-°C. We tag each reading with its source name, prefer
+// the max among known-CPU sources, and fall back to the hottest plausible
+// zone (20–120 °C) if no CPU-named sensor is present. Static shell command,
+// no interpolation — globbing is why it's `sh -c` rather than argv.
+fn probe_cpu_temp() {
+	if (!exists("/sys/class/thermal") && !exists("/sys/class/hwmon")) {
+		return null;
+	}
+	let r = null;
+	try {
+		r = exec_argv(["sh", "-c",
+			"for h in /sys/class/hwmon/hwmon*; do "
+			+ "n=$(cat \"$h/name\" 2>/dev/null); "
+			+ "for f in \"$h\"/temp*_input; do "
+			+ "[ -r \"$f\" ] && printf '%s %s\\n' \"$n\" \"$(cat \"$f\" 2>/dev/null)\"; "
+			+ "done; done; "
+			+ "for z in /sys/class/thermal/thermal_zone*; do "
+			+ "printf '%s %s\\n' \"$(cat \"$z/type\" 2>/dev/null)\" \"$(cat \"$z/temp\" 2>/dev/null)\"; "
+			+ "done"]);
+	} catch (e) { return null; }
+	if (r.exit_code != 0 || r.output.length == 0) { return null; }
+
+	let best_cpu = null;   // hottest reading from a known CPU sensor
+	let best_any = null;   // hottest plausible reading, any source
+	let lines = r.output.split("\n");
+	for (line in lines) {
+		let t = line.trim();
+		if (t.length == 0) { continue; }
+		let sp = t.find(" ");
+		if (sp <= 0) { continue; }
+		let typ = t.substr(0, sp);
+		let vstr = t.substr(sp + 1, t.length - sp - 1).trim();
+		if (vstr.length == 0) { continue; }
+		let milli = 0;
+		try { milli = i32(vstr); } catch (e) { continue; }
+		let c = i32(milli / 1000);   // whole °C, matching GPU temps + the int column
+		if (c < 20 || c > 120) { continue; }   // implausible / unpopulated
+		let is_cpu = (typ == "coretemp" || typ == "k10temp"
+			|| typ == "zenpower" || typ == "cpu_thermal"
+			|| typ == "x86_pkg_temp");
+		if (is_cpu && (best_cpu == null || c > best_cpu)) { best_cpu = c; }
+		if (best_any == null || c > best_any) { best_any = c; }
+	}
+	if (best_cpu != null) { return best_cpu; }
+	return best_any;
+}
+
 export fn probe(canonical_dir, extra_dirs): object {
 	// Convert bytes → MB up front so the wire payload is small ints,
 	// not 64-bit byte counts CP would have to divide every render.
@@ -539,6 +615,7 @@ export fn probe(canonical_dir, extra_dirs): object {
 	return {
 		role:         role,
 		cpu_cores:    cpu_count(),
+		cpu_temp_c:   probe_cpu_temp(),
 		ram_total_mb: ram_total_mb,
 		ram_free_mb:  ram_free_mb,
 		gpus:         gpus,
