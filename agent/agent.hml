@@ -306,7 +306,6 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 			eprint("[heartbeat] CP unreachable: " + e);
 		}
 	}
-	return null;
 }
 
 // Strip URL → bare host. Handed to make_pull_handler so peer pulls

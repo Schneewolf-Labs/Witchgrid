@@ -4,9 +4,9 @@ Orchestration + dashboard for self-hosted AI inference. The control plane that l
 
 For the case where you have a small fleet of CPU/GPU boxes and want to manage what's running where, what's loaded, and what's available — without hand-wiring each consumer to a hardcoded inference URL.
 
-> **Status: v0.9.0 — 1.0 candidate.** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a real-time dashboard (SSE-pushed, failure-first), a self-healing service supervisor, a first-class CPU/GPU toggle, a guided profile wizard, and graceful WAL-checkpoint shutdown all work. The whole [1.0 punch list](#roadmap-to-10) is checked; 0.9.0 is the soak-before-1.0 cut.
+> **Status: v0.9.3 — 1.0 candidate.** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a real-time dashboard (SSE-pushed, failure-first), a self-healing service supervisor, a first-class CPU/GPU toggle, a guided profile wizard, and graceful WAL-checkpoint shutdown all work. The whole [1.0 punch list](#roadmap-to-10) is checked; the 0.9.x line is the soak-before-1.0 cut.
 
-Built in [Hemlock](https://hemlang.dev) (2.5.7). Each binary is a single ~7 MB ELF with universal dynamic deps (`libm`, `libffi`, `libcrypto`, `libwebsockets`, `libc`) — deploy is `scp` + a service unit.
+Built in [Hemlock](https://hemlang.dev) (2.8.1). Each binary is a single ~10 MB ELF. Since Hemlock 2.6.0 `hemlockc` static-links libwebsockets/libssl/libffi, so they are build-time inputs, not runtime deps; what's left dynamic is universal (`libcap`, `libuv`, `libev`, `libm`, `libc`). The one real runtime requirement is **libsqlite3** — `@stdlib/sqlite` `dlopen()`s `libsqlite3.so.0` at startup, so it never shows up in `ldd` and must be present on every box that runs the CP or an agent. Deploy is `scp` + a service unit.
 
 ---
 

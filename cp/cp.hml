@@ -791,7 +791,6 @@ async fn db_backup_loop(): null {
 			eprint("[backup] prune scan failed: " + e);
 		}
 	}
-	return null;
 }
 
 // Bench reaper. Anything left in 'running' for >10 min is almost
@@ -2577,10 +2576,16 @@ fn health_path_for(binary): string {
 	return "/health";
 }
 
-fn wait_for_service_ready(host: string, port: i32, health_path: string): bool {
+// timeout_seconds is passed by the caller rather than read from a
+// module constant: autospawn blocks a client request (60s), while a
+// bench deliberately allows longer (120s) for a cold model load. Both
+// used to land on AUTOSPAWN_READY_TIMEOUT_SECONDS, which silently
+// capped benches at 60s and left BENCH_READY_TIMEOUT_SECONDS dead.
+fn wait_for_service_ready(host: string, port: i32, health_path: string,
+                          timeout_seconds: i32): bool {
 	let url = "http://" + host + ":" + port + health_path;
 	let waited = 0;
-	while (waited < AUTOSPAWN_READY_TIMEOUT_SECONDS) {
+	while (waited < timeout_seconds) {
 		try {
 			let r = get(url, null);
 			if (r.status_code == 200) { return true; }
@@ -2700,7 +2705,8 @@ fn auto_spawn(profile_name: string) {
 	}
 
 	let host = extract_host(pick.agent_url);
-	if (!wait_for_service_ready(host, port, health_path_for(profile?.binary))) {
+	if (!wait_for_service_ready(host, port, health_path_for(profile?.binary),
+	                            AUTOSPAWN_READY_TIMEOUT_SECONDS)) {
 		return { error: { status: 503, body: stringify({
 			error: "auto-spawned service did not become ready in "
 				+ AUTOSPAWN_READY_TIMEOUT_SECONDS + "s",
@@ -4027,10 +4033,10 @@ async fn bench_task(bench_id: string, target_node: string,
 	let svc_id = svc.id;
 	let host = extract_host(agent_url);
 
-	if (!wait_for_service_ready(host, port, "/health")) {
+	if (!wait_for_service_ready(host, port, "/health", BENCH_READY_TIMEOUT_SECONDS)) {
 		try { cp_post_json(agent_url + "/services/stop", { id: svc_id }); } catch (e) { }
 		db_exec(DB, "update bench_runs set status='error', error=? where id=?",
-			["service didn't become ready in " + AUTOSPAWN_READY_TIMEOUT_SECONDS + "s", bench_id]);
+			["service didn't become ready in " + BENCH_READY_TIMEOUT_SECONDS + "s", bench_id]);
 		return null;
 	}
 

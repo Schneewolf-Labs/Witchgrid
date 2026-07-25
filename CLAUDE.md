@@ -49,7 +49,7 @@ You shouldn't have to ssh into your GPU box to swap a model. You shouldn't have 
 └───────────┘   └───────────┘   └───────────────┘
 ```
 
-CP and agent each compile to a standalone ~7 MB ELF (`witchgrid-cp`, `witchgrid-agent`). Universal dynamic deps only (`libm`, `libffi`, `libcrypto`, `libwebsockets`, `libc`).
+CP and agent each compile to a standalone ~10 MB ELF (`witchgrid-cp`, `witchgrid-agent`). Hemlock 2.6.0+ static-links libwebsockets/libssl/libffi, so the remaining dynamic deps are universal (`libcap`, `libuv`, `libev`, `libm`, `libc`). **libsqlite3 is the one true runtime dependency** — it is `dlopen()`ed by `@stdlib/sqlite`, so it is invisible to `ldd` and is not bundled; every box running the CP or an agent needs it installed.
 
 ## Components
 

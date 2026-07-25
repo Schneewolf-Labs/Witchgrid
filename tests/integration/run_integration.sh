@@ -60,7 +60,13 @@ if curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
 fi
 
 echo "[integration] booting CP ($CP_URL)…"
-( cd "$TMP/cp" && WITCHGRID_DATA_DIR="$TMP/cp" WITCHGRID_STALE_NODE_SECONDS="$STALE_SECS" WITCHGRID_CP_PORT="$CP_PORT" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
+# `exec` matters: the CP needs a subshell for the `cd`, and without exec
+# `$!` is the *subshell's* pid, not the CP's. cleanup would then kill the
+# wrapper and orphan the daemon — leaving :$CP_PORT bound, which makes the
+# next local run trip the stale-CP pre-flight below. (CI never caught it;
+# the runner is thrown away.) exec replaces the subshell with the CP, so
+# $! is the real pid. The agents below need no subshell and are fine.
+( cd "$TMP/cp" && exec env WITCHGRID_DATA_DIR="$TMP/cp" WITCHGRID_STALE_NODE_SECONDS="$STALE_SECS" WITCHGRID_CP_PORT="$CP_PORT" "$CP_BIN" ) >"$TMP/cp.log" 2>&1 &
 CP_PID=$!; disown "$CP_PID" 2>/dev/null || true
 for i in $(seq 1 30); do curl -fsS "$CP_URL/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
 if ! curl -fsS "$CP_URL/healthz" >/dev/null 2>&1; then
