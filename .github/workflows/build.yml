@@ -84,8 +84,22 @@ on:
 #           clean on 2.7.0). No breaking changes for POSIX. Bumped to ride
 #           the compiler fixes + stay current; unit+integration suites pass
 #           clean on 2.8.1. (2.8.0 skipped — same-day predecessor of 2.8.1.)
+#   2.8.2 — the load-bearing one is a runtime data race in the single-char
+#           ASCII string pool. Its 128 entries were built lazily behind a
+#           plain `static int initialized`, on the path every single-char
+#           string takes: two threads could both run the fill, and the flag
+#           was published without a release barrier, so a reader could get a
+#           not-yet-initialized entry (a garbage HmlString*, not just a
+#           sanitizer gripe). Long-running threaded programs are exactly the
+#           exposure — i.e. the CP and agent, which are async-task daemons
+#           doing constant string work. The pool is now statically
+#           initialized, so the race is gone by construction. Also fixes
+#           --strict-types across module boundaries (imports were never
+#           type-bound, so every imported symbol read as an unknown
+#           identifier) and identifier diagnostics that reported ":0"
+#           instead of a real line. No codegen changes.
 env:
-  HEMLOCK_VERSION: 2.8.1
+  HEMLOCK_VERSION: 2.8.2
 
 jobs:
   build:
@@ -150,15 +164,20 @@ jobs:
           hemlock --version
           hemlockc --version
           # Sanity-check the install (catch a gross fallback, e.g. install.sh
-          # dropping to a different major.minor). NOTE: Hemlock's version.h
-          # isn't bumped per patch tag — the 2.6.1/2.6.2 release binaries still
-          # self-report "2.6.0" — so we can't grep the exact patch. install.sh
-          # pulls assets BY TAG (v${HEMLOCK_VERSION}), so the right (fixed)
-          # build is installed regardless of the stale self-report; we just
-          # verify the major.minor line matches.
+          # dropping to a different major.minor). major.minor is the hard
+          # gate; the exact patch is only warned about, because version.h has
+          # historically not been bumped for every patch tag (the 2.6.1/2.6.2
+          # release binaries self-report "2.6.0"). install.sh pulls assets BY
+          # TAG (v${HEMLOCK_VERSION}), so the correct build is installed
+          # regardless of what it self-reports — a mismatch here means the
+          # upstream bump was missed, not that we built against the wrong
+          # thing, and it should not fail our build. 2.8.2 does report
+          # exactly.
           MM="$(echo "${HEMLOCK_VERSION}" | cut -d. -f1,2)"
           hemlockc --version | grep -q "${MM}\." \
             || { echo "Wrong Hemlock major.minor installed (wanted ${MM}.x)"; exit 1; }
+          hemlockc --version | grep -q "${HEMLOCK_VERSION}" \
+            || echo "NOTE: hemlockc does not self-report ${HEMLOCK_VERSION} (upstream version.h likely not bumped for this tag)"
 
       - name: Build cp
         run: |
