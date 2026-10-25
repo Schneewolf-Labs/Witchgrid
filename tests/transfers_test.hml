@@ -8,7 +8,7 @@
 // they're load-bearing — keep them green.
 
 import { describe, test, assert_eq } from "@stdlib/testing";
-import { valid_alias, valid_hf_component, valid_peer_url, scrub } from "../agent/transfers";
+import { valid_alias, valid_hf_component, valid_peer_url, host_is_lan, scrub } from "../agent/transfers";
 
 export fn register(): null {
 	describe("transfers.valid_alias (filename-segment guard)", fn() {
@@ -88,6 +88,43 @@ export fn register(): null {
 		test("rejects empty / null", fn() {
 			assert_eq(valid_peer_url(""), false);
 			assert_eq(valid_peer_url(null), false);
+		});
+		test("rejects a public IPv4 host — SSRF + token exfiltration off-LAN", fn() {
+			assert_eq(valid_peer_url("http://8.8.8.8:8766/models/x/blob"), false);
+		});
+		test("rejects 169.254.169.254 (cloud metadata)", fn() {
+			assert_eq(valid_peer_url("http://169.254.169.254/latest/meta-data/"), false);
+		});
+	});
+
+	describe("transfers.host_is_lan (anti-SSRF target guard)", fn() {
+		test("accepts private IPv4 literals", fn() {
+			assert_eq(host_is_lan("10.0.0.12"), true);
+			assert_eq(host_is_lan("192.168.8.154"), true);
+			assert_eq(host_is_lan("172.16.0.1"), true);
+			assert_eq(host_is_lan("172.31.255.254"), true);
+			assert_eq(host_is_lan("127.0.0.1"), true);
+		});
+		test("accepts hostnames (LAN-first, not range-checkable here)", fn() {
+			assert_eq(host_is_lan("node-a.lan"), true);
+			assert_eq(host_is_lan("localhost"), true);
+		});
+		test("rejects public IPv4", fn() {
+			assert_eq(host_is_lan("8.8.8.8"), false);
+			assert_eq(host_is_lan("1.1.1.1"), false);
+			assert_eq(host_is_lan("172.32.0.1"), false);   // just outside 172.16/12
+			assert_eq(host_is_lan("172.15.0.1"), false);
+		});
+		test("rejects link-local 169.254/16 (metadata) and 0.x", fn() {
+			assert_eq(host_is_lan("169.254.169.254"), false);
+			assert_eq(host_is_lan("0.0.0.0"), false);
+		});
+		test("rejects malformed IPv4 literals", fn() {
+			assert_eq(host_is_lan("10.0.0"), false);
+			assert_eq(host_is_lan("10.0.0.256"), false);
+			assert_eq(host_is_lan("10.0.0.1.2"), false);
+			assert_eq(host_is_lan(""), false);
+			assert_eq(host_is_lan(null), false);
 		});
 	});
 
