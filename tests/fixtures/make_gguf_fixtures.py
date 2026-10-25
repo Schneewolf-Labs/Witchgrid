@@ -89,3 +89,29 @@ write("gguf_v2.gguf", gguf([], version=2))
 
 # Not a GGUF at all: wrong magic.
 write("bad_magic.bin", b"NOPE" + b"\x00" * 28)
+
+T_ARRAY = 9
+
+# Hardening fixtures: a well-formed header whose KV lies about a length/count,
+# the shapes a malicious model from HF/a peer would use. The parser must reject
+# each (throw) instead of truncating to a negative size, reading past EOF, or
+# looping on an absurd count.
+
+# A metadata STRING that claims a 2 GiB length (0x80000000 — also the exact
+# value that i32-truncated to a NEGATIVE size before hardening), with only a
+# couple of real bytes after it.
+evil_bigstring = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)  # version, tensor_count=0
+evil_bigstring += struct.pack("<Q", 1)                                   # kv_count = 1
+evil_bigstring += struct.pack("<Q", 1) + b"x"                            # key "x"
+evil_bigstring += struct.pack("<I", T_STRING)
+evil_bigstring += struct.pack("<Q", 0x80000000) + b"ab"                  # lied length + 2 bytes
+write("evil_bigstring.gguf", evil_bigstring)
+
+# An ARRAY KV claiming 2^40 elements — would drive an unbounded skip loop.
+evil_bigarray = b"GGUF" + struct.pack("<I", 3) + struct.pack("<Q", 0)
+evil_bigarray += struct.pack("<Q", 1)                                    # kv_count = 1
+evil_bigarray += struct.pack("<Q", 1) + b"y"                             # key "y"
+evil_bigarray += struct.pack("<I", T_ARRAY)
+evil_bigarray += struct.pack("<I", T_UINT32)                             # element type
+evil_bigarray += struct.pack("<Q", 1 << 40)                              # absurd element count
+write("evil_bigarray.gguf", evil_bigarray)

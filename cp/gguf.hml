@@ -48,6 +48,19 @@ let GGUF_TYPE_UINT64  = 10;
 let GGUF_TYPE_INT64   = 11;
 let GGUF_TYPE_FLOAT64 = 12;
 
+// Hardening caps for values read out of an UNTRUSTED GGUF. A malicious model
+// pulled from HuggingFace or a peer is parsed here (and on every agent's
+// catalog scan), so a length/count read from the file is attacker input.
+// Without bounds, `i32(read_u64(...))` truncated a huge u64 to a negative
+// size (read_bytes(negative)) and an array count drove an unbounded skip loop
+// / recursion. Every file-derived length+count is validated against both a
+// generous hard cap and the file size (nothing in the file can exceed it).
+// Real metadata is orders of magnitude under these.
+let GGUF_MAX_STRING_LEN: i64 = 67108864;    // 64 MiB
+let GGUF_MAX_ARRAY_COUNT: i64 = 268435456;  // 256 M elements
+let GGUF_MAX_KV_COUNT: i64    = 1048576;    // 1 M keys
+let GGUF_MAX_SKIP_DEPTH: i32  = 64;         // nested-array recursion cap
+
 // Bytes per scalar (excluding STRING and ARRAY).
 fn scalar_size(t: i32): i32 {
 	if (t == GGUF_TYPE_UINT8 || t == GGUF_TYPE_INT8 || t == GGUF_TYPE_BOOL) { return 1; }
@@ -86,13 +99,17 @@ fn read_u64(f): i64 {
 	return buf_u64_le(buf, 0);
 }
 
-fn read_string(f): string {
-	let n = i32(read_u64(f));
+fn read_string(f, max_bytes: i64): string {
+	let n: i64 = read_u64(f);
+	if (n < 0 || n > GGUF_MAX_STRING_LEN || n > max_bytes) {
+		throw "gguf: string length out of range (" + n + ")";
+	}
 	if (n == 0) { return ""; }
-	let buf = f.read_bytes(n);
+	let ni = i32(n);
+	let buf = f.read_bytes(ni);
 	let out = "";
 	let i = 0;
-	while (i < n) {
+	while (i < ni) {
 		let r: rune = buf[i];
 		out = out + r;
 		i = i + 1;
@@ -103,7 +120,7 @@ fn read_string(f): string {
 // ── value reader: returns parsed value for scalar/string types,
 //    null for arrays (we only skip past them — see skip_value_inplace) ─
 
-fn read_scalar_value(f, t: i32) {
+fn read_scalar_value(f, t: i32, max_bytes: i64) {
 	if (t == GGUF_TYPE_UINT32 || t == GGUF_TYPE_INT32) { return read_u32(f); }
 	if (t == GGUF_TYPE_UINT64 || t == GGUF_TYPE_INT64) { return read_u64(f); }
 	if (t == GGUF_TYPE_UINT8  || t == GGUF_TYPE_INT8 || t == GGUF_TYPE_BOOL) {
@@ -130,25 +147,32 @@ fn read_scalar_value(f, t: i32) {
 		return null;
 	}
 	if (t == GGUF_TYPE_STRING) {
-		return read_string(f);
+		return read_string(f, max_bytes);
 	}
 	throw "unsupported scalar gguf type: " + t;
 }
 
 // Skip past a value of the given type without parsing it. For arrays this
 // recurses into each element (advancing the cursor element-by-element).
-fn skip_value(f, t: i32): null {
+fn skip_value(f, t: i32, max_bytes: i64, depth: i32): null {
+	if (depth > GGUF_MAX_SKIP_DEPTH) { throw "gguf: array nesting too deep"; }
 	if (t == GGUF_TYPE_STRING) {
-		let n = i32(read_u64(f));
-		if (n > 0) { f.read_bytes(n); }  // discard
+		let n: i64 = read_u64(f);
+		if (n < 0 || n > GGUF_MAX_STRING_LEN || n > max_bytes) {
+			throw "gguf: string length out of range (" + n + ")";
+		}
+		if (n > 0) { f.read_bytes(i32(n)); }  // discard
 		return null;
 	}
 	if (t == GGUF_TYPE_ARRAY) {
 		let elem_t = i32(read_u32(f));
-		let count = i32(read_u64(f));
-		let i = 0;
+		let count: i64 = read_u64(f);
+		if (count < 0 || count > GGUF_MAX_ARRAY_COUNT || count > max_bytes) {
+			throw "gguf: array count out of range (" + count + ")";
+		}
+		let i: i64 = 0;
 		while (i < count) {
-			skip_value(f, elem_t);
+			skip_value(f, elem_t, max_bytes, depth + 1);
 			i = i + 1;
 		}
 		return null;
@@ -185,7 +209,12 @@ export fn read_metadata(path: string): object {
 		throw "unsupported GGUF version " + version + " (this parser handles v3)";
 	}
 	let tensor_count = read_u64(f);
-	let kv_count = i32(read_u64(f));
+	let kv_count_raw: i64 = read_u64(f);
+	if (kv_count_raw < 0 || kv_count_raw > GGUF_MAX_KV_COUNT) {
+		f.close();
+		throw "gguf: metadata_kv_count out of range (" + kv_count_raw + ")";
+	}
+	let kv_count = i32(kv_count_raw);
 
 	// Keys we want to keep. Anything else gets skipped past so we don't
 	// retain megabytes of tokenizer vocab in memory. This list covers
@@ -204,19 +233,19 @@ export fn read_metadata(path: string): object {
 	let meta = {};
 	let i = 0;
 	while (i < kv_count) {
-		let key = read_string(f);
+		let key = read_string(f, file_size);
 		let t = i32(read_u32(f));
 		// Always store small scalars + short strings; skip everything else.
 		if (t == GGUF_TYPE_ARRAY) {
-			skip_value(f, t);
+			skip_value(f, t, file_size, 0);
 		} else if (t == GGUF_TYPE_STRING) {
-			let s = read_string(f);
+			let s = read_string(f, file_size);
 			if (s.length <= 256 || want?[key] == true) {
 				meta[key] = s;
 			}
 			// (long strings like chat templates are dropped on the floor)
 		} else {
-			let v = read_scalar_value(f, t);
+			let v = read_scalar_value(f, t, file_size);
 			meta[key] = v;
 		}
 		i = i + 1;
@@ -270,6 +299,7 @@ export fn kv_per_token_bytes(parsed: object, kv_type: string): f64 {
 		throw "missing required architecture metadata for " + arch;
 	}
 	if (n_kv_heads == null) { n_kv_heads = n_heads; }
+	if (n_heads == 0) { throw "gguf: attention.head_count is zero for " + arch; }
 	let head_dim: i64 = embed_dim / n_heads;
 	let bpe = kv_bytes_per_elem(kv_type);
 	return 2.0 * f64(n_layers) * f64(n_kv_heads) * f64(head_dim) * bpe;
@@ -365,6 +395,7 @@ export fn max_context_tokens(parsed: object, available_vram_mb: f64,
 export fn estimate_vram_from_ingredients(ing, context_tokens: i32, kv_type: string): object {
 	let n_kv_heads = ing.n_kv_heads;
 	if (n_kv_heads == null) { n_kv_heads = ing.n_heads; }
+	if (ing.n_heads == null || ing.n_heads == 0) { throw "gguf: ingredients n_heads is zero or missing"; }
 	let head_dim: i64 = ing.embedding_length / ing.n_heads;
 	let bpe = kv_bytes_per_elem(kv_type);
 	let kv_per_token_b: f64 = 2.0 * f64(ing.n_layers) * f64(n_kv_heads) * f64(head_dim) * bpe;
@@ -416,6 +447,7 @@ export fn estimate_vram_mb(parsed: object, context_tokens: i32, kv_type: string)
 		throw "missing required architecture metadata for " + arch;
 	}
 	if (n_kv_heads == null) { n_kv_heads = n_heads; }  // non-GQA models
+	if (n_heads == 0) { throw "gguf: attention.head_count is zero for " + arch; }
 
 	let head_dim: i64 = embed_dim / n_heads;
 	let bpe = kv_bytes_per_elem(kv_type);
