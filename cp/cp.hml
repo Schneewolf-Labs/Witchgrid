@@ -1389,6 +1389,13 @@ fn handle_register(req): object {
 			return { status: 400,
 				body: "{\"error\":\"agent_url must be a plain http(s) URL\"}" };
 		}
+		// The CP issues bearer-authenticated RPC to this host; refuse a
+		// public/off-LAN target so a crafted register can't redirect that
+		// traffic (and the shared secret) off-network. See host_is_lan.
+		if (!host_is_lan(extract_host(u))) {
+			return { status: 400,
+				body: "{\"error\":\"agent_url host must be a LAN address (private or loopback)\"}" };
+		}
 	}
 	let now = iso_now();
 
@@ -2445,6 +2452,38 @@ fn extract_host(agent_url: string): string {
 	let colon = rest.find(":");
 	if (colon >= 0) { rest = rest.substr(0, colon); }
 	return rest;
+}
+
+// LAN-only target guard for a registered agent_url. Every CP->agent call
+// (spawn/stop/fan-outs) is issued to this host WITH the shared bearer
+// attached, so a register that points it at a public host would exfiltrate
+// the secret and turn the CP into an SSRF proxy. Allow private/loopback IPv4
+// literals; reject public IPv4 and 169.254/16 link-local (cloud metadata).
+// Hostnames pass (LAN-first, no resolver here) — mirrors agent transfers.host_is_lan.
+fn host_is_lan(host): bool {
+	if (host == null || host.length == 0) { return false; }
+	let i = 0;
+	let ipish = true;
+	while (i < host.length) {
+		let c = host.substr(i, 1);
+		if (!((c >= "0" && c <= "9") || c == ".")) { ipish = false; break; }
+		i = i + 1;
+	}
+	if (!ipish) { return true; }
+	let parts = host.split(".");
+	if (parts.length != 4) { return false; }
+	let a = 0; let b = 0; let c2 = 0; let d = 0;
+	try {
+		a = i32(parts[0]); b = i32(parts[1]);
+		c2 = i32(parts[2]); d = i32(parts[3]);
+	} catch (e) { return false; }
+	if (a < 0 || a > 255 || b < 0 || b > 255
+		|| c2 < 0 || c2 > 255 || d < 0 || d > 255) { return false; }
+	if (a == 127) { return true; }
+	if (a == 10) { return true; }
+	if (a == 192 && b == 168) { return true; }
+	if (a == 172 && b >= 16 && b <= 31) { return true; }
+	return false;
 }
 
 // Pick the first running service matching this profile. Returns

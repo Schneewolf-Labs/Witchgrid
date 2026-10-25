@@ -60,14 +60,62 @@ fn iso_now(db): string {
 	return r[0].ts;
 }
 
+// Host out of a URL: strip scheme, then path, then :port. Mirrors cp.hml's
+// extract_host (the codebase keeps cp/agent validators in sync by mirroring,
+// not sharing — see valid_alias).
+fn peer_host(url: string): string {
+	let rest = url;
+	let scheme = rest.find("://");
+	if (scheme >= 0) { rest = rest.substr(scheme + 3, rest.length - scheme - 3); }
+	let slash = rest.find("/");
+	if (slash >= 0) { rest = rest.substr(0, slash); }
+	let colon = rest.find(":");
+	if (colon >= 0) { rest = rest.substr(0, colon); }
+	return rest;
+}
+
+// LAN-only target guard. We append the peer auth token (sha256(secret)) to
+// this URL and fetch it, so a crafted host would exfiltrate that token and
+// turn the agent into an SSRF proxy. Allow private/loopback IPv4 literals;
+// reject public IPv4 and the 169.254/16 link-local range (cloud metadata).
+// Hostnames pass — Witchgrid is LAN-first and there's no resolver here;
+// range-checking a hostname needs DNS (tracked as a follow-up).
+export fn host_is_lan(host): bool {
+	if (host == null || host.length == 0) { return false; }
+	let i = 0;
+	let ipish = true;
+	while (i < host.length) {
+		let c = host.substr(i, 1);
+		if (!((c >= "0" && c <= "9") || c == ".")) { ipish = false; break; }
+		i = i + 1;
+	}
+	if (!ipish) { return true; }   // hostname: allow (LAN-first, no DNS here)
+	let parts = host.split(".");
+	if (parts.length != 4) { return false; }
+	let a = 0; let b = 0; let c2 = 0; let d = 0;
+	try {
+		a = i32(parts[0]); b = i32(parts[1]);
+		c2 = i32(parts[2]); d = i32(parts[3]);
+	} catch (e) { return false; }
+	if (a < 0 || a > 255 || b < 0 || b > 255
+		|| c2 < 0 || c2 > 255 || d < 0 || d > 255) { return false; }
+	if (a == 127) { return true; }                       // loopback 127/8
+	if (a == 10) { return true; }                        // 10/8
+	if (a == 192 && b == 168) { return true; }           // 192.168/16
+	if (a == 172 && b >= 16 && b <= 31) { return true; } // 172.16/12
+	return false;   // public, 0.x, 169.254/16 link-local, etc.
+}
+
 // Peer-pull URL safety: source.url is CP-resolved in normal operation,
 // but it's still request input — pin it to plain http(s) so a crafted
-// pull can't point download_streaming at another scheme, and keep
-// CR/LF/space out of it (request-line injection on the fetch).
+// pull can't point download_streaming at another scheme, keep CR/LF/space
+// out of it (request-line injection on the fetch), and require a LAN host
+// so the appended auth token can't be sent off-network.
 export fn valid_peer_url(url): bool {
 	if (url == null || url.length == 0 || url.length > 2048) { return false; }
 	if (!(url.find("http://") == 0 || url.find("https://") == 0)) { return false; }
 	if (url.find(" ") >= 0 || url.find("\r") >= 0 || url.find("\n") >= 0) { return false; }
+	if (!host_is_lan(peer_host(url))) { return false; }
 	return true;
 }
 
