@@ -101,7 +101,9 @@ fn init_auth(): null {
 	if (s.length > 0) {
 		print("[auth] enabled (" + s.length + "-char shared secret)");
 	} else {
-		print("[auth] DISABLED — set WITCHGRID_SHARED_SECRET to enable");
+		eprint("[auth] DISABLED — WITCHGRID_SHARED_SECRET is unset, so every "
+			+ "agent endpoint (spawn, stop, model pull/delete) is open to anyone "
+			+ "who can reach this port. Set it on the CP and every agent.");
 	}
 	return null;
 }

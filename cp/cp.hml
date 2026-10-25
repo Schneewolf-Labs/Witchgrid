@@ -205,8 +205,10 @@ fn init_auth(): null {
 				? "bearer required (WITCHGRID_AUTH_PROTECT_INFERENCE)"
 				: "public — set WITCHGRID_AUTH_PROTECT_INFERENCE=1 to gate"));
 	} else {
-		print("[auth] DISABLED — set WITCHGRID_SHARED_SECRET on CP "
-			+ "and every agent to enable");
+		eprint("[auth] DISABLED — WITCHGRID_SHARED_SECRET is unset, so EVERY "
+			+ "endpoint (spawn, stop, model pull/delete, register, /mcp) is open "
+			+ "to anyone who can reach this port. Set it on the CP and every "
+			+ "agent to enable auth; only run without it on a fully trusted LAN.");
 		if (auth_protect_read() || auth_protect_inference()) {
 			eprint("[auth] WARNING: WITCHGRID_AUTH_PROTECT_READ/"
 				+ "_INFERENCE set without WITCHGRID_SHARED_SECRET "
