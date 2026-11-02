@@ -29,8 +29,8 @@ PUT  /api/nodes/{id}/auto-restart { auto_restart: bool }                    → 
 
 # ── services (proxied to the owning agent) ─────────────────────
 POST /services        { profile, node_id?, model?, port?, gpus? }           → 201
-GET  /services                                                              → [...]
-POST /services/stop   { id, node_id }                                       → 204
+GET  /services                                                              → [...]  (x-witchgrid-unreachable: node_ids that didn't answer)
+POST /services/stop   { id, node_id }                                       → 204  (SIGTERM; SIGKILL after 15s)
 GET  /services/log/{id}                                                     → text/plain (public)
 
 # ── routing ────────────────────────────────────────────────────
@@ -40,6 +40,7 @@ GET  /resolve/{profile}                                                     → 
 
 # ── profiles + aliases (CP-owned) ──────────────────────────────
 GET/POST /api/profiles · GET/PUT/DELETE /api/profiles/{name}
+#       POST takes { name, profile: {...} }; PUT takes the profile object itself
 GET/PUT /api/profile-aliases · DELETE /api/profile-aliases/{name}
 GET  /profiles                                                              → [names]
 GET  /capabilities | /api/capabilities                                     → { node: caps }
@@ -59,9 +60,21 @@ GET  /  ·  /assets/*  ·  /ui/*                                            → 
 
 `POST /services` **without** `node_id` triggers capacity-aware placement: CP
 picks the (node, GPU set) with the model on disk + enough free VRAM, then proxies
-the spawn. **With** `node_id` it forwards verbatim — required for models the GGUF
-placement parser can't size (SD/whisper/piper), which spawn pinned with
-`node_id` + `gpus` + `port` + `model`.
+the spawn. **With** `node_id` + `gpus` it skips placement — required for models
+the GGUF placement parser can't size (SD/whisper/piper), which spawn pinned with
+`node_id` + `gpus` + `port` + `model`. A pinned spawn with no `model` resolves it
+the same way placement does: the profile's `model_alias` in that node's catalog,
+then its `default_model`.
+
+`GET /services` fans out to every live agent. An agent that doesn't answer within
+6 s (down, or busy, e.g. re-probing a newly activated engine) contributes nothing
+to the list; its node_id is listed in the `x-witchgrid-unreachable` response
+header, and the dashboard's services panel says which nodes it couldn't reach.
+
+Profile writes are checked for shape: the body must be an object, `binary` (if
+set) must be a known engine, `intent` an object and `extra_flags` an array. A PUT
+whose body is POST's `{ profile: {...} }` wrapper is refused with 400 instead of
+being stored as the profile.
 
 `/resolve` is a pure locator (never spawns) for resolve-then-connect consumers
 that talk to the engine directly; `/v1/llama` is the full proxy that auto-spawns

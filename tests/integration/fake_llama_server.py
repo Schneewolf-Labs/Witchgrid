@@ -16,6 +16,8 @@ Three modes, dispatched by argv (the agent invokes all three):
                   POST /completion → JSON, or text/event-stream when the
                     request body has "stream": true. Run until killed.
 """
+import os
+import signal
 import sys
 import json
 
@@ -48,6 +50,21 @@ def main():
     if "--version" in args:
         sys.stdout.write("version: 9999 (fakehash)\n")
         return
+
+    # Server mode: re-exec once with argv[0] set to this file's path, so
+    # /proc/<pid>/cmdline starts with ".../llama-server" like the real
+    # binary. The agent's ownership check reads argv[0]; under the plain
+    # shebang argv[0] is "python3", and the agent would refuse to treat
+    # the fake as its own server (no SIGKILL escalation, watchdog churn).
+    if os.environ.get("FAKE_LLAMA_REEXEC") != "1":
+        os.environ["FAKE_LLAMA_REEXEC"] = "1"
+        me = os.path.abspath(__file__)
+        os.execv(sys.executable, [me, me] + args)
+
+    # --ignore-sigterm: behave like a llama-server stuck in a long call,
+    # so the agent's stop path has to escalate to SIGKILL.
+    if "--ignore-sigterm" in args:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
     port = 8080
     for i, a in enumerate(args):

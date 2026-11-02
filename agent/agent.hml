@@ -59,7 +59,7 @@ import { exists, make_dirs, remove_file } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { WITCHGRID_VERSION } from "../version";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, agent_setting_get, agent_setting_set } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set } from "./services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
@@ -285,6 +285,11 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 			reconcile_services(db, caps_ref);
 		} catch (e) {
 			eprint("[watchdog] reconcile error: " + e);
+		}
+		try {
+			finish_stops(db);
+		} catch (e) {
+			eprint("[watchdog] finish_stops error: " + e);
 		}
 		let hw = probe(canonical_dir, scan_dirs_ref.extra);
 		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));

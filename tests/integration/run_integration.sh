@@ -196,6 +196,41 @@ check "device=cpu forces a GPU profile onto CPU (first-class toggle)" \
 check "invalid device value is rejected with 400" \
 	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"designer-cpu\",\"node_id\":\"$NODE_ID\",\"model\":\"$MODEL\",\"device\":\"banana\",\"port\":18806}')\" = '400' ]"
 
+# Profile writes refuse shapes no spawn can use. PUT takes the flat profile;
+# PUT given POST's { name, profile } wrapper used to store the wrapper verbatim.
+check "PUT with a { profile: ... } wrapper is refused (400), stored profile unchanged" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X PUT '$CP_URL/api/profiles/wiz-it' -H 'content-type: application/json' -d '{\"profile\":{\"binary\":\"llama-server\",\"extra_flags\":[]}}')\" = '400' ] && curl -fsS '$CP_URL/api/profiles/wiz-it' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"binary\")==\"llama-server\" and \"profile\" not in d else 1)'"
+
+check "profile with an unknown binary is refused (400)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/api/profiles' -H 'content-type: application/json' -d '{\"name\":\"bad-bin\",\"profile\":{\"binary\":\"lama-server\"}}')\" = '400' ]"
+
+# Pinned spawn (node_id + gpus) with no model in the request resolves the
+# profile's default_model instead of 400ing. The profile's fake backend
+# ignores SIGTERM, which the stop test below relies on.
+curl -fsS -X POST "$CP_URL/api/profiles" -H 'content-type: application/json' \
+	-d '{"name":"stubborn","profile":{"binary":"llama-server","intent":{"context":4096,"gpu_layers":0},"extra_flags":["--ignore-sigterm"],"default_port":18971,"context":4096,"kv_type":"q4_0","default_model":"'"$MODEL"'"}}' >/dev/null 2>&1
+STUB=$(curl -fsS -X POST "$CP_URL/services" -H 'content-type: application/json' \
+	-d '{"profile":"stubborn","node_id":"'"$NODE_ID"'","gpus":[],"port":18971}' 2>/dev/null)
+STUB_ID=$(echo "$STUB" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+STUB_PID=$(echo "$STUB" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null)
+check "pinned spawn without a model uses the profile's default_model" \
+	bash -c "[ -n '$STUB_PID' ]"
+
+# Stop must not leave a backend that ignores SIGTERM running: after the grace
+# period the agent's watchdog tick sends SIGKILL, then reaps the child so it
+# doesn't linger as a zombie either. Poll for the pid to vanish from /proc.
+STOP_DONE=0
+if [ -n "$STUB_PID" ]; then
+	curl -fsS -X POST "$CP_URL/services/stop" -H 'content-type: application/json' \
+		-d '{"id":"'"$STUB_ID"'","node_id":"'"$NODE_ID"'"}' >/dev/null 2>&1
+	for _ in $(seq 1 40); do
+		[ -e "/proc/$STUB_PID" ] || { STOP_DONE=1; break; }
+		sleep 1
+	done
+fi
+check "stop escalates to SIGKILL and reaps a backend that ignores SIGTERM" \
+	bash -c "[ $STOP_DONE -eq 1 ]"
+
 # #4: a live agent's heartbeat must keep advancing its last_seen_at. Snapshot,
 # then poll until it moves forward (cadence forced fast via
 # WITCHGRID_HEARTBEAT_SECONDS, but each beat refreshes hardware so real spacing
@@ -235,6 +270,15 @@ check "each node round-trips its own agent_url + hardware, no swap (#2)" \
 
 # stop the 2nd agent so the #3 staleness test runs against a clean fleet.
 kill -9 "$AGENT2_PID" 2>/dev/null; AGENT2_PID=""
+
+# An agent that's registered but too busy to answer (here: paused with
+# SIGSTOP, well inside the stale window) contributes no services to GET
+# /services. The CP must name it in x-witchgrid-unreachable rather than look
+# like a node with nothing running. cp_get_fast gives up after 6s.
+kill -STOP "$AGENT_PID" 2>/dev/null
+check "GET /services names a non-answering node in x-witchgrid-unreachable" \
+	bash -c "curl -fsS -m 15 -D - -o /dev/null '$CP_URL/services' | grep -qi '^x-witchgrid-unreachable:.*$NODE_ID'"
+kill -CONT "$AGENT_PID" 2>/dev/null
 
 # #3: a silenced agent must drop out of live placement after STALE_NODE_SECONDS
 # (forced short here). Kill the agent to stop heartbeats, wait past the cutoff,

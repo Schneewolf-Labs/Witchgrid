@@ -784,11 +784,22 @@ export fn render_missing(missing_data, all_nodes): string {
 // services_data: [{id, profile, model_path, port, alive, node_id, profile_version?, ...}]
 // live_profiles: { name → profile object with __version stamped } so we can
 //                flag a stale badge when the profile's been edited since spawn.
-export fn render_services(services_data, live_profiles): string {
+// unreachable: node_ids whose agent didn't answer this poll — their
+//              services are missing from services_data, so say so rather
+//              than imply they have none.
+export fn render_services(services_data, live_profiles, unreachable?: []): string {
+	let warn = "";
+	if (unreachable.length > 0) {
+		let names = [];
+		for (n in unreachable) { names.push(esc(n)); }
+		warn = "<p class=\"warn\">No answer from " + names.join(", ")
+			+ "; their services aren't listed. Retrying on the next refresh.</p>\n";
+	}
 	if (services_data.length == 0) {
+		if (warn != "") { return warn; }
 		return "<p class=\"empty\">No services running. POST /services to spawn.</p>";
 	}
-	let html = "<table>\n"
+	let html = warn + "<table>\n"
 		+ "<thead><tr>"
 		+ "<th>profile</th><th>node</th><th>device</th><th>port</th>"
 		+ "<th>alive</th><th>model</th><th>id</th><th></th>"

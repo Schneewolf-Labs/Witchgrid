@@ -2276,12 +2276,22 @@ fn handle_spawn_proxy(req): object {
 		model = resolved_model;
 		if (port == null) { port = pick_port(pick.agent_url, profile.default_port); }
 	} else {
-		// Pinned (node_id + gpus). Operator must supply the model path —
-		// no point doing a catalog lookup since they've already chosen
-		// where to spawn it.
+		// Pinned (node_id + gpus): no placement, but the model still
+		// resolves the same way — request, then the profile's model_alias
+		// on the pinned node, then default_model — so a pinned respawn
+		// doesn't need the operator to dig up a host-specific path.
+		if (model == null && profile?.model_alias != null) {
+			let rows = query(DB,
+				"select path from node_models where alias = ? and node_id = ?",
+				[profile.model_alias, node_id]);
+			if (rows.length > 0) { model = rows[0].path; }
+		}
+		if (model == null) { model = profile?.default_model; }
 		if (model == null) {
 			return { status: 400, body: stringify({
-				error: "model required when node_id+gpus are pinned",
+				error: "no model resolved for " + profile_name + " on node " + node_id
+					+ " (request had no model, profile's model_alias isn't in that "
+					+ "node's catalog, and no default_model)",
 			})};
 		}
 	}
@@ -2408,12 +2418,18 @@ fn handle_model_delete_proxy(req): object {
 	}
 }
 
-fn handle_list_services(req): object {
-	// Aggregate from every registered agent. Each service is tagged with
-	// its owning node_id so subsequent stop calls know where to route.
+// Aggregate from every registered agent. Each service is tagged with
+// its owning node_id so subsequent stop calls know where to route.
+// An agent that doesn't answer (down, or busy past cp_get_fast's 6s —
+// e.g. re-probing a freshly activated engine) contributes no services,
+// so its node_id goes in `unreachable`: without that, a busy agent looked
+// exactly like a node with nothing running.
+fn collect_services(): object {
 	let agents = list_all_agents();
 	let merged = [];
+	let unreachable = [];
 	for (a in agents) {
+		let ok = false;
 		try {
 			let resp = cp_get_fast(a.agent_url + "/services");
 			if (resp.status_code >= 200 && resp.status_code < 300) {
@@ -2422,13 +2438,25 @@ fn handle_list_services(req): object {
 					e["node_id"] = a.node_id;
 					merged.push(e);
 				}
+				ok = true;
 			}
-		} catch (e) {
-			// Agent unreachable — skip; we'll surface in /nodes as a stale
-			// last_seen_at once heartbeats land.
-		}
+		} catch (e) { }
+		if (!ok) { unreachable.push(a.node_id); }
 	}
-	return { status: 200, body: stringify(merged) };
+	return { services: merged, unreachable: unreachable };
+}
+
+// GET /services. The body stays a plain array for existing clients; nodes
+// whose agent didn't answer are listed in the x-witchgrid-unreachable
+// header (comma-separated node_ids) so a client can tell "no services"
+// from "couldn't ask".
+fn handle_list_services(req): object {
+	let c = collect_services();
+	let headers = { "content-type": "application/json" };
+	if (c.unreachable.length > 0) {
+		headers["x-witchgrid-unreachable"] = c.unreachable.join(",");
+	}
+	return { status: 200, body: stringify(c.services), headers: headers };
 }
 
 // ── inference routing ────────────────────────────────────────────────
@@ -2966,22 +2994,9 @@ fn handle_ui_services(req): object {
 	// merged list, hand to the renderer. Also fetch the current
 	// profiles map so the renderer can flag a "stale" badge on
 	// services whose profile_version is older than the live profile.
-	let agents = list_all_agents();
-	let merged = [];
-	for (a in agents) {
-		try {
-			let resp = cp_get_fast(a.agent_url + "/services");
-			if (resp.status_code >= 200 && resp.status_code < 300) {
-				let entries = parse(resp.body);
-				for (e in entries) {
-					e["node_id"] = a.node_id;
-					merged.push(e);
-				}
-			}
-		} catch (e) { }
-	}
+	let c = collect_services();
 	let live_profiles = all_profiles_map();
-	return { status: 200, body: render_services(merged, live_profiles),
+	return { status: 200, body: render_services(c.services, live_profiles, c.unreachable),
 		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
@@ -4323,6 +4338,38 @@ fn handle_get_profile(req): object {
 	return { status: 200, body: stringify(p) };
 }
 
+// Shape check shared by create + update. Returns an error message, or
+// null when the profile is acceptable. Deliberately shallow: fields the
+// agent doesn't know are still allowed (profiles carry UI metadata), but
+// the two mistakes that silently store a profile no spawn can use are
+// refused — a non-object body, and PUT given POST's { name, profile }
+// wrapper, which used to be saved verbatim as the profile.
+let KNOWN_BINARIES = ["llama-server", "sd-server", "whisper-server", "piper"];
+
+fn validate_profile(profile, is_put: bool) {
+	if (profile == null || typeof(profile) != "object") {
+		return "profile must be a JSON object";
+	}
+	if (profile?.binary == null && profile?.intent == null && profile?.profile != null) {
+		if (is_put) {
+			return "PUT takes the profile object itself, not { profile: {...} }; "
+				+ "send the inner object as the body";
+		}
+		return "profile is nested twice ({ profile: { profile: ... } })";
+	}
+	if (profile?.binary != null && !KNOWN_BINARIES.contains(profile.binary)) {
+		return "unknown binary '" + profile.binary + "'; expected one of "
+			+ KNOWN_BINARIES.join(", ");
+	}
+	if (profile?.intent != null && typeof(profile.intent) != "object") {
+		return "intent must be an object";
+	}
+	if (profile?.extra_flags != null && typeof(profile.extra_flags) != "array") {
+		return "extra_flags must be an array of strings";
+	}
+	return null;
+}
+
 // POST /api/profiles  body: { name, profile: {...} }
 // Refuses if name is taken; use PUT to update.
 fn handle_create_profile(req): object {
@@ -4334,6 +4381,10 @@ fn handle_create_profile(req): object {
 	let profile = payload?.profile;
 	if (name == null || profile == null) {
 		return { status: 400, body: "{\"error\":\"name + profile required\"}" };
+	}
+	let invalid = validate_profile(profile, false);
+	if (invalid != null) {
+		return { status: 400, body: stringify({ error: invalid }) };
 	}
 	let existing = query(DB, "select name from profiles where name = ?", [name]);
 	if (existing.length > 0) {
@@ -4364,6 +4415,10 @@ fn handle_update_profile(req): object {
 	}
 	if (profile == null) {
 		return { status: 400, body: "{\"error\":\"profile body required\"}" };
+	}
+	let invalid = validate_profile(profile, true);
+	if (invalid != null) {
+		return { status: 400, body: stringify({ error: invalid }) };
 	}
 	let existing = query(DB,
 		"select version from profiles where name = ?", [name]);

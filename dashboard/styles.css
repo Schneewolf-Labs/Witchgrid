@@ -369,6 +369,7 @@ code {
 .alive-yes { color: var(--ok); }
 .alive-no  { color: var(--err); }
 .empty     { color: var(--fg-dim); font-style: italic; }
+.warn      { color: var(--warn); background: var(--warn-soft); padding: 0.35rem 0.6rem; border-radius: 4px; }
 .id        { font-family: ui-monospace, monospace; font-size: 0.82em; color: var(--fg-dim); }
 .stop-btn  { padding: 0.2rem 0.6rem; font-size: 0.78rem; margin: 0; }
 
