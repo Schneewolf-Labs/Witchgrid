@@ -20,7 +20,7 @@
 //   POST /services/stop       { id }                              → 204
 //   GET  /profiles                                                → [profile names]
 
-import { posix_spawn, kill, get_pid } from "@stdlib/process";
+import { posix_spawn, kill, get_pid, waitpid } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
 import { SpinLock } from "@stdlib/atomic";
@@ -110,6 +110,12 @@ export fn init_services_schema(db): null {
 	// 'failed' instead of looping forever.
 	try {
 		db_exec(db, "alter table services add column restart_count integer not null default 0", []);
+	} catch (e) { }
+	// stopped_at: when stop_service sent SIGTERM. finish_stops uses it to
+	// escalate to SIGKILL once STOP_GRACE_SECONDS pass and the process is
+	// still ours and alive. NULL for rows that ended any other way.
+	try {
+		db_exec(db, "alter table services add column stopped_at text", []);
 	} catch (e) { }
 	return null;
 }
@@ -909,11 +915,66 @@ export fn stop_service(db, id: string): bool {
 	if (process_alive(pid)) {
 		try { kill(pid, SIGTERM); } catch (e) { /* race with exit; fine */ }
 	}
+	reap_child(pid);
 	// Soft-delete: keep the row so adoption can match by port if the
 	// operator later restarts the service with the same profile and
-	// the previous llama-server hadn't yet exited.
-	db_exec(db, "update services set state = 'stopped' where id = ?", [id]);
+	// the previous llama-server hadn't yet exited. finish_stops follows
+	// up on the next heartbeat tick in case SIGTERM wasn't enough.
+	db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [id]);
 	return true;
+}
+
+// Seconds a stopped service gets to exit on SIGTERM before finish_stops
+// sends SIGKILL. llama-server normally exits in well under a second; one
+// stuck in a CUDA call or a long prompt can ignore SIGTERM indefinitely,
+// which used to leave it holding its GPUs after /services/stop said 204.
+let STOP_GRACE_SECONDS = 15;
+// Only escalate on recent stops: an hour-old 'stopped' row whose pid is
+// alive is far more likely a recycled pid than our server.
+let STOP_ESCALATE_WINDOW_SECONDS = 3600;
+let SIGKILL = 9;   // same value on Linux and macOS; @stdlib/signal doesn't export it
+
+// Collect the exit status of a child we spawned, if it has exited.
+// posix_spawn children stay ours even with setsid, so without this every
+// stopped or crashed service lingers as a zombie until the agent exits.
+// WNOHANG: never blocks. Not our child (adopted after an agent restart,
+// so init reaps it) or already reaped → waitpid errors; ignore.
+fn reap_child(pid: i32): null {
+	if (pid <= 1) { return null; }
+	try { waitpid(pid, 1); } catch (e) { }
+	return null;
+}
+
+// Supervisor follow-up for stops, run once per heartbeat tick: reap
+// exited children of every non-running row, and SIGKILL recently stopped
+// services whose process is still alive and still ours after the grace
+// period. Returns the number of processes killed (for logging).
+export fn finish_stops(db): i32 {
+	let rows = query(db,
+		"select id, pid, profile_json, "
+		+ "(strftime('%s','now') - strftime('%s', stopped_at)) as since_s "
+		+ "from services where state <> 'running'", []);
+	let running = query(db, "select pid from services where state = 'running'", []);
+	let running_pids = {};
+	for (r in running) { running_pids["" + r.pid] = true; }
+	let killed = 0;
+	for (row in rows) {
+		reap_child(row.pid);
+		if (row.since_s == null) { continue; }
+		let since = i32(row.since_s);
+		if (since < STOP_GRACE_SECONDS || since > STOP_ESCALATE_WINDOW_SECONDS) { continue; }
+		// Re-adopted or respawned onto the same pid: not ours to kill.
+		if (running_pids["" + row.pid] == true) { continue; }
+		let binary = "llama-server";
+		if (row.profile_json != null) {
+			try { binary = parse(row.profile_json)?.binary ?? "llama-server"; } catch (e) { }
+		}
+		if (!service_healthy(row.pid, binary)) { continue; }
+		eprint("[watchdog] service " + row.id + " (pid " + row.pid + ") ignored SIGTERM for "
+			+ since + "s; sending SIGKILL");
+		try { kill(row.pid, SIGKILL); killed = killed + 1; } catch (e) { }
+	}
+	return killed;
 }
 
 // ── auto-restart watchdog ───────────────────────────────────────────────

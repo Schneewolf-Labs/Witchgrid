@@ -48,7 +48,8 @@ reachable from the CP.
 # services (supervisor)
 POST /services         { profile, profile_name, model?, port?, gpus?, tensor_split? } → 201 {id,...}
 GET  /services                                                         → [{id,profile,pid,port,alive,...}]
-POST /services/stop    { id }                                          → 204
+POST /services/stop    { id }                                          → 204  (SIGTERM now; the watchdog
+                                                                         SIGKILLs after 15s if still ours, and reaps)
 GET  /services/log/{id}                                                → text/plain (tail)
 
 # per-agent settings (auto-restart watchdog toggle)
