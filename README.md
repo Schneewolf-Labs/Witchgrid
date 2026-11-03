@@ -4,7 +4,7 @@ Orchestration + dashboard for self-hosted AI inference. The control plane that l
 
 For the case where you have a small fleet of CPU/GPU boxes and want to manage what's running where, what's loaded, and what's available — without hand-wiring each consumer to a hardcoded inference URL.
 
-> **Status: v0.9.3 — 1.0 candidate.** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a real-time dashboard (SSE-pushed, failure-first), a self-healing service supervisor, a first-class CPU/GPU toggle, a guided profile wizard, and graceful WAL-checkpoint shutdown all work. The whole [1.0 punch list](#roadmap-to-10) is checked; the 0.9.x line is the soak-before-1.0 cut.
+> **Status: v0.9.4 — 1.0 candidate.** Single-operator, LAN-first. In daily production use serving [flammen.ai](https://github.com/Schneewolf-Labs). Multi-node capacity-aware placement, auto-spawn, on-demand model management, a real-time dashboard (SSE-pushed, failure-first), a self-healing service supervisor, a first-class CPU/GPU toggle, a guided profile wizard, and graceful WAL-checkpoint shutdown all work. The whole [1.0 punch list](#roadmap-to-10) is checked; the 0.9.x line is the soak-before-1.0 cut.
 
 Built in [Hemlock](https://hemlang.dev) (2.8.2). Each binary is a single ~10 MB ELF. Since Hemlock 2.6.0 `hemlockc` static-links libwebsockets/libssl/libffi, so they are build-time inputs, not runtime deps; what's left dynamic is universal (`libcap`, `libuv`, `libev`, `libm`, `libc`). The one real runtime requirement is **libsqlite3** — `@stdlib/sqlite` `dlopen()`s `libsqlite3.so.0` at startup, so it never shows up in `ldd` and must be present on every box that runs the CP or an agent. Deploy is `scp` + a service unit.
 
@@ -89,7 +89,7 @@ A fresh CP seeds a set of ready-to-use **default profiles** — no config to wri
 
 Plus the flammen.ai production profiles (`chat-mahou`, `designer-cpu`, `memory-phoenix`, `image-niku`) kept as worked examples. Clone any of them in the dashboard's profile wizard to retune for your hardware. Defaults are filled in with insert-or-ignore, so upgrades pick up new ones without touching profiles you've edited.
 
-Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub release](https://github.com/hemlang/witchgrid/releases); installing the matching [Hemlock](https://hemlang.dev) runtime is only needed to *build*.
+Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub release](https://github.com/Schneewolf-Labs/Witchgrid/releases); installing the matching [Hemlock](https://hemlang.dev) runtime is only needed to *build*.
 
 ## Docs
 
@@ -130,7 +130,7 @@ Capability-wise it's there; 1.0 is about coherence, deployability, and test brea
 - [x] **Single source of truth for the version** (`version.hml`), surfaced in `/healthz` + `/metrics` (`witchgrid_build_info`) + the dashboard header.
 - [x] **CP bind configurable** — `WITCHGRID_CP_HOST` / `WITCHGRID_CP_PORT`.
 - [x] **Deploy/ops documented** — see [`docs/operations.md`](docs/operations.md).
-- [x] **Test breadth** — the integration harness now covers port-contention, stale-node drop, spawn-failure, bad-model-path, multi-node registration, the CPU/GPU device override, and the live/health endpoints (26 assertions).
+- [x] **Test breadth** — the integration harness now covers port-contention, stale-node drop, spawn-failure, bad-model-path, multi-node registration, the CPU/GPU device override, stop-escalation to SIGKILL, profile-PUT validation, and the live/health endpoints (31 assertions).
 - [x] **Auth posture finalized** — LAN-first shared-secret model, documented in [`docs/security.md`](docs/security.md) (what's public vs protected, reverse-proxy guidance for exposure). Deferred to post-1.0: a dashboard login (slice 2) + per-consumer `/v1/llama` tokens (slice 3) + native TLS.
 - [x] **Graceful shutdown** — on SIGINT/TERM/HUP the CP checkpoints the WAL (TRUNCATE) and exits cleanly. Live as of the Hemlock 2.6.2 pin, which carries the async-runtime signal fix ([hemlang/hemlock#587](https://github.com/hemlang/hemlock/pull/587)). Single-host multi-node registration is tested; a cross-node 2-agent test (mocked `nvidia-smi`) is the remaining test nicety.
 

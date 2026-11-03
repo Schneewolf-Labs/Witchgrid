@@ -65,7 +65,7 @@ CP and agent each compile to a standalone ~10 MB ELF (`witchgrid-cp`, `witchgrid
 
 ## Resolved design decisions
 
-- **Language: Hemlock** ([hemlang.dev](https://hemlang.dev), built on 2.5.7). Python prototype shipped through v0.3 (now in `legacy-python/`); the Hemlock rewrite (v0.7 line) is what's documented here. Single ~7 MB binary each, universal libs only — drops onto every box without a runtime install. The 7-issue language-evaluation writeup that informed the rewrite lives in `docs/hemlock-feedback-archive.md`; all seven were resolved upstream. (Witchgrid has since driven further Hemlock fixes — e.g. the v2.5.7 async-task pthread + accepted-socket leak fixes that matter to the long-running daemons.)
+- **Language: Hemlock** ([hemlang.dev](https://hemlang.dev); pinned in `.github/workflows/build.yml`, currently 2.8.2). Python prototype shipped through v0.3 (now in `legacy-python/`); the Hemlock rewrite (v0.7 line) is what's documented here. Single ~10 MB binary each, universal libs only — drops onto every box without a runtime install. The 7-issue language-evaluation writeup that informed the rewrite lives in `docs/hemlock-feedback-archive.md`; all seven were resolved upstream. (Witchgrid has since driven further Hemlock fixes — e.g. the v2.5.7 async-task pthread + accepted-socket leak fixes that matter to the long-running daemons.)
 - **Service templating format.** Profiles are CP-owned rows in sqlite (moved off the agent in v0.7), seeded with defaults and edited via `/api/profiles` + the dashboard — versioned, so a running service keeps the argv it was spawned with even after the profile is edited. Still a normalized intent map, not raw YAML.
 - **Model storage + catalog.** Agents scan their model dirs into a per-node catalog advertised by alias, so profiles reference `model_alias` instead of host-specific paths. CP can pull models from HuggingFace and distribute them peer-to-peer between nodes (`transfers.hml`).
 - **Concurrent loading on a single GPU.** Naive VRAM accounting (free_mb − sum(claimed_mb)). Works.
@@ -106,7 +106,7 @@ flammen.ai is the **first consumer** Witchgrid was designed against, and now run
 ## Status
 
 - **`legacy-python/`** — v0.3 Python prototype. Frozen.
-- **`cp/` + `agent/` + `dashboard/`** — pre-1.0, **v0.7 line** (Hemlock 2.5.7); `main` is ahead of the `v0.7.0` tag. In daily **production** use serving flammen.ai (chat / image / caption). Multi-node, capacity-aware, multi-engine (llama / sd / whisper / piper), self-healing (auto-restart watchdog), observable (`/metrics`), with unit + integration tests in CI and multi-platform release artifacts. The 1.0 punch list is in `README.md` (version coherence, configurable CP bind, test breadth, auth posture).
+- **`cp/` + `agent/` + `dashboard/`** — pre-1.0, **v0.9 line** (1.0 candidate; version in `version.hml`). In daily **production** use serving flammen.ai (chat / image / caption). Multi-node, capacity-aware, multi-engine (llama / sd / whisper / piper), self-healing (auto-restart watchdog), observable (`/metrics`), with unit + integration tests in CI and multi-platform release artifacts. The 1.0 punch list in `README.md` is complete; the 0.9.x line is the soak before 1.0.
 
 ## Roadmap
 
@@ -138,6 +138,6 @@ Plus operability/infra: spawn-failure visibility, port reservation, zombie reapi
 - ✅ Engines beyond llama.cpp — `sd-server`, `whisper-server`, `piper`, each with an install/activate lifecycle.
 - ✅ Auto-restart watchdog + Prometheus `/metrics` (post-v0.7).
 
-**Toward 1.0** (see `README.md` for the punch list): version coherence, configurable CP bind (`:8765` is hardcoded), broader integration-test coverage, finalized auth posture, graceful shutdown.
+**Toward 1.0**: the `README.md` punch list is done (version coherence, configurable CP bind via `WITCHGRID_CP_HOST`/`WITCHGRID_CP_PORT`, integration-test breadth, auth posture, graceful shutdown); 1.0.0 is cut once the 0.9.x line has soaked in production.
 
 Longer-term — see `docs/llama-cpp-as-managed-runtime.md` for the "Witchgrid as the llama.cpp manager" brainstorm (vendoring binaries, prebuilt download, source build, eventual auto-canary). vLLM / ComfyUI as further `binary` types remain candidates.
