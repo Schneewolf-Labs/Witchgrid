@@ -3,7 +3,7 @@
 The control-plane daemon. Owns the node registry, **profiles**, capacity-aware
 placement, the routing API, the model catalog/transfer orchestration, the
 dashboard, and GGUF introspection. Talks to one or more `agent/` instances over
-plain HTTP. Compiles to a single ~7 MB binary (`witchgrid-cp`) with universal
+plain HTTP. Compiles to a single ~10 MB binary (`witchgrid-cp`) with universal
 dynamic deps.
 
 ## What's in here

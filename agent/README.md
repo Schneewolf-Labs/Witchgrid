@@ -3,7 +3,7 @@
 Runs on every box that hosts inference. Probes hardware, registers with the
 control plane, **supervises** local engine processes (llama-server, sd-server,
 whisper-server, piper), exposes each binary's capability map, and keeps its
-services alive with an auto-restart watchdog. Compiles to a single ~7 MB binary
+services alive with an auto-restart watchdog. Compiles to a single ~10 MB binary
 (`witchgrid-agent`) with universal dynamic deps.
 
 The agent is *not* the source of truth for profiles — since v0.7 those live on
