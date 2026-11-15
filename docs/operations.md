@@ -22,7 +22,7 @@ universal dynamic deps — deploy is a copy + a service unit.
 
 ## Build
 
-Needs the [Hemlock](https://hemlang.dev) toolchain (`hemlockc`; CI and releases are built on the version pinned in `.github/workflows/build.yml`, currently 2.8.2). Or skip
+Needs the [Hemlock](https://hemlang.dev) toolchain (`hemlockc`; CI and releases are built on the version pinned in `.github/workflows/build.yml`, currently 2.16.0). Or skip
 building and grab the prebuilt binaries from a [release](https://github.com/Schneewolf-Labs/Witchgrid/releases)
 (`linux-x86_64`, `macos-arm64`).
 
