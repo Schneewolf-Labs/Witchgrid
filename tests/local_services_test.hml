@@ -1,0 +1,276 @@
+// local_services_test.hml — coverage for agent/local_services.hml, the
+// declaration layer of the `local` engine.
+//
+// These checks are the security boundary of that engine: the CP can only
+// NAME a service, so everything that decides what actually executes —
+// the declaration's shape, the refusal of undeclared names, the
+// group/world-writable file guard, the explicit child env that keeps the
+// agent's shared secret out of third-party code — is exercised here.
+
+import { describe, test, assert_eq, assert_true, assert_false } from "@stdlib/testing";
+import { write_file, make_dirs, remove_file, remove_dir, list_dir, exists } from "@stdlib/fs";
+import { exec_argv, get_pid } from "@stdlib/process";
+import { setenv, unsetenv } from "@stdlib/env";
+import { homedir } from "@stdlib/os";
+import { stringify } from "@stdlib/json";
+import {
+	valid_service_name, expand_home, validate_declaration, load_declarations,
+	find_declaration, public_view, build_argv, build_env,
+} from "../agent/local_services";
+
+// The message a callback throws, or null if it didn't throw.
+fn thrown(cb) {
+	try { cb(); } catch (e) { return "" + e; }
+	return null;
+}
+
+fn base_decl(): object {
+	return {
+		name: "riko-voice",
+		argv: ["/bin/sh", "-c", "echo {port}"],
+		port: 19300,
+	};
+}
+
+fn env_has(env, kv: string): bool {
+	for (e in env) { if (e == kv) { return true; } }
+	return false;
+}
+
+fn env_has_key(env, k: string): bool {
+	for (e in env) { if (e.find(k + "=") == 0) { return true; } }
+	return false;
+}
+
+// Fresh scratch dir for the file-loading tests; removed by rm_tree.
+fn scratch_dir(tag: string): string {
+	let d = "/tmp/witchgrid-local-test-" + get_pid() + "-" + tag;
+	make_dirs(d);
+	exec_argv(["chmod", "755", d]);
+	return d;
+}
+
+fn rm_tree(d: string): null {
+	if (!exists(d)) { return null; }
+	for (f in list_dir(d)) {
+		if (f == "." || f == "..") { continue; }
+		try { remove_file(d + "/" + f); } catch (e) { }
+	}
+	try { remove_dir(d); } catch (e) { }
+	return null;
+}
+
+fn write_decl(dir: string, file: string, body: string): null {
+	write_file(dir + "/" + file, body);
+	exec_argv(["chmod", "644", dir + "/" + file]);
+	return null;
+}
+
+export fn register(): null {
+	describe("local_services.valid_service_name", fn() {
+		test("accepts lowercase names with - _ .", fn() {
+			assert_true(valid_service_name("riko-voice"));
+			assert_true(valid_service_name("tts_2.kokoro"));
+		});
+		test("rejects path / shell / case tricks", fn() {
+			assert_false(valid_service_name("../etc"));
+			assert_false(valid_service_name("a/b"));
+			assert_false(valid_service_name("-rf"));
+			assert_false(valid_service_name(".hidden"));
+			assert_false(valid_service_name("Riko"));
+			assert_false(valid_service_name("a b"));
+			assert_false(valid_service_name(""));
+			assert_false(valid_service_name(null));
+			assert_false(valid_service_name(42));
+		});
+	});
+
+	describe("local_services.validate_declaration (shape)", fn() {
+		test("a minimal declaration normalizes with defaults", fn() {
+			let d = validate_declaration(base_decl(), "riko-voice", false);
+			assert_eq(d.name, "riko-voice");
+			assert_eq(d.port, 19300);
+			assert_eq(d.health_path, "/health");
+			assert_eq(d.vram_mb, 0);
+			assert_eq(d.startup_timeout_s, 60);
+			assert_eq(d.cwd, "/bin");   // default: argv[0]'s directory
+		});
+		test("name must match the file stem", fn() {
+			let m = thrown(fn() { validate_declaration(base_decl(), "other", false); });
+			assert_true(m != null && m.find("must match its file name") >= 0);
+		});
+		test("unknown fields are refused (catches vram/vram_mb typos)", fn() {
+			let r = base_decl();
+			r["vram"] = 1300;
+			let m = thrown(fn() { validate_declaration(r, "riko-voice", false); });
+			assert_true(m != null && m.find("unknown field 'vram'") >= 0);
+		});
+		test("argv must be a non-empty array of strings", fn() {
+			let r = base_decl();
+			r["argv"] = "/bin/sh -c 'rm -rf /'";
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r["argv"] = [];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r["argv"] = ["/bin/sh", 5];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+		});
+		test("argv[0] must be absolute (no PATH lookup)", fn() {
+			let r = base_decl();
+			r["argv"] = ["python3", "server.py"];
+			let m = thrown(fn() { validate_declaration(r, "riko-voice", false); });
+			assert_true(m != null && m.find("absolute") >= 0);
+		});
+		test("~/ is expanded for argv[0] and cwd only", fn() {
+			let r = base_decl();
+			r["argv"] = ["~/riko-voice/run.sh", "~/not-expanded"];
+			r["cwd"] = "~/riko-voice";
+			let d = validate_declaration(r, "riko-voice", false);
+			assert_eq(d.argv[0], homedir() + "/riko-voice/run.sh");
+			assert_eq(d.argv[1], "~/not-expanded");
+			assert_eq(d.cwd, homedir() + "/riko-voice");
+		});
+		test("NUL / newline in argv is refused", fn() {
+			let r = base_decl();
+			r["argv"] = ["/bin/sh", "a\nb"];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+		});
+		test("env: string values, valid keys, agent-owned keys refused", fn() {
+			let r = base_decl();
+			r["env"] = { DEVICE: "cuda" };
+			assert_eq(validate_declaration(r, "riko-voice", false).env.DEVICE, "cuda");
+			r["env"] = { PORT: "1" };
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }).find("PORT") >= 0);
+			r["env"] = { CUDA_VISIBLE_DEVICES: "0" };
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r["env"] = { "BAD-KEY": "x" };
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r["env"] = { N: 5 };
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+		});
+		test("inherit_env may not pull in the shared secret", fn() {
+			let r = base_decl();
+			r["inherit_env"] = ["WITCHGRID_SHARED_SECRET"];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+		});
+		test("port, vram_mb, startup_timeout_s, health_path are range-checked", fn() {
+			let r = base_decl();
+			r["port"] = 80;
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r["port"] = "19300";
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r = base_decl();
+			r["vram_mb"] = -1;
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r = base_decl();
+			r["startup_timeout_s"] = 0;
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+			r = base_decl();
+			r["health_path"] = "health";
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", false); }) != null);
+		});
+		test("check_fs: argv[0] must exist and be executable, cwd must exist", fn() {
+			let r = base_decl();
+			assert_eq(validate_declaration(r, "riko-voice", true).argv[0], "/bin/sh");
+			r["argv"] = ["/nonexistent/run.sh"];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", true); }).find("does not exist") >= 0);
+			r["argv"] = ["/etc/hostname"];
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", true); }) != null);
+			r = base_decl();
+			r["cwd"] = "/nonexistent-dir";
+			assert_true(thrown(fn() { validate_declaration(r, "riko-voice", true); }).find("cwd") >= 0);
+		});
+	});
+
+	describe("local_services.build_argv / build_env", fn() {
+		test("{port} is substituted in every argv element", fn() {
+			let r = base_decl();
+			r["argv"] = ["/bin/sh", "--port={port}", "{port}"];
+			let d = validate_declaration(r, "riko-voice", false);
+			let a = build_argv(d, 19301);
+			assert_eq(a[1], "--port=19301");
+			assert_eq(a[2], "19301");
+		});
+		test("env: declared values, PORT + CUDA pin from placement", fn() {
+			let r = base_decl();
+			r["env"] = { DEVICE: "cuda" };
+			let d = validate_declaration(r, "riko-voice", false);
+			let env = build_env(d, 19300, "2");
+			assert_true(env_has(env, "DEVICE=cuda"));
+			assert_true(env_has(env, "PORT=19300"));
+			assert_true(env_has(env, "CUDA_VISIBLE_DEVICES=2"));
+			assert_true(env_has_key(env, "PATH"));
+		});
+		test("cvd \"\" hides all GPUs", fn() {
+			let d = validate_declaration(base_decl(), "riko-voice", false);
+			assert_true(env_has(build_env(d, 19300, ""), "CUDA_VISIBLE_DEVICES="));
+		});
+		test("the agent's shared secret is NOT inherited", fn() {
+			setenv("WITCHGRID_SHARED_SECRET", "hunter2");
+			let d = validate_declaration(base_decl(), "riko-voice", false);
+			let env = build_env(d, 19300, null);
+			unsetenv("WITCHGRID_SHARED_SECRET");
+			assert_false(env_has_key(env, "WITCHGRID_SHARED_SECRET"));
+		});
+		test("inherit_env passes named agent vars through", fn() {
+			setenv("WG_TEST_HF_HOME", "/data/hf");
+			let r = base_decl();
+			r["inherit_env"] = ["WG_TEST_HF_HOME"];
+			let d = validate_declaration(r, "riko-voice", false);
+			let env = build_env(d, 19300, null);
+			unsetenv("WG_TEST_HF_HOME");
+			assert_true(env_has(env, "WG_TEST_HF_HOME=/data/hf"));
+		});
+		test("public_view carries no argv or env values", fn() {
+			let r = base_decl();
+			r["argv"] = ["/bin/sh", "--token", "s3cret"];
+			r["env"] = { API_KEY: "s3cret" };
+			let v = public_view(validate_declaration(r, "riko-voice", false));
+			assert_eq(v.program, "/bin/sh");
+			assert_eq(v.env_keys.length, 1);
+			assert_eq(stringify(v).find("s3cret"), -1);
+		});
+	});
+
+	describe("local_services.load_declarations / find_declaration (files)", fn() {
+		test("loads valid files, reports bad ones, ignores non-json", fn() {
+			let d = scratch_dir("load");
+			write_decl(d, "good.json",
+				"{\"name\":\"good\",\"argv\":[\"/bin/sh\"],\"port\":19310,\"vram_mb\":1300}");
+			write_decl(d, "broken.json", "{not json");
+			write_decl(d, "mismatch.json", "{\"name\":\"other\",\"argv\":[\"/bin/sh\"],\"port\":19311}");
+			write_decl(d, "README.txt", "not a declaration");
+			let loaded = load_declarations(d);
+			rm_tree(d);
+			assert_eq(loaded.services.keys().length, 1);
+			assert_eq(loaded.services["good"].vram_mb, 1300);
+			assert_eq(loaded.errors.length, 2);
+		});
+		test("a missing dir means no services, not an error", fn() {
+			let loaded = load_declarations("/nonexistent/witchgrid-local");
+			assert_eq(loaded.services.keys().length, 0);
+			assert_eq(loaded.errors.length, 0);
+		});
+		test("a world-writable declaration is refused", fn() {
+			let d = scratch_dir("ww");
+			write_decl(d, "loose.json", "{\"name\":\"loose\",\"argv\":[\"/bin/sh\"],\"port\":19312}");
+			exec_argv(["chmod", "666", d + "/loose.json"]);
+			let loaded = load_declarations(d);
+			let m = thrown(fn() { find_declaration(d, "loose"); });
+			rm_tree(d);
+			assert_eq(loaded.services.keys().length, 0);
+			assert_true(m != null && m.find("writable") >= 0);
+		});
+		test("find_declaration refuses undeclared and invalid names", fn() {
+			let d = scratch_dir("find");
+			write_decl(d, "good.json", "{\"name\":\"good\",\"argv\":[\"/bin/sh\"],\"port\":19313}");
+			let ok = find_declaration(d, "good");
+			let m1 = thrown(fn() { find_declaration(d, "nope"); });
+			let m2 = thrown(fn() { find_declaration(d, "../good"); });
+			rm_tree(d);
+			assert_eq(ok.port, 19313);
+			assert_true(m1 != null && m1.find("not declared") >= 0);
+			assert_true(m2 != null && m2.find("not declared") >= 0);
+		});
+	});
+	return null;
+}

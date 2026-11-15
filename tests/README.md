@@ -20,6 +20,7 @@ tests/
 ├── intent_test.hml        # agent/intent.hml — intent → argv translation
 ├── capabilities_test.hml  # agent/capabilities.hml — --help parser
 ├── gguf_test.hml          # cp/gguf.hml — GGUF parser + VRAM estimator
+├── local_services_test.hml # agent/local_services.hml — `local` engine declarations
 └── fixtures/
     ├── llama_help_enum_fa.txt    # modern build: -fa [on|off|auto]
     ├── llama_help_legacy_fa.txt  # older build: -fa as bare boolean
@@ -56,6 +57,18 @@ needed. It isolates `HOME` to a temp dir so the agent can't pick up a real
 Covers: agent registration round-trip, the `auto_restart` watchdog field,
 `POST /services` spawn, `/resolve`, health-gating, the `/v1/llama` proxy
 (non-stream), and **SSE passthrough**.
+
+The **`local` engine** block declares `tiny-voice` (`fake_local_run.sh`, a
+venv-style wrapper that starts `fake_local_service.py` without `exec`) in a
+temp `WITCHGRID_LOCAL_SERVICES` dir and drives: capabilities + `/nodes`
+advertisement (no argv/env values), local profile create (and refusal of
+`extra_flags`), placement preview, spawn → declared health path, the child's
+cwd/env/PORT/CUDA pin and non-inheritance of the agent's env, `/resolve` +
+`/api/ready`, watchdog respawn after the group is killed, re-adoption across an
+agent SIGKILL + restart, stop taking down the whole process group, proxy
+auto-spawn waiting on the declared health path, refusal of an
+undeclared name (CP 503, agent 403), and that argv-shaped fields in a raw spawn
+payload are ignored.
 
 ```bash
 # after building cp/witchgrid-cp + agent/witchgrid-agent:
