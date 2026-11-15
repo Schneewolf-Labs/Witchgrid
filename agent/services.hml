@@ -20,7 +20,7 @@
 //   POST /services/stop       { id }                              → 204
 //   GET  /profiles                                                → [profile names]
 
-import { posix_spawn, kill, get_pid, waitpid } from "@stdlib/process";
+import { posix_spawn, kill, get_pid, waitpid, exec_argv } from "@stdlib/process";
 import { SIGTERM } from "@stdlib/signal";
 import { setenv, unsetenv } from "@stdlib/env";
 import { SpinLock } from "@stdlib/atomic";

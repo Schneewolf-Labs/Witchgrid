@@ -98,8 +98,41 @@ on:
 #           type-bound, so every imported symbol read as an unknown
 #           identifier) and identifier diagnostics that reported ":0"
 #           instead of a real line. No codegen changes.
+#   2.16.0 — the 2.9 → 2.16 span; the items that matter to us:
+#           1. BREAKING (2.14.0): name resolution is now a static pass that
+#              gates hemlockc codegen (no opt-out) and interpreter startup.
+#              agent/services.hml called exec_argv without importing it; the
+#              2.8.2 compiled binary resolved it anyway because other agent
+#              modules import it, while the interpreter would have thrown
+#              "Undefined variable" (inside try/catch, so silently). 2.16
+#              refuses to build the agent until the import is explicit — now
+#              it is. CP and inspect compiled clean unchanged.
+#           2. 2.9.0/2.11.0 refcount, codegen-divergence and runtime
+#              memory-safety batches + the 2.13.0 UBSan audit and checked
+#              allocation wrappers — the long-running daemons are the exposure.
+#           3. 2.10.1: use-after-free when an HTTP redirect follows a completed
+#              request (@stdlib/http client path).
+#           4. 2.12.0: hemlockc now converts typed parameters to their declared
+#              type (was interpreter-only); `fn f(x: i32)` given an f64 now
+#              truncates in the binaries too. Our i32 params are ports, pids
+#              and byte/token counts fed integers — no behaviour change seen.
+#              Also: one shared channel core; select() no longer polls.
+#           5. 2.11.0: JSON is exact + strict — serialize() emits shortest
+#              round-trip floats (was %g, 6 digits), NaN/Infinity throw,
+#              deserialize() rejects trailing commas/text. Our JSON is
+#              machine-generated; suites pass.
+#           6. 2.14.0: an uncaught exception in an unjoined spawned task is
+#              now logged to stderr instead of vanishing (more visible
+#              failures in agent/CP logs), and exit() no longer deadlocks on
+#              glibc >= 2.39 while a task blocks in read_line().
+#           7. 2.15.0: macOS static build links CoreFoundation/
+#              SystemConfiguration for libwebsockets; exception values are
+#              released on throw/catch/defer paths (leak fix).
+#           Separately, GitHub retired the macos-14 runner image (jobs are
+#           cancelled since 2026-11-04), so the macOS leg moves to macos-15.
+#           Unit (87) + integration (31) suites pass clean on 2.16.0.
 env:
-  HEMLOCK_VERSION: 2.8.2
+  HEMLOCK_VERSION: 2.16.0
 
 jobs:
   build:
@@ -117,7 +150,7 @@ jobs:
           # 2.6.0 static-links lws, so that no longer constrains the runner.)
           - os: ubuntu-22.04
             target: linux-x86_64
-          - os: macos-14            # Apple Silicon (arm64) runner
+          - os: macos-15            # Apple Silicon (arm64) runner (macos-14 retired)
             target: macos-arm64
     steps:
       - uses: actions/checkout@v4
@@ -171,7 +204,7 @@ jobs:
           # TAG (v${HEMLOCK_VERSION}), so the correct build is installed
           # regardless of what it self-reports — a mismatch here means the
           # upstream bump was missed, not that we built against the wrong
-          # thing, and it should not fail our build. 2.8.2 does report
+          # thing, and it should not fail our build. 2.16.0 does report
           # exactly.
           MM="$(echo "${HEMLOCK_VERSION}" | cut -d. -f1,2)"
           hemlockc --version | grep -q "${MM}\." \
