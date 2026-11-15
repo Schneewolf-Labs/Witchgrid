@@ -80,6 +80,19 @@ being stored as the profile.
 that talk to the engine directly; `/v1/llama` is the full proxy that auto-spawns
 and health-gates before completing.
 
+**`local` profiles** (`{ "binary": "local", "local_service": "<name>" }`) name a
+service an agent declares on its own disk (see
+[`../agent/README.md`](../agent/README.md#local-services-local-engine)); the CP
+never holds or sends a command for them and refuses `extra_flags` on such a
+profile. Agents advertise their declarations (name, port, `vram_mb`,
+`health_path`, … — not argv/env) on every heartbeat; `GET /nodes` shows them as
+`local_services`. Placement picks a live node that declares the name and, when
+`vram_mb > 0`, the single GPU there with the most free VRAM ≥ `vram_mb` (no
+tensor split); `device: "cpu"` or `vram_mb: 0` places it with no GPU. Undeclared
+names get 503 from placement and 403 from an agent asked directly. There is no
+local-specific proxy route: consumers use `/resolve/{profile}` and talk to
+`node:port` directly (`/v1/llama` would forward JSON only).
+
 ## Build & run
 
 ```bash

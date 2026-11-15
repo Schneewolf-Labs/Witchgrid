@@ -212,6 +212,7 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid-agent.db`. Same rationale as the CP. |
 | `WITCHGRID_HEARTBEAT_SECONDS` | `30` | How often the agent re-probes hardware and heartbeats the CP (advancing its `last_seen_at`). Lower = fresher `free_mb` for placement at the cost of more RPC + `nvidia-smi` calls. Keep the CP's `WITCHGRID_STALE_NODE_SECONDS` ≳ 3× this. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | See above; must match the CP. |
+| `WITCHGRID_LOCAL_SERVICES` | `~/.witchgrid/local-services` | Dir of `local` engine declarations (one `<name>.json` per service: argv, cwd, env, port, health path, VRAM). Missing = no local services. Must not be group/world-writable. See [`agent/README.md`](../agent/README.md#local-services-local-engine). |
 
 ## Device selection (CPU/GPU)
 

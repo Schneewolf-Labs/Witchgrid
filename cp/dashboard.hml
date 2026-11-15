@@ -884,6 +884,35 @@ export fn render_services(services_data, live_profiles, unreachable?: []): strin
 // how many flags each one exposes. Detailed flag listing is collapsed
 // behind a <details> so the section stays compact for fleets with
 // hundreds of flags per binary.
+// The agent's "local" capabilities entry is { name → declaration public
+// view }, not a flag map: one row per declared `local` engine service.
+// argv/env values are never sent by the agent, so there's nothing secret
+// to leak here — program path + env key names only.
+fn render_local_services(decls): string {
+	let names = decls.keys();
+	let html = "<details style=\"margin-bottom:0.5rem\">"
+		+ "<summary><code>local</code> — " + names.length + " declared service"
+		+ (names.length == 1 ? "" : "s") + "</summary>";
+	if (names.length == 0) {
+		return html + "<p class=\"empty\">None declared (WITCHGRID_LOCAL_SERVICES).</p></details>";
+	}
+	html = html + "<table style=\"margin-top:0.5rem\">"
+		+ "<thead><tr><th>service</th><th>port</th><th>VRAM</th><th>health</th><th>program</th><th>description</th></tr></thead>"
+		+ "<tbody>";
+	for (n in names) {
+		let d = decls[n];
+		html = html + "<tr>"
+			+ "<td><code>" + esc(n) + "</code></td>"
+			+ "<td>" + esc("" + (d?.port ?? "")) + "</td>"
+			+ "<td>" + esc("" + (d?.vram_mb ?? 0)) + " MB</td>"
+			+ "<td><code>" + esc("" + (d?.health_path ?? "")) + "</code></td>"
+			+ "<td><code>" + esc("" + (d?.program ?? "")) + "</code></td>"
+			+ "<td style=\"font-size:0.85em\">" + esc("" + (d?.description ?? "")) + "</td>"
+			+ "</tr>";
+	}
+	return html + "</tbody></table></details>";
+}
+
 export fn render_capabilities(caps_data): string {
 	let nodes = caps_data.keys();
 	if (nodes.length == 0) {
@@ -901,6 +930,10 @@ export fn render_capabilities(caps_data): string {
 		}
 		for (b in bnames) {
 			let flags = binaries[b];
+			if (b == "local") {
+				html = html + render_local_services(flags);
+				continue;
+			}
 			let fnames = flags.keys();
 			html = html + "<details style=\"margin-bottom:0.5rem\">"
 				+ "<summary><code>" + esc(b) + "</code> — "

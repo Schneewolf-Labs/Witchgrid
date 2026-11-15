@@ -379,6 +379,11 @@ fn init_db(db): null {
 	// register. null = an agent too old to report it (→ "update" hint). Lets
 	// the dashboard surface fleet version drift instead of it being silent.
 	try { exec(db, "alter table nodes add column agent_version text", []); } catch (e) { }
+	// local_services_json: the `local` engine services this node's agent
+	// declares (public view: name, port, vram_mb, health_path, … — never
+	// argv/env), replaced on every register. Placement for a `local`
+	// profile reads it; null = an agent too old to report any.
+	try { exec(db, "alter table nodes add column local_services_json text", []); } catch (e) { }
 	// Per-node GGUF catalog. Replaced wholesale on each /register so we
 	// don't accumulate stale entries when an operator deletes a model
 	// from disk. Indexed on alias for the placement-time "which nodes
@@ -1368,6 +1373,63 @@ fn iso_now(): string {
 
 // ── node registry ────────────────────────────────────────────────────
 
+// Keep only the well-formed entries of an agent's local_services list,
+// reduced to the fields the CP uses (placement, health, display). Agent
+// data, but it lands in placement decisions and dashboard HTML, so shape
+// it here once. Returns the JSON to store, or null when absent.
+let MAX_LOCAL_SERVICES_PER_NODE = 256;
+
+fn sanitize_local_services(list) {
+	if (list == null || typeof(list) != "array") { return null; }
+	let out = [];
+	for (e in list) {
+		if (out.length >= MAX_LOCAL_SERVICES_PER_NODE) { break; }
+		if (e == null || typeof(e) != "object") { continue; }
+		let name = e?.name;
+		if (name == null || typeof(name) != "string" || !valid_local_name(name)) { continue; }
+		let port = e?.port;
+		if (!is_int_value(port) || port < 1 || port > 65535) { continue; }
+		let hp = e?.health_path;
+		if (hp == null || typeof(hp) != "string" || hp.length > 256 || !hp.starts_with("/")
+			|| hp.find(" ") >= 0 || hp.find("\r") >= 0 || hp.find("\n") >= 0) { hp = "/health"; }
+		let vram = e?.vram_mb ?? 0;
+		if (!is_int_value(vram) || vram < 0 || vram > 1048576) { vram = 0; }
+		let tmo = e?.startup_timeout_s ?? AUTOSPAWN_READY_TIMEOUT_SECONDS;
+		if (!is_int_value(tmo) || tmo < 1 || tmo > 3600) { tmo = AUTOSPAWN_READY_TIMEOUT_SECONDS; }
+		out.push({
+			name:              name,
+			description:       "" + (e?.description ?? ""),
+			program:           "" + (e?.program ?? ""),
+			port:              i32(port),
+			health_path:       hp,
+			vram_mb:           i32(vram),
+			startup_timeout_s: i32(tmo),
+		});
+	}
+	return stringify(out);
+}
+
+fn is_int_value(v): bool {
+	let t = typeof(v);
+	return t == "i32" || t == "i64" || t == "i16" || t == "i8"
+		|| t == "u8" || t == "u16" || t == "u32" || t == "u64";
+}
+
+// Same rule as the agent's local_services.valid_service_name.
+fn valid_local_name(name): bool {
+	if (name == null || typeof(name) != "string") { return false; }
+	if (name.length == 0 || name.length > 63) { return false; }
+	let i = 0;
+	while (i < name.length) {
+		let c = name.substr(i, 1);
+		let ok = (c >= "a" && c <= "z") || (c >= "0" && c <= "9");
+		if (i > 0 && (c == "-" || c == "_" || c == ".")) { ok = true; }
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
 fn handle_register(req): object {
 	let payload = parse(req.body);
 	let node_id = payload?.node_id;
@@ -1411,17 +1473,19 @@ fn handle_register(req): object {
 	let ar = payload?.auto_restart;
 	let ar_val = (ar == null) ? null : (ar == true ? 1 : 0);
 	let agent_ver = payload?.agent_version;
+	let local_json = sanitize_local_services(payload?.local_services);
 	exec(DB,
-		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json, auto_restart, agent_version) "
-		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json, auto_restart, agent_version, local_services_json) "
+		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
 		+ "on conflict(node_id) do update set "
 		+ "hostname=excluded.hostname, role=excluded.role, "
 		+ "hardware_json=excluded.hardware_json, agent_url=excluded.agent_url, "
 		+ "last_seen_at=excluded.last_seen_at, "
 		+ "runtime_json=excluded.runtime_json, "
 		+ "auto_restart=coalesce(excluded.auto_restart, nodes.auto_restart), "
-		+ "agent_version=coalesce(excluded.agent_version, nodes.agent_version)",
-		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json, ar_val, agent_ver]
+		+ "agent_version=coalesce(excluded.agent_version, nodes.agent_version), "
+		+ "local_services_json=excluded.local_services_json",
+		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json, ar_val, agent_ver, local_json]
 	);
 
 	// Catalog ingest. Replace-all-for-this-node so deleted models drop
@@ -1523,13 +1587,18 @@ fn handle_register(req): object {
 fn handle_list_nodes(req): object {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
-		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, agent_version "
+		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, agent_version, "
+		+ "local_services_json "
 		+ "from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
 		let runtime = null;
 		if (row?.runtime_json != null) {
 			try { runtime = parse(row.runtime_json); } catch (e) { }
+		}
+		let local_services = [];
+		if (row?.local_services_json != null) {
+			try { local_services = parse(row.local_services_json); } catch (e) { }
 		}
 		out.push({
 			node_id: row.node_id,
@@ -1545,6 +1614,8 @@ fn handle_list_nodes(req): object {
 			// predates auto_restart reporting.
 			auto_restart: (row?.auto_restart == null) ? null : (row.auto_restart == 1),
 			agent_version: row?.agent_version,
+			// `local` engine services this node declares (public view).
+			local_services: local_services,
 		});
 	}
 	return { status: 200, body: stringify(out) };
@@ -2069,6 +2140,93 @@ fn pick_placement(model_path: string, profile) {
 	return null;
 }
 
+// ── local engine placement ───────────────────────────────────────────
+// A `local` profile ({ binary: "local", local_service: "<name>" }) runs
+// a command the agent declares on its own disk; the CP never sees or
+// sends the command. Placement therefore only answers: which live node
+// declares <name>, and (if it declares vram_mb > 0) which ONE GPU there
+// has that much free. No tensor split — an arbitrary process can't be
+// sharded the way llama-server can.
+
+// The declaration <name> as advertised by node_id, or null.
+fn local_decl_on_node(node_id: string, name) {
+	let rows = query(DB, "select local_services_json from nodes where node_id = ?", [node_id]);
+	if (rows.length == 0 || rows[0]?.local_services_json == null) { return null; }
+	let list = [];
+	try { list = parse(rows[0].local_services_json); } catch (e) { return null; }
+	for (e in list) { if (e?.name == name) { return e; } }
+	return null;
+}
+
+// First declaration of <name> on any node (fresh or not) — for the
+// readiness probe's health path / timeout, where any copy will do.
+fn local_decl_any(name) {
+	let rows = query(DB,
+		"select node_id from nodes where local_services_json is not null "
+		+ "order by last_seen_at desc", []);
+	for (r in rows) {
+		let d = local_decl_on_node(r.node_id, name);
+		if (d != null) { return d; }
+	}
+	return null;
+}
+
+// Health path a profile's service answers on: per engine, or the
+// declared one for a local service.
+fn health_path_for_profile(profile): string {
+	if (profile?.binary == "local") {
+		return local_decl_any(profile?.local_service)?.health_path ?? "/health";
+	}
+	return health_path_for(profile?.binary);
+}
+
+// Returns a placement { node_id, agent_url, gpu_indices, tensor_split:
+// null, est_mb, model_path, decl } or { error, status }. Device: the
+// profile has already been through apply_device, so gpu_layers == 0
+// means "cpu" was asked for — no GPU even if the service declares VRAM.
+fn pick_placement_local(profile) {
+	let name = profile?.local_service;
+	let rows = query(DB,
+		"select node_id, agent_url, hardware_json from nodes "
+		+ "where agent_url is not null "
+		+ "and state = 'active' "
+		+ "and last_seen_at > datetime('now', ?) "
+		+ "order by registered_at desc",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
+	let declared_somewhere = false;
+	let need = 0;
+	for (row in rows) {
+		let decl = local_decl_on_node(row.node_id, name);
+		if (decl == null) { continue; }
+		declared_somewhere = true;
+		need = decl?.vram_mb ?? 0;
+		let cpu = (profile?.intent?.gpu_layers == 0) || need <= 0;
+		if (cpu) {
+			return { node_id: row.node_id, agent_url: row.agent_url,
+				gpu_indices: [], tensor_split: null, est_mb: 0,
+				model_path: "local:" + name, decl: decl };
+		}
+		// One GPU, the one with the most free VRAM that covers the
+		// declared need (headroom for whatever loads next).
+		let hw = parse(row.hardware_json);
+		let best = null;
+		for (g in (hw?.gpus ?? [])) {
+			if (g.free_mb >= need && (best == null || g.free_mb > best.free_mb)) { best = g; }
+		}
+		if (best != null) {
+			return { node_id: row.node_id, agent_url: row.agent_url,
+				gpu_indices: [best.index], tensor_split: null, est_mb: need,
+				model_path: "local:" + name, decl: decl };
+		}
+	}
+	if (!declared_somewhere) {
+		return { status: 503, error: "no live node declares local service '" + name
+			+ "' (add " + name + ".json to an agent's WITCHGRID_LOCAL_SERVICES dir)" };
+	}
+	return { status: 503, error: "no single GPU has " + need
+		+ " MB free for local service '" + name + "'" };
+}
+
 // Extract the port number from an agent_url like "http://host:8766" or
 // "http://host:8766/". Returns 0 if not parseable.
 fn extract_port(agent_url: string): i32 {
@@ -2237,10 +2395,32 @@ fn handle_spawn_proxy(req): object {
 	let device = resolve_device(req_device, profile);
 	profile = apply_device(profile, device);
 
-	// If the operator didn't pin (node_id, gpus), do capacity-aware
-	// placement. Try alias-driven first (catalog → no FS access on CP);
-	// fall back to path-driven if no alias resolves.
-	if (node_id == null || gpus == null) {
+	if (profile?.binary == "local") {
+		// local engine: placement by declaration, no model. A request
+		// `model` is ignored — the agent's declaration is the command.
+		let name = profile?.local_service;
+		if (node_id == null || gpus == null) {
+			let lp = pick_placement_local(profile);
+			if (lp?.error != null) {
+				return { status: lp.status, body: stringify({ error: lp.error }) };
+			}
+			node_id = lp.node_id;
+			gpus = lp.gpu_indices;
+			if (port == null) {
+				port = pick_port(lp.agent_url, profile?.default_port ?? lp.decl.port);
+			}
+		} else if (port == null) {
+			// Pinned: the agent refuses a name it doesn't declare; default
+			// the port from what the node advertised (else the agent's own
+			// declaration decides).
+			port = profile?.default_port ?? local_decl_on_node(node_id, name)?.port;
+		}
+		tensor_split = null;
+		model = "local:" + name;
+	} else if (node_id == null || gpus == null) {
+		// If the operator didn't pin (node_id, gpus), do capacity-aware
+		// placement. Try alias-driven first (catalog → no FS access on CP);
+		// fall back to path-driven if no alias resolves.
 
 		let pick = null;
 		// Prefer explicit model: from the request, then alias, then default_model.
@@ -2323,6 +2503,9 @@ fn handle_spawn_proxy(req): object {
 			body["node_id"] = node_id;
 			body["placed_by"] = "cp";
 			body["device"] = device_label(profile);
+			if (profile?.binary == "local") {
+				body["device"] = (gpus != null && gpus.length > 0) ? "gpu" : "cpu";
+			}
 			return { status: resp.status_code, body: stringify(body) };
 		}
 		return { status: resp.status_code, body: resp.body };
@@ -2612,7 +2795,7 @@ fn handle_service_ready(req): object {
 	}
 	let profile = fetch_profile_by_name(profile_name);
 	let url = "http://" + target.agent_host + ":" + target.port
-		+ health_path_for(profile?.binary);
+		+ health_path_for_profile(profile);
 	let ready = false;
 	try { let r = get(url, null); if (r.status_code == 200) { ready = true; } } catch (e) { }
 	return { status: 200, body: stringify({
@@ -2698,6 +2881,8 @@ fn auto_spawn(profile_name: string) {
 	// override exists here — /v1/llama/* is profile-derived).
 	profile = apply_device(profile, resolve_device(null, profile));
 
+	if (profile?.binary == "local") { return auto_spawn_local(profile_name, profile); }
+
 	// Same priority ladder as handle_spawn_proxy: alias-driven first,
 	// then default_model fallback. The /v1/llama/* path has no operator-
 	// supplied override; it's all profile-derived.
@@ -2779,6 +2964,46 @@ fn auto_spawn(profile_name: string) {
 		return { error: { status: 503, body: stringify({
 			error: "auto-spawned service did not become ready in "
 				+ AUTOSPAWN_READY_TIMEOUT_SECONDS + "s",
+		})}};
+	}
+	print("[autospawn] " + profile_name + " ready on " + host + ":" + port);
+	return { agent_host: host, port: port };
+}
+
+// auto_spawn for a `local` profile: declaration-driven placement, then
+// wait on the DECLARED health path for the declared startup timeout
+// (a venv loading TTS/RVC weights is slower than the 60s llama default).
+fn auto_spawn_local(profile_name: string, profile) {
+	let lp = pick_placement_local(profile);
+	if (lp?.error != null) {
+		return { error: { status: lp.status, body: stringify({ error: lp.error }) }};
+	}
+	let port = pick_port(lp.agent_url, profile?.default_port ?? lp.decl.port);
+	print("[autospawn] local " + profile_name + " (" + profile.local_service + ") on "
+		+ lp.node_id + " gpus=" + lp.gpu_indices.join(",") + " port=" + port);
+	let spawn_resp = null;
+	try {
+		spawn_resp = cp_post_json(lp.agent_url + "/services", {
+			profile_name: profile_name,
+			profile:      profile,
+			model:        lp.model_path,
+			port:         port,
+			gpus:         lp.gpu_indices,
+			tensor_split: null,
+		});
+	} catch (e) {
+		return { error: { status: 502, body: stringify({
+			error: "auto-spawn: agent unreachable: " + e,
+		})}};
+	}
+	if (spawn_resp.status_code < 200 || spawn_resp.status_code >= 300) {
+		return { error: { status: spawn_resp.status_code, body: spawn_resp.body }};
+	}
+	let host = extract_host(lp.agent_url);
+	let timeout = lp.decl?.startup_timeout_s ?? AUTOSPAWN_READY_TIMEOUT_SECONDS;
+	if (!wait_for_service_ready(host, port, lp.decl?.health_path ?? "/health", timeout)) {
+		return { error: { status: 503, body: stringify({
+			error: "auto-spawned local service did not become ready in " + timeout + "s",
 		})}};
 	}
 	print("[autospawn] " + profile_name + " ready on " + host + ":" + port);
@@ -3845,6 +4070,21 @@ fn handle_placement_preview(req): object {
 	}
 	profile = apply_device(profile, resolve_device(req_device, profile));
 
+	if (profile?.binary == "local") {
+		let lp = pick_placement_local(profile);
+		if (lp?.error != null) {
+			return { status: 200, body: stringify({ ok: false, reason: lp.error }) };
+		}
+		return { status: 200, body: stringify({
+			ok:          true,
+			node_id:     lp.node_id,
+			gpu_indices: lp.gpu_indices,
+			cpu_only:    lp.gpu_indices.length == 0,
+			est_mb:      lp.est_mb,
+			model_path:  lp.model_path,
+		})};
+	}
+
 	// Alias path — same logic as auto_spawn() takes. Only previews the
 	// alias case; default_model fallback would need pick_placement which
 	// stats the file from CP's box and isn't meaningful as a preview.
@@ -4344,7 +4584,7 @@ fn handle_get_profile(req): object {
 // the two mistakes that silently store a profile no spawn can use are
 // refused — a non-object body, and PUT given POST's { name, profile }
 // wrapper, which used to be saved verbatim as the profile.
-let KNOWN_BINARIES = ["llama-server", "sd-server", "whisper-server", "piper"];
+let KNOWN_BINARIES = ["llama-server", "sd-server", "whisper-server", "piper", "local"];
 
 fn validate_profile(profile, is_put: bool) {
 	if (profile == null || typeof(profile) != "object") {
@@ -4366,6 +4606,24 @@ fn validate_profile(profile, is_put: bool) {
 	}
 	if (profile?.extra_flags != null && typeof(profile.extra_flags) != "array") {
 		return "extra_flags must be an array of strings";
+	}
+	if (profile?.binary == "local") {
+		// The command lives in the agent's declaration; a profile only
+		// names it. Refuse argv-shaped fields outright rather than store
+		// something that looks like it does something and is ignored.
+		if (!valid_local_name(profile?.local_service)) {
+			return "local profiles need local_service: the name of a service an agent "
+				+ "declares ([a-z0-9][a-z0-9._-]{0,62})";
+		}
+		if (profile?.extra_flags != null && profile.extra_flags.length > 0) {
+			return "local profiles take no extra_flags — the command line lives in the "
+				+ "agent's declaration file, not in the profile";
+		}
+		if (profile?.default_port != null
+			&& (!is_int_value(profile.default_port)
+				|| profile.default_port < 1024 || profile.default_port > 65535)) {
+			return "default_port must be an integer 1024-65535";
+		}
 	}
 	return null;
 }

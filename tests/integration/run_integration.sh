@@ -35,6 +35,30 @@ TMP="$(mktemp -d)"
 BIN="$TMP/bin"; mkdir -p "$BIN" "$TMP/cp" "$TMP/agent" "$TMP/models"
 cp "$FAKE" "$BIN/llama-server"; chmod +x "$BIN/llama-server"
 
+# `local` engine fixture: a declarations dir (WITCHGRID_LOCAL_SERVICES) with
+# one service, tiny-voice — a venv-style wrapper script that starts a small
+# python HTTP server without exec. The declaration (argv/cwd/env) lives only
+# here, on the agent's disk; the CP profile just names it.
+LOCAL_DIR="$TMP/local-services"; LOCAL_SVC="$TMP/localsvc"
+LOCAL_PORT=18990
+mkdir -p "$LOCAL_DIR" "$LOCAL_SVC"; chmod 755 "$LOCAL_DIR" "$LOCAL_SVC"
+cp "$ROOT/tests/integration/fake_local_service.py" "$ROOT/tests/integration/fake_local_run.sh" "$LOCAL_SVC/"
+chmod 755 "$LOCAL_SVC/fake_local_run.sh" "$LOCAL_SVC/fake_local_service.py"
+cat > "$LOCAL_DIR/tiny-voice.json" <<JSON
+{
+  "name": "tiny-voice",
+  "description": "integration stand-in for a python venv TTS service",
+  "argv": ["$LOCAL_SVC/fake_local_run.sh"],
+  "cwd": "$LOCAL_SVC",
+  "env": { "DEVICE": "cuda" },
+  "port": $LOCAL_PORT,
+  "health_path": "/health",
+  "vram_mb": 0,
+  "startup_timeout_s": 20
+}
+JSON
+chmod 644 "$LOCAL_DIR/tiny-voice.json"
+
 CP_PID=""; AGENT_PID=""; AGENT2_PID=""
 cleanup() {
 	[ -n "$AGENT2_PID" ] && kill -9 "$AGENT2_PID" 2>/dev/null
@@ -42,6 +66,11 @@ cleanup() {
 	[ -n "$CP_PID" ] && kill -9 "$CP_PID" 2>/dev/null
 	# the agent posix_spawn'd the fake (setsid) — it outlives the agent
 	for p in $(pgrep -f "$BIN/llama-server" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+	# local-engine fixture processes (wrapper + python grandchild); the
+	# python runs with cwd $LOCAL_SVC, so match the wrapper and the server.
+	for p in $(pgrep -f "$LOCAL_SVC/fake_local_run.sh" 2>/dev/null) $(pgrep -f "fake_local_service.py" 2>/dev/null); do
+		[ "$(readlink "/proc/$p/cwd" 2>/dev/null)" = "$LOCAL_SVC" ] && kill -9 "$p" 2>/dev/null
+	done
 	rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -78,17 +107,25 @@ echo "[integration] booting agent ($AGENT_URL, fake llama-server on PATH)…"
 # current_binary_path() looks under $HOME/.witchgrid/llama-server, so an
 # empty temp HOME forces the bare-name PATH lookup → our fake. (On a clean
 # CI runner there's no install anyway; this just makes it work locally too.)
-PATH="$BIN:$PATH" \
-	HOME="$TMP" \
-	WITCHGRID_CP_URL="$CP_URL" \
-	WITCHGRID_AGENT_URL="$AGENT_URL" \
-	WITCHGRID_AGENT_PORT="$AGENT_PORT" \
-	WITCHGRID_NODE_ID="$NODE_ID" \
-	WITCHGRID_DATA_DIR="$TMP/agent" \
-	WITCHGRID_MODEL_DIR="$TMP/models" \
+# WG_INTEGRATION_CANARY is in the agent's env only: a local service must not
+# inherit it (local services get an explicit env, not the agent's).
+# A function because the local-engine block restarts this agent (re-adoption).
+boot_agent1() {
+	PATH="$BIN:$PATH" \
+		HOME="$TMP" \
+		WITCHGRID_CP_URL="$CP_URL" \
+		WITCHGRID_AGENT_URL="$AGENT_URL" \
+		WITCHGRID_AGENT_PORT="$AGENT_PORT" \
+		WITCHGRID_NODE_ID="$NODE_ID" \
+		WITCHGRID_DATA_DIR="$TMP/agent" \
+		WITCHGRID_MODEL_DIR="$TMP/models" \
 		WITCHGRID_HEARTBEAT_SECONDS="$HEARTBEAT_SECS" \
-	"$AGENT_BIN" >"$TMP/agent.log" 2>&1 &
-AGENT_PID=$!; disown "$AGENT_PID" 2>/dev/null || true
+		WITCHGRID_LOCAL_SERVICES="$LOCAL_DIR" \
+		WG_INTEGRATION_CANARY=1 \
+		"$AGENT_BIN" >>"$TMP/agent.log" 2>&1 &
+	AGENT_PID=$!; disown "$AGENT_PID" 2>/dev/null || true
+}
+boot_agent1
 # wait for the node to register with the CP
 for i in $(seq 1 30); do
 	curl -fsS "$CP_URL/nodes" 2>/dev/null | grep -q "$NODE_ID" && break; sleep 0.3
@@ -230,6 +267,114 @@ if [ -n "$STUB_PID" ]; then
 fi
 check "stop escalates to SIGKILL and reaps a backend that ignores SIGTERM" \
 	bash -c "[ $STOP_DONE -eq 1 ]"
+
+# ── local engine: declare → profile → spawn → health → stop → refusal ──
+# tiny-voice is declared in $LOCAL_DIR on agent 1 only. The CP profile names
+# it; the command line never leaves the agent.
+check "agent /capabilities lists the declared local service (no argv/env values)" \
+	bash -c "curl -fsS '$AGENT_URL/capabilities' | python3 -c 'import sys,json; raw=sys.stdin.read(); d=json.loads(raw)[\"local\"][\"tiny-voice\"]; sys.exit(0 if d[\"port\"]==$LOCAL_PORT and d[\"health_path\"]==\"/health\" and d[\"env_keys\"]==[\"DEVICE\"] and \"cuda\" not in raw else 1)'"
+
+check "CP /nodes carries the node's declared local services" \
+	bash -c "curl -fsS '$CP_URL/nodes' | python3 -c 'import sys,json; n=[x for x in json.load(sys.stdin) if x[\"node_id\"]==\"$NODE_ID\"][0]; sys.exit(0 if any(s[\"name\"]==\"tiny-voice\" for s in n.get(\"local_services\",[])) else 1)'"
+
+check "local profile referencing the declared name is accepted (201)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/api/profiles' -H 'content-type: application/json' -d '{\"name\":\"voice-local\",\"profile\":{\"binary\":\"local\",\"local_service\":\"tiny-voice\",\"intent\":{},\"extra_flags\":[]}}')\" = '201' ]"
+
+check "local profile with extra_flags is refused (400) — argv lives on the agent" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/api/profiles' -H 'content-type: application/json' -d '{\"name\":\"voice-evil\",\"profile\":{\"binary\":\"local\",\"local_service\":\"tiny-voice\",\"extra_flags\":[\"-c\",\"id\"]}}')\" = '400' ]"
+
+check "placement preview places the local profile on its declaring node, no GPU (vram_mb 0)" \
+	bash -c "curl -fsS -X POST '$CP_URL/api/placement_preview' -H 'content-type: application/json' -d '{\"profile_name\":\"voice-local\"}' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"ok\") and d.get(\"node_id\")==\"$NODE_ID\" and d.get(\"gpu_indices\")==[] else 1)'"
+
+LSVC=$(curl -fsS -X POST "$CP_URL/services" -H 'content-type: application/json' \
+	-d '{"profile":"voice-local"}' 2>/dev/null)
+LSVC_ID=$(echo "$LSVC" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+LSVC_PID=$(echo "$LSVC" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null)
+check "spawn via POST /services places the local service on its declaring node + port" \
+	bash -c "echo '$LSVC' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get(\"pid\") and d.get(\"port\")==$LOCAL_PORT and d.get(\"node_id\")==\"$NODE_ID\" else 1)'"
+
+LOCAL_UP=0
+for _ in $(seq 1 20); do
+	curl -fsS "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1 && { LOCAL_UP=1; break; }
+	sleep 0.5
+done
+check "the local service answers its declared health path" bash -c "[ $LOCAL_UP -eq 1 ]"
+
+check "local service got the declared cwd + env, PORT, hidden GPUs, and NOT the agent's env" \
+	bash -c "curl -fsS 'http://127.0.0.1:$LOCAL_PORT/env' | python3 -c 'import sys,json; d=json.load(sys.stdin); sys.exit(0 if d[\"cwd\"]==\"$LOCAL_SVC\" and d[\"DEVICE\"]==\"cuda\" and d[\"PORT\"]==\"$LOCAL_PORT\" and d[\"CUDA_VISIBLE_DEVICES\"]==\"\" and d[\"canary_leaked\"]==False and d[\"pgid\"]==$LSVC_PID else 1)'"
+
+check "/resolve + /api/ready work for the local profile" \
+	bash -c "curl -fsS '$CP_URL/resolve/voice-local' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"port\")==$LOCAL_PORT else 1)' && curl -fsS '$CP_URL/api/ready/voice-local' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"ready\")==True else 1)'"
+
+# Watchdog: kill the whole group (wrapper + python) out from under the agent;
+# the next heartbeat tick must respawn it from the declaration.
+kill -9 -- "-$LSVC_PID" 2>/dev/null
+LOCAL_RESPAWNED=0
+for _ in $(seq 1 30); do
+	NEWPID=$(curl -fsS "$AGENT_URL/services" 2>/dev/null | python3 -c 'import sys,json; s=[x for x in json.load(sys.stdin) if x["profile"]=="voice-local" and x["alive"]]; print(s[0]["pid"] if s else "")' 2>/dev/null)
+	if [ -n "$NEWPID" ] && [ "$NEWPID" != "$LSVC_PID" ] && curl -fsS "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1; then
+		LOCAL_RESPAWNED=1; break
+	fi
+	sleep 0.5
+done
+check "auto-restart watchdog respawns a killed local service" bash -c "[ $LOCAL_RESPAWNED -eq 1 ]"
+LSVC_ID=$(curl -fsS "$AGENT_URL/services" 2>/dev/null | python3 -c 'import sys,json; s=[x for x in json.load(sys.stdin) if x["profile"]=="voice-local" and x["alive"]]; print(s[0]["id"] if s else "")' 2>/dev/null)
+LSVC_PID=$NEWPID
+
+# Re-adoption: the agent dies (SIGKILL), its setsid'd local service lives on;
+# the restarted agent must pick it back up as the same service — same pid,
+# no second copy fighting for the port.
+kill -9 "$AGENT_PID" 2>/dev/null; sleep 0.5
+boot_agent1
+for _ in $(seq 1 40); do curl -fsS "$AGENT_URL/healthz" >/dev/null 2>&1 && break; sleep 0.3; done
+sleep $((HEARTBEAT_SECS * 3))
+check "agent restart re-adopts the running local service (same pid, single copy)" \
+	bash -c "curl -fsS '$AGENT_URL/services' | python3 -c 'import sys,json; s=[x for x in json.load(sys.stdin) if x[\"profile\"]==\"voice-local\"]; sys.exit(0 if len(s)==1 and s[0][\"alive\"] and s[0][\"pid\"]==$LSVC_PID else 1)' && [ \"\$(pgrep -f 'fake_local_service.py' | while read p; do [ \"\$(readlink /proc/\$p/cwd)\" = '$LOCAL_SVC' ] && echo \$p; done | wc -l)\" = 1 ]"
+
+# Stop signals the whole process group: the python grandchild must go too,
+# freeing the port (a plain kill of the wrapper pid would orphan it).
+curl -fsS -X POST "$CP_URL/services/stop" -H 'content-type: application/json' \
+	-d '{"id":"'"$LSVC_ID"'","node_id":"'"$NODE_ID"'"}' >/dev/null 2>&1
+LOCAL_DOWN=0
+for _ in $(seq 1 20); do
+	if ! curl -fsS "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1 \
+		&& [ -z "$(pgrep -f 'fake_local_service.py' | while read p; do [ "$(readlink /proc/$p/cwd)" = "$LOCAL_SVC" ] && echo $p; done)" ]; then
+		LOCAL_DOWN=1; break
+	fi
+	sleep 0.5
+done
+check "stop takes down the local service's whole process group" bash -c "[ $LOCAL_DOWN -eq 1 ]"
+
+# Auto-spawn: with nothing running, a request through the CP proxy places +
+# spawns the local service and waits on its declared health path first.
+check "proxy auto-spawn brings a stopped local service up (declared health path)" \
+	bash -c "curl -fsS -m 40 '$CP_URL/v1/llama/voice-local/health' | python3 -c 'import sys,json; sys.exit(0 if json.load(sys.stdin).get(\"status\")==\"ok\" else 1)'"
+AS_ID=$(curl -fsS "$AGENT_URL/services" 2>/dev/null | python3 -c 'import sys,json; s=[x for x in json.load(sys.stdin) if x["profile"]=="voice-local" and x["alive"]]; print(s[0]["id"] if s else "")' 2>/dev/null)
+[ -n "$AS_ID" ] && curl -fsS -X POST "$AGENT_URL/services/stop" -H 'content-type: application/json' \
+	-d '{"id":"'"$AS_ID"'"}' >/dev/null 2>&1
+for _ in $(seq 1 20); do curl -fsS "http://127.0.0.1:$LOCAL_PORT/health" >/dev/null 2>&1 || break; sleep 0.5; done
+
+# Refusal: a profile naming something no agent declares can be stored (the
+# agent is the authority), but never runs — CP placement finds no declaring
+# node (503), and an agent asked directly refuses it (403).
+curl -fsS -X POST "$CP_URL/api/profiles" -H 'content-type: application/json' \
+	-d '{"name":"voice-ghost","profile":{"binary":"local","local_service":"ghost"}}' >/dev/null 2>&1
+check "spawn of an undeclared local service is refused by CP placement (503)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"voice-ghost\"}')\" = '503' ]"
+check "pinned spawn of an undeclared local service is refused by the agent (403)" \
+	bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -X POST '$CP_URL/services' -H 'content-type: application/json' -d '{\"profile\":\"voice-ghost\",\"node_id\":\"$NODE_ID\",\"gpus\":[],\"port\":18992}')\" = '403' ]"
+
+# A hand-crafted agent payload can't smuggle a command in: argv-shaped
+# profile fields are ignored for local services — the spawned argv is
+# exactly the declaration's.
+SMUG=$(curl -fsS -X POST "$AGENT_URL/services" -H 'content-type: application/json' \
+	-d '{"profile_name":"voice-smuggle","profile":{"binary":"local","local_service":"tiny-voice","extra_flags":["--evil"],"intent":{"context":1},"argv":["/bin/false"]},"model":"/bin/false","port":18991}' 2>/dev/null)
+SMUG_ID=$(echo "$SMUG" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))' 2>/dev/null)
+SMUG_PID=$(echo "$SMUG" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("pid",""))' 2>/dev/null)
+check "argv-shaped fields in a spawn payload are ignored (argv = declaration)" \
+	bash -c "[ -n '$SMUG_PID' ] && tr '\\0' ' ' < /proc/$SMUG_PID/cmdline | grep -q 'fake_local_run.sh' && ! tr '\\0' ' ' < /proc/$SMUG_PID/cmdline | grep -q -- '--evil'"
+[ -n "$SMUG_ID" ] && curl -fsS -X POST "$AGENT_URL/services/stop" -H 'content-type: application/json' \
+	-d '{"id":"'"$SMUG_ID"'"}' >/dev/null 2>&1
 
 # #4: a live agent's heartbeat must keep advancing its last_seen_at. Snapshot,
 # then poll until it moves forward (cadence forced fast via

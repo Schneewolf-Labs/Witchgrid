@@ -14,6 +14,7 @@ import { register as register_capabilities } from "./capabilities_test";
 import { register as register_gguf }         from "./gguf_test";
 import { register as register_transfers }    from "./transfers_test";
 import { register as register_mcp }          from "./mcp_test";
+import { register as register_local }        from "./local_services_test";
 
 import { run } from "@stdlib/testing";
 import { exit } from "@stdlib/env";
@@ -23,6 +24,7 @@ register_capabilities();
 register_gguf();
 register_transfers();
 register_mcp();
+register_local();
 
 let result = run();
 if (!result.success) {

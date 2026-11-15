@@ -1,0 +1,12 @@
+{
+  "_comment": "Example `local` engine declaration for a Python venv HTTP service. Copy to $WITCHGRID_LOCAL_SERVICES/riko-voice.json on the agent (chmod 644; the dir must not be group/world-writable). run.sh activates the venv and starts the server on $PORT; GET /health answers 200 once the models are loaded.",
+  "name": "riko-voice",
+  "description": "Riko voice: Kokoro TTS + RVC (python venv)",
+  "argv": ["~/riko-voice/run.sh"],
+  "cwd": "~/riko-voice",
+  "env": { "DEVICE": "cuda" },
+  "port": 19300,
+  "health_path": "/health",
+  "vram_mb": 1300,
+  "startup_timeout_s": 180
+}

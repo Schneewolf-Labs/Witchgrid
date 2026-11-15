@@ -23,7 +23,8 @@
 //   GET  /services                                             → [...]
 //   POST /services/stop    { id }                              → 204
 //   GET  /profiles                                             → [profile names]
-//   GET  /capabilities                                         → { binary: caps_map }
+//   GET  /capabilities                                         → { binary: caps_map, local: {...} }
+//   GET  /local-services                                       → declared local services + file errors
 //   GET  /models                                               → catalog entries
 //   POST /rescan                                               → 200, refresh + return new count
 //   GET  /healthz                                              → ok
@@ -46,6 +47,10 @@
 //                                         CWD-relative (legacy). Set this so
 //                                         a launch from the wrong dir doesn't
 //                                         spin up an empty registry.
+//   WITCHGRID_LOCAL_SERVICES   ~/.witchgrid/local-services
+//                                         dir of `local` engine declarations
+//                                         (one <name>.json per service; see
+//                                         local_services.hml). Missing = none.
 
 import { open_db, close_db, query as db_query, exec as db_exec } from "@stdlib/sqlite";
 import { stringify, parse } from "@stdlib/json";
@@ -59,7 +64,8 @@ import { exists, make_dirs, remove_file } from "@stdlib/fs";
 import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
 import { serve } from "./http_server";
 import { WITCHGRID_VERSION } from "../version";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set, managed_pids } from "./services";
+import { local_services_dir, load_declarations, public_list as local_public_list, public_view as local_public_view } from "./local_services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
@@ -262,12 +268,19 @@ fn register_with_cp(cp_url: string, payload): null {
 // Pull every PID the agent has ever spawned and not reaped — these
 // are "ours" for the unmanaged-proc cross-reference. Includes zombies
 // the next reap_zombie_services() pass would cull, but that's harmless;
-// nvidia-smi already won't list them.
+// nvidia-smi already won't list them. Running `local` services also
+// contribute their process-group members: a wrapper script's python
+// grandchild is the process nvidia-smi actually reports.
 fn collect_known_pids(db): array {
-	let rows = db_query(db, "select pid from services", []);
-	let out = [];
-	for (r in rows) { out.push(r.pid); }
-	return out;
+	return managed_pids(db);
+}
+
+// Declared local services as advertised to the CP (register/heartbeat)
+// and /capabilities: name, port, vram_mb, health_path, … — never argv
+// or env values. Re-read every call so a new declaration shows up on the
+// next heartbeat without an agent restart.
+fn local_services_public(): array {
+	return local_public_list(load_declarations(local_services_dir()));
 }
 
 // Transient CP failures are swallowed — we'll succeed on the next
@@ -305,6 +318,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				runtime:   runtime_ref.value,
 				unmanaged_processes: unmanaged,
 				auto_restart: get_auto_restart(db),
+				local_services: local_services_public(),
 			});
 			if (resp.status_code < 200 || resp.status_code >= 300) {
 				eprint("[heartbeat] CP " + resp.status_code + ": " + resp.body);
@@ -473,6 +487,14 @@ fn main(): null {
 	} else {
 		print("[agent] piper: present at " + pcpp_current_binary_path());
 	}
+	// local engine: report what's declared (and what was refused) so a
+	// typo in a declaration file is visible at boot, not at first spawn.
+	let boot_local = load_declarations(local_services_dir());
+	print("[agent] local services: " + boot_local.services.keys().length
+		+ " declared in " + boot_local.dir);
+	for (le in boot_local.errors) {
+		eprint("[agent] local service declaration " + le.file + " refused: " + le.error);
+	}
 
 	// Scan the catalog before first /register so CP gets the model list
 	// on the very first contact (placement can use it immediately).
@@ -543,6 +565,7 @@ fn main(): null {
 		unmanaged_processes: probe_unmanaged_procs(hw.gpus,
 			collect_known_pids(db)),
 		auto_restart: get_auto_restart(db),
+		local_services: local_services_public(),
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
@@ -743,11 +766,29 @@ fn main(): null {
 		// /profiles gone in v0.7 — profiles live on CP. The handler
 		// stub returns 410; route left out so 404 is the response.
 		{ method: "GET",  path: "/capabilities",  handler: fn(req): object {
+			// "local" maps declared service name → its public view
+			// (port, vram_mb, health_path, …) rather than flags.
+			let loaded = load_declarations(local_services_dir());
+			let local_map = {};
+			for (n in loaded.services.keys()) {
+				local_map[n] = local_public_view(loaded.services[n]);
+			}
 			return { status: 200, body: stringify({
 				"llama-server":   caps_ref.llama_server,
 				"sd-server":      caps_ref.sd_server,
 				"whisper-server": caps_ref.whisper_server,
 				"piper":          caps_ref.piper,
+				"local":          local_map,
+			})};
+		} },
+		// Declared `local` engine services + any declaration files that
+		// were refused (and why). Public views only — no argv/env values.
+		{ method: "GET",  path: "/local-services", handler: fn(req): object {
+			let loaded = load_declarations(local_services_dir());
+			return { status: 200, body: stringify({
+				dir:      loaded.dir,
+				services: local_public_list(loaded),
+				errors:   loaded.errors,
 			})};
 		} },
 		{ method: "GET",  path: "/models",        handler: fn(req): object {
