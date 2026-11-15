@@ -1,0 +1,464 @@
+// local_services.hml — agent-declared `local` engine services.
+//
+// The fifth engine, and the only one Witchgrid doesn't build or
+// install: a service that is just "run this command, it listens on this
+// port". The motivating case is a Python venv (Kokoro TTS + RVC behind a
+// small HTTP server) that has to live under the same supervisor as the
+// llama/sd/whisper/piper engines — GPU pin, PID tracking, watchdog,
+// re-adoption — without Witchgrid learning anything about Python.
+//
+// SECURITY MODEL — the reason this file exists rather than a `command`
+// field on the profile. CP auth is optional and is off on real fleets,
+// so anything the CP can put in a spawn payload is something any LAN
+// peer can put there. A profile that carried an argv would turn every
+// agent into a remote shell. So the command line lives ONLY on the
+// agent, in operator-written declaration files:
+//
+//   $WITCHGRID_LOCAL_SERVICES/<name>.json   (default ~/.witchgrid/local-services)
+//
+// and a CP profile only *references* a declared name:
+//
+//   { "binary": "local", "local_service": "<name>", ... }
+//
+// The agent refuses any name it has no valid declaration for, and it
+// ignores every argv-shaped field on the profile (intent, extra_flags,
+// model) for local services — the declaration is the whole command.
+// No shell: argv goes to posix_spawn as a real argv, same as the other
+// engines. The env is built explicitly (see build_env) rather than
+// inherited wholesale, so the agent's own WITCHGRID_SHARED_SECRET never
+// reaches third-party code.
+//
+// Declaration file (one per service, file stem == name):
+//
+//   {
+//     "name":              "riko-voice",          required, [a-z0-9][a-z0-9._-]{0,62}
+//     "description":       "Kokoro TTS + RVC",    optional, shown in listings
+//     "argv":              ["~/riko-voice/run.sh"], required; argv[0] absolute
+//                                                  (or ~/...), an existing
+//                                                  executable. "{port}" in any
+//                                                  element is replaced with the
+//                                                  service's port.
+//     "cwd":               "~/riko-voice",        optional; absolute (or ~/...)
+//                                                  existing dir. Default: the
+//                                                  directory holding argv[0].
+//     "env":               { "DEVICE": "cuda" },  optional; string values.
+//                                                  PORT / CUDA_VISIBLE_DEVICES
+//                                                  are agent-owned and refused.
+//     "inherit_env":       ["HF_HOME"],           optional; extra agent env vars
+//                                                  to pass through (beyond the
+//                                                  BASE_INHERIT list below).
+//     "port":              19300,                 required, 1024-65535. Default
+//                                                  bind port; CP may move it
+//                                                  (port contention) and the
+//                                                  process gets the real one in
+//                                                  env PORT and {port}.
+//     "health_path":       "/health",             optional, default "/health".
+//     "vram_mb":           1300,                  optional, default 0. CP places
+//                                                  on one GPU with this much free;
+//                                                  0 = no GPU (CUDA hidden).
+//     "startup_timeout_s": 120                    optional, default 60. How long
+//                                                  CP auto-spawn waits for health.
+//   }
+//
+// "~/" is expanded against the agent user's home for argv[0] and cwd
+// only — no other shell-isms, no globbing, no variable expansion.
+//
+// Files are re-read on every use (spawn, respawn, heartbeat), so
+// editing or adding a declaration needs no agent restart. A file that is
+// group- or world-writable is refused: whoever can write it can make the
+// agent run anything.
+
+import { exists, is_dir, is_file, list_dir, read_file, file_stat } from "@stdlib/fs";
+import { getenv } from "@stdlib/env";
+import { homedir } from "@stdlib/os";
+import { parse } from "@stdlib/json";
+
+let DEFAULT_HEALTH_PATH = "/health";
+let DEFAULT_STARTUP_TIMEOUT_S = 60;
+let MAX_DECL_BYTES = 65536;
+let MAX_ARGV = 64;
+let MAX_ARG_LEN = 4096;
+let MAX_ENV = 128;
+
+// Agent env vars a local service inherits by default — what a venv or a
+// shell script needs to find its interpreter, its home and a locale.
+// Everything else (notably WITCHGRID_SHARED_SECRET) stays with the agent
+// unless the declaration names it in inherit_env.
+let BASE_INHERIT = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+
+// Keys the agent sets itself from placement; a declaration may not.
+let AGENT_OWNED_ENV = ["PORT", "CUDA_VISIBLE_DEVICES"];
+
+let ALLOWED_KEYS = ["name", "description", "argv", "cwd", "env", "inherit_env",
+	"port", "health_path", "vram_mb", "startup_timeout_s", "_comment"];
+
+// Read fresh from env on every call: Hemlock spawn() snapshots module
+// state, so a `let` here would freeze whatever the heartbeat task saw at
+// spawn time (same reason agent.hml re-reads the shared secret).
+export fn local_services_dir(): string {
+	let d = getenv("WITCHGRID_LOCAL_SERVICES");
+	if (d != null && d.length > 0) { return d; }
+	let h = homedir();
+	if (h == null || h.length == 0) { return "/var/lib/witchgrid/local-services"; }
+	return h + "/.witchgrid/local-services";
+}
+
+// ── validation helpers ────────────────────────────────────────────────
+
+fn is_int(v): bool {
+	let t = typeof(v);
+	return t == "i32" || t == "i64" || t == "i16" || t == "i8"
+		|| t == "u8" || t == "u16" || t == "u32" || t == "u64";
+}
+
+fn is_lower_alnum(c: string): bool {
+	return (c >= "a" && c <= "z") || (c >= "0" && c <= "9");
+}
+
+// Service names end up in file paths, profile references, sqlite rows,
+// log lines and dashboard HTML, so keep them boring.
+export fn valid_service_name(name): bool {
+	if (name == null || typeof(name) != "string") { return false; }
+	if (name.length == 0 || name.length > 63) { return false; }
+	if (!is_lower_alnum(name.substr(0, 1))) { return false; }
+	let i = 1;
+	while (i < name.length) {
+		let c = name.substr(i, 1);
+		if (!(is_lower_alnum(c) || c == "-" || c == "_" || c == ".")) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+fn valid_env_key(k): bool {
+	if (k == null || k.length == 0 || k.length > 128) { return false; }
+	let i = 0;
+	while (i < k.length) {
+		let c = k.substr(i, 1);
+		let alpha = (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c == "_";
+		let digit = (c >= "0" && c <= "9");
+		if (!(alpha || (digit && i > 0))) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+fn has_control_char(s: string): bool {
+	let i = 0;
+	while (i < s.length) {
+		let c = s.substr(i, 1);
+		if (c == "\0" || c == "\n" || c == "\r") { return true; }
+		i = i + 1;
+	}
+	return false;
+}
+
+// "~/x" → "<home>/x". Only a leading "~/" (or a bare "~"); anything else
+// is returned untouched and must already be absolute.
+export fn expand_home(p: string): string {
+	if (p == "~") { return homedir() ?? p; }
+	if (p.length >= 2 && p.substr(0, 2) == "~/") {
+		let h = homedir();
+		if (h == null || h.length == 0) { return p; }
+		return h + p.substr(1, p.length - 1);
+	}
+	return p;
+}
+
+fn dirname(p: string): string {
+	let li = -1;
+	let i = 0;
+	while (i < p.length) {
+		if (p.substr(i, 1) == "/") { li = i; }
+		i = i + 1;
+	}
+	if (li <= 0) { return "/"; }
+	return p.substr(0, li);
+}
+
+fn contains(arr, v): bool {
+	for (x in arr) { if (x == v) { return true; } }
+	return false;
+}
+
+// Validate a parsed declaration and normalize it. `stem` is the file
+// name without .json (the name must match it, so there is exactly one
+// file per name). `check_fs` false skips the existence/permission checks
+// on argv[0] and cwd — for unit tests of the pure shape rules.
+//
+// Returns the normalized declaration object; throws a message naming
+// the offending field otherwise.
+export fn validate_declaration(raw, stem: string, check_fs: bool): object {
+	if (raw == null || typeof(raw) != "object") {
+		throw "declaration must be a JSON object";
+	}
+	for (k in raw.keys()) {
+		if (!contains(ALLOWED_KEYS, k)) {
+			throw "unknown field '" + k + "' (allowed: " + ALLOWED_KEYS.join(", ") + ")";
+		}
+	}
+
+	let name = raw?.name;
+	if (!valid_service_name(name)) {
+		throw "name must match [a-z0-9][a-z0-9._-]{0,62}";
+	}
+	if (stem != null && name != stem) {
+		throw "name '" + name + "' must match its file name (" + stem + ".json)";
+	}
+
+	let argv_in = raw?.argv;
+	if (argv_in == null || typeof(argv_in) != "array" || argv_in.length == 0) {
+		throw "argv must be a non-empty array of strings";
+	}
+	if (argv_in.length > MAX_ARGV) {
+		throw "argv has " + argv_in.length + " elements (max " + MAX_ARGV + ")";
+	}
+	let argv = [];
+	for (a in argv_in) {
+		if (typeof(a) != "string") { throw "argv elements must be strings"; }
+		if (a.length > MAX_ARG_LEN) { throw "argv element longer than " + MAX_ARG_LEN; }
+		if (has_control_char(a)) { throw "argv elements must not contain NUL/CR/LF"; }
+		argv.push(a);
+	}
+	argv[0] = expand_home(argv[0]);
+	if (argv[0].substr(0, 1) != "/") {
+		throw "argv[0] must be an absolute path (or ~/...): " + argv[0];
+	}
+
+	let cwd = dirname(argv[0]);
+	if (raw?.cwd != null) {
+		if (typeof(raw.cwd) != "string" || raw.cwd.length == 0 || has_control_char(raw.cwd)) {
+			throw "cwd must be a path string";
+		}
+		cwd = expand_home(raw.cwd);
+	}
+	if (cwd.substr(0, 1) != "/") {
+		throw "cwd must be an absolute path (or ~/...): " + cwd;
+	}
+
+	let env = {};
+	if (raw?.env != null) {
+		if (typeof(raw.env) != "object") { throw "env must be an object of strings"; }
+		let keys = raw.env.keys();
+		if (keys.length > MAX_ENV) { throw "env has more than " + MAX_ENV + " entries"; }
+		for (k in keys) {
+			if (!valid_env_key(k)) { throw "env key '" + k + "' is not a valid variable name"; }
+			if (contains(AGENT_OWNED_ENV, k)) {
+				throw "env may not set " + k + " (the agent sets it from placement)";
+			}
+			let v = raw.env[k];
+			if (typeof(v) != "string") { throw "env value for " + k + " must be a string"; }
+			if (v.length > MAX_ARG_LEN || has_control_char(v)) {
+				throw "env value for " + k + " is too long or has NUL/CR/LF";
+			}
+			env[k] = v;
+		}
+	}
+
+	let inherit = [];
+	if (raw?.inherit_env != null) {
+		if (typeof(raw.inherit_env) != "array") { throw "inherit_env must be an array of names"; }
+		for (k in raw.inherit_env) {
+			if (typeof(k) != "string" || !valid_env_key(k)) {
+				throw "inherit_env entry '" + k + "' is not a valid variable name";
+			}
+			if (contains(AGENT_OWNED_ENV, k)) {
+				throw "inherit_env may not include " + k + " (the agent sets it)";
+			}
+			if (k == "WITCHGRID_SHARED_SECRET") {
+				throw "inherit_env may not include WITCHGRID_SHARED_SECRET";
+			}
+			inherit.push(k);
+		}
+	}
+
+	let port = raw?.port;
+	if (!is_int(port) || port < 1024 || port > 65535) {
+		throw "port must be an integer 1024-65535";
+	}
+
+	let health = raw?.health_path ?? DEFAULT_HEALTH_PATH;
+	if (typeof(health) != "string" || health.length == 0 || health.length > 256
+		|| health.substr(0, 1) != "/" || health.find(" ") >= 0 || has_control_char(health)) {
+		throw "health_path must be an absolute URL path like /health";
+	}
+
+	let vram = raw?.vram_mb ?? 0;
+	if (!is_int(vram) || vram < 0 || vram > 1048576) {
+		throw "vram_mb must be an integer 0-1048576";
+	}
+
+	let timeout = raw?.startup_timeout_s ?? DEFAULT_STARTUP_TIMEOUT_S;
+	if (!is_int(timeout) || timeout < 1 || timeout > 3600) {
+		throw "startup_timeout_s must be an integer 1-3600";
+	}
+
+	let desc = raw?.description ?? "";
+	if (typeof(desc) != "string" || desc.length > 512) {
+		throw "description must be a string (max 512 chars)";
+	}
+
+	if (check_fs) {
+		if (!exists(argv[0]) || !is_file(argv[0])) {
+			throw "argv[0] does not exist or is not a file: " + argv[0];
+		}
+		let st = file_stat(argv[0]);
+		if ((st.mode & 73) == 0) {   // 0o111: no execute bit at all
+			throw "argv[0] is not executable: " + argv[0];
+		}
+		if (!exists(cwd) || !is_dir(cwd)) {
+			throw "cwd does not exist or is not a directory: " + cwd;
+		}
+	}
+
+	return {
+		name:              name,
+		description:       desc,
+		argv:              argv,
+		cwd:               cwd,
+		env:               env,
+		inherit_env:       inherit,
+		port:              i32(port),
+		health_path:       health,
+		vram_mb:           i32(vram),
+		startup_timeout_s: i32(timeout),
+	};
+}
+
+// Load one declaration file. Throws with a reason on any problem.
+fn load_file(path: string, stem: string): object {
+	let st = file_stat(path);
+	if (!st.is_file) { throw "not a regular file"; }
+	if (st.size > MAX_DECL_BYTES) { throw "file larger than " + MAX_DECL_BYTES + " bytes"; }
+	if ((st.mode & 18) != 0) {   // 0o022
+		throw "file is group- or world-writable; chmod go-w it";
+	}
+	let raw = null;
+	try { raw = parse(read_file(path)); } catch (e) {
+		throw "invalid JSON: " + e;
+	}
+	return validate_declaration(raw, stem, true);
+}
+
+// Scan the declarations dir. Never throws: a missing dir means "no local
+// services" and a bad file is reported in `errors` (and skipped) so one
+// typo doesn't take the others down.
+//
+// Returns { dir, services: { name → decl }, errors: [{ file, error }] }.
+export fn load_declarations(dir: string): object {
+	let out = { dir: dir, services: {}, errors: [] };
+	if (dir == null || dir.length == 0 || !exists(dir)) { return out; }
+	let st = null;
+	try { st = file_stat(dir); } catch (e) { return out; }
+	if (!st.is_dir) {
+		out.errors.push({ file: dir, error: "not a directory" });
+		return out;
+	}
+	if ((st.mode & 18) != 0) {
+		out.errors.push({ file: dir,
+			error: "directory is group- or world-writable; chmod go-w it (all declarations ignored)" });
+		return out;
+	}
+	let entries = null;
+	try { entries = list_dir(dir); } catch (e) {
+		out.errors.push({ file: dir, error: "cannot list: " + e });
+		return out;
+	}
+	for (f in entries) {
+		if (f.length <= 5 || f.substr(f.length - 5, 5) != ".json") { continue; }
+		let stem = f.substr(0, f.length - 5);
+		let path = dir + "/" + f;
+		try {
+			let decl = load_file(path, stem);
+			out.services[decl.name] = decl;
+		} catch (e) {
+			out.errors.push({ file: f, error: "" + e });
+		}
+	}
+	return out;
+}
+
+// The declaration for `name`, or throw a refusal. The message always
+// contains "not declared" for a missing/invalid name — the spawn handler
+// keys its 403 off that marker.
+export fn find_declaration(dir: string, name): object {
+	if (!valid_service_name(name)) {
+		throw "local service name '" + name + "' is not declared (invalid name)";
+	}
+	let path = dir + "/" + name + ".json";
+	if (!exists(path)) {
+		throw "local service '" + name + "' is not declared on this agent (no "
+			+ path + ")";
+	}
+	try {
+		return load_file(path, name);
+	} catch (e) {
+		throw "local service '" + name + "' is not declared: " + path + ": " + e;
+	}
+}
+
+// What the agent tells the CP (and anyone who can read /capabilities)
+// about a declaration. Deliberately NOT the argv or env values — those
+// can carry tokens, and the CP never needs them. argv[0] and the env
+// key names are enough to recognise a service in the dashboard.
+export fn public_view(decl): object {
+	return {
+		name:              decl.name,
+		description:       decl.description,
+		program:           decl.argv[0],
+		cwd:               decl.cwd,
+		env_keys:          decl.env.keys(),
+		port:              decl.port,
+		health_path:       decl.health_path,
+		vram_mb:           decl.vram_mb,
+		startup_timeout_s: decl.startup_timeout_s,
+	};
+}
+
+export fn public_list(loaded): array {
+	let out = [];
+	for (n in loaded.services.keys()) { out.push(public_view(loaded.services[n])); }
+	return out;
+}
+
+// argv with every "{port}" replaced by the actual port.
+export fn build_argv(decl, port: i32): array {
+	let out = [];
+	let ps = "" + port;
+	for (a in decl.argv) {
+		out.push(a.replace_all("{port}", ps));
+	}
+	return out;
+}
+
+// Explicit child environment as posix_spawn's "KEY=value" array (which
+// REPLACES the environment rather than extending it). Order of
+// precedence, last wins: BASE_INHERIT + inherit_env from the agent's
+// env → the declaration's env → PORT and CUDA_VISIBLE_DEVICES from
+// placement.
+//
+// cvd: null = leave CUDA_VISIBLE_DEVICES as the agent has it (or unset),
+//      ""   = hide every GPU, "0,2" = pin.
+export fn build_env(decl, port: i32, cvd): array {
+	let m = {};
+	for (k in BASE_INHERIT) {
+		let v = getenv(k);
+		if (v != null) { m[k] = v; }
+	}
+	if (!m.has("PATH")) { m["PATH"] = "/usr/local/bin:/usr/bin:/bin"; }
+	for (k in decl.inherit_env) {
+		let v = getenv(k);
+		if (v != null) { m[k] = v; }
+	}
+	for (k in decl.env.keys()) { m[k] = decl.env[k]; }
+	m["PORT"] = "" + port;
+	if (cvd != null) {
+		m["CUDA_VISIBLE_DEVICES"] = cvd;
+	} else {
+		let inherited = getenv("CUDA_VISIBLE_DEVICES");
+		if (inherited != null) { m["CUDA_VISIBLE_DEVICES"] = inherited; }
+	}
+	let out = [];
+	for (k in m.keys()) { out.push(k + "=" + m[k]); }
+	return out;
+}

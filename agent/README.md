@@ -2,8 +2,9 @@
 
 Runs on every box that hosts inference. Probes hardware, registers with the
 control plane, **supervises** local engine processes (llama-server, sd-server,
-whisper-server, piper), exposes each binary's capability map, and keeps its
-services alive with an auto-restart watchdog. Compiles to a single ~10 MB binary
+whisper-server, piper, and operator-declared `local` services), exposes each
+binary's capability map, and keeps its services alive with an auto-restart
+watchdog. Compiles to a single ~10 MB binary
 (`witchgrid-agent`) with universal dynamic deps.
 
 The agent is *not* the source of truth for profiles — since v0.7 those live on
@@ -21,12 +22,14 @@ binary's capabilities.
 | `capabilities.hml` | Runs `<binary> --help`, parses into `{flag → {short, longs, value, description}}`. Cached per agent lifetime. |
 | `intent.hml` | Translates witchgrid intents (`flash_attention`, `kv_cache_k`, …) into the binary's actual flag form using the capability map. Handles `boolean_or_enum` for flags that changed shape across llama.cpp versions. |
 | `llama_cpp.hml`, `sd_cpp.hml`, `whisper_cpp.hml`, `piper_cpp.hml` | Per-engine install lifecycle (download/build a binary, list installed, activate `current`) + binary-path resolution. |
+| `local_services.hml` | The `local` engine's declaration files: load + validate, refuse undeclared names, build the explicit argv/env for a spawn, and the public view sent to the CP. |
 | `transfers.hml` | Peer-to-peer model pulls (stream a GGUF from another node, bounded memory). |
 | `http_server.hml` | Minimal HTTP/1.1 server (shared shape with `cp/`). |
 
 ## Engines
 
-The agent supervises four engine binaries; a profile's `binary` field selects one:
+The agent supervises four engine binaries plus declared `local` services; a
+profile's `binary` field selects one:
 
 | `binary` | Engine | Bind flag | Health |
 |---|---|---|---|
@@ -34,10 +37,105 @@ The agent supervises four engine binaries; a profile's `binary` field selects on
 | `sd-server` | stable-diffusion.cpp (images) | `--listen-port` (`-l`) | `GET /sdapi/v1/options` |
 | `whisper-server` | whisper.cpp (STT) | `--port` | — |
 | `piper` | piper (TTS) | `--http` | — |
+| `local` | anything declared on the agent (see below) | env `PORT` / `{port}` in argv | declared `health_path` |
 
 Each engine has an on-demand install layer: `POST /{engine}_cpp/install`,
 `GET /{engine}_cpp/installed`, `POST /{engine}_cpp/activate`. Spawns use the
-`current` activated build, falling back to a bare-name PATH lookup.
+`current` activated build, falling back to a bare-name PATH lookup. `local`
+services have no install layer — the operator installs them (a venv, a script)
+and declares them.
+
+## Local services (`local` engine)
+
+For a service that is just "run this command, it serves HTTP on a port" — e.g.
+a Python venv (Kokoro TTS + RVC behind a small server) — that should live under
+the same supervisor as the engines: GPU pin from placement, PID tracking in
+sqlite, log capture, auto-restart watchdog, SIGTERM stop with SIGKILL
+escalation, re-adoption after an agent restart.
+
+**Security model.** CP auth is optional and is off on real fleets, so anything
+a CP profile can say, any LAN peer can say. A profile therefore can NOT carry a
+command. Commands live only on the agent, in declaration files the operator
+writes:
+
+```
+$WITCHGRID_LOCAL_SERVICES/<name>.json      (default ~/.witchgrid/local-services/)
+```
+
+and a CP profile only *references* a declared name:
+
+```json
+{ "binary": "local", "local_service": "riko-voice" }
+```
+
+The agent refuses (403) any name it has no valid declaration for, and ignores
+every argv-shaped field on the profile (`intent`, `extra_flags`, `model`) — the
+CP refuses to store `extra_flags` on a local profile at all. A declaration file
+(or its directory) that is group- or world-writable is refused. There is no
+shell: `argv` goes to `posix_spawn` as a real argv.
+
+**Declaration** (one file per service; the file stem must equal `name`;
+unknown fields are rejected so a typo like `vram` fails loudly):
+
+| field | required | meaning |
+|---|---|---|
+| `name` | yes | `[a-z0-9][a-z0-9._-]{0,62}`; what profiles reference |
+| `argv` | yes | array of strings; `argv[0]` absolute (or `~/…`) and executable. `{port}` in any element is replaced with the port |
+| `port` | yes | default port, 1024-65535. The CP may move it (contention); the process always gets the real one in env `PORT` (and `{port}`) |
+| `cwd` | no | absolute (or `~/…`) existing dir; default: `argv[0]`'s directory |
+| `env` | no | `{ "KEY": "string" }`; `PORT` / `CUDA_VISIBLE_DEVICES` are agent-owned and refused |
+| `inherit_env` | no | extra agent env var names to pass through |
+| `health_path` | no | default `/health`; used by CP auto-spawn and `/api/ready` |
+| `vram_mb` | no | default 0. CP places the service on **one** GPU with this much free; 0 = no GPU (`CUDA_VISIBLE_DEVICES=""`) |
+| `startup_timeout_s` | no | default 60; how long CP auto-spawn waits for `health_path` |
+| `description`, `_comment` | no | display / notes |
+
+`~/` is expanded (agent user's home) for `argv[0]` and `cwd` only. The child
+gets an **explicit** environment, not the agent's: `PATH HOME USER LOGNAME LANG
+LC_ALL TZ TMPDIR` from the agent, then `inherit_env`, then `env`, then `PORT`
+and `CUDA_VISIBLE_DEVICES` from placement. In particular the agent's
+`WITCHGRID_SHARED_SECRET` never reaches the service.
+
+The child is spawned with `setsid`, so it leads its own process group. Stop,
+the SIGKILL escalation and the watchdog act on the **whole group**: a `run.sh`
+that starts python without `exec` still stops cleanly, and the unmanaged-GPU
+probe counts the python grandchild as ours. Declarations are re-read on every
+spawn/respawn/heartbeat — add or edit one without restarting the agent.
+
+Example — [`docs/examples/local-services/riko-voice.json`](../docs/examples/local-services/riko-voice.json):
+
+```json
+{
+  "name": "riko-voice",
+  "description": "Riko voice: Kokoro TTS + RVC (python venv)",
+  "argv": ["~/riko-voice/run.sh"],
+  "cwd": "~/riko-voice",
+  "env": { "DEVICE": "cuda" },
+  "port": 19300,
+  "health_path": "/health",
+  "vram_mb": 1300,
+  "startup_timeout_s": 180
+}
+```
+
+```bash
+mkdir -p ~/.witchgrid/local-services && chmod 755 ~/.witchgrid/local-services
+cp docs/examples/local-services/riko-voice.json ~/.witchgrid/local-services/
+chmod 644 ~/.witchgrid/local-services/riko-voice.json
+curl -s http://<agent>:8766/local-services | jq     # declared + refused files (with reasons)
+
+# on the CP: a profile that names it, then spawn (placed on a node that
+# declares it, on one GPU with >= vram_mb free) — or pin with node_id + gpus
+curl -X POST http://<cp>:8765/api/profiles -H 'content-type: application/json' \
+  -d '{"name":"riko-voice","profile":{"binary":"local","local_service":"riko-voice"}}'
+curl -X POST http://<cp>:8765/services -H 'content-type: application/json' \
+  -d '{"profile":"riko-voice"}'                          # or add "node_id":"schneewolf","gpus":[2]
+curl -s http://<cp>:8765/resolve/riko-voice              # → base_url http://<node>:19300
+```
+
+Consumers reach a local service **directly** at the resolved `node:port`
+(`GET /resolve/{profile}`); the CP has no binary-safe proxy route for them (the
+`/v1/llama` proxy is JSON-only, built for llama-server).
 
 ## Endpoints
 
@@ -57,7 +155,9 @@ GET  /settings                                                         → { aut
 PUT  /settings         { auto_restart: bool }                          → { auto_restart }
 
 # capabilities + catalog
-GET  /capabilities                                                     → { "llama-server": {...}, "sd-server": {...}, ... }
+GET  /capabilities                                                     → { "llama-server": {...}, "sd-server": {...}, ...,
+                                                                         "local": { name → {port, vram_mb, health_path, …} } }
+GET  /local-services                                                   → { dir, services: [...], errors: [{file, error}] }
 GET  /models                                                           → [catalog entries]
 GET  /models/{alias}/blob                                              → streams the GGUF (peer pulls)
 POST /models/pull      { ... }                                        → start a pull
@@ -109,7 +209,8 @@ WITCHGRID_AGENT_URL   http://10.0.0.20:8766    # required — what URL the CP ca
 WITCHGRID_DATA_DIR    $HOME/.witchgrid         # pin the sqlite DB off CWD (strongly recommended)
 WITCHGRID_MODEL_DIR   $HOME/.witchgrid/models  # canonical model dir (default)
 # optional: WITCHGRID_AGENT_HOST/PORT, WITCHGRID_NODE_ID,
-#           WITCHGRID_MODEL_DIRS_EXTRA, WITCHGRID_SHARED_SECRET
+#           WITCHGRID_MODEL_DIRS_EXTRA, WITCHGRID_SHARED_SECRET,
+#           WITCHGRID_LOCAL_SERVICES (local engine declarations dir)
 ```
 
 `WITCHGRID_AGENT_URL` isn't derivable (NAT / multiple NICs) — always set it.

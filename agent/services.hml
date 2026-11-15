@@ -38,6 +38,11 @@ import { current_binary_path } from "./llama_cpp";
 import { current_binary_path as sd_current_binary_path } from "./sd_cpp";
 import { current_binary_path as wcpp_current_binary_path } from "./whisper_cpp";
 import { current_binary_path as pcpp_current_binary_path } from "./piper_cpp";
+// `local` engine: operator-declared command + port services. The
+// declaration (argv/cwd/env) is read from the agent's own disk at spawn
+// time — never from the CP payload. See local_services.hml.
+import { local_services_dir, find_declaration, build_argv as local_build_argv,
+	build_env as local_build_env } from "./local_services";
 
 // IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
 // keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
@@ -189,15 +194,13 @@ let ADOPTION_HISTORY_DAYS = 7;
 
 export fn reap_zombie_services(db): i32 {
 	let rows = query(db,
-		"select id, pid from services where state = 'running'", []);
+		"select id, pid, profile_json from services where state = 'running'", []);
 	let reaped = 0;
 	for (row in rows) {
-		let drop = false;
-		if (!process_alive(row.pid)) {
-			drop = true;
-		} else if (!is_our_llama_server(row.pid)) {
-			drop = true;
-		}
+		// Binary-aware (service_healthy), so with the watchdog off a live
+		// sd/whisper/piper/local service isn't misread as a recycled
+		// llama-server pid and dropped from 'running'.
+		let drop = !service_healthy(row.pid, row_binary(row.profile_json));
 		if (drop) {
 			db_exec(db,
 				"update services set state = 'dead' where id = ?",
@@ -630,6 +633,9 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 		throw "spawn_service called without a profile object — "
 			+ "v0.7+ requires CP to inline the profile in the spawn payload";
 	}
+	if (prof?.binary == "local") {
+		return spawn_local_service(db, profile_name, prof, port, gpus);
+	}
 
 	// Build full argv: binary + intent-derived flags + extras + spawner-set
 	// model/port/host. capabilities is the parsed --help map for prof.binary
@@ -807,7 +813,17 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	fd_close(log_fd);
 	fd_close(null_fd);
 
-	let pid = result.pid;
+	return finish_spawn(db, id, log_path, result.pid, profile_name, prof,
+		model_path, port, argv, gpus, tensor_split, false);
+}
+
+// Shared tail of every spawn: the crash-on-launch grace check, then the
+// services row. group_kill: the child is a `local` service — on a failed
+// launch, take down anything it already forked (its process group; see
+// signal_group) so a half-started venv doesn't keep a port or a GPU.
+fn finish_spawn(db, id: string, log_path: string, pid: i32, profile_name: string,
+                prof, model_path: string, port: i32, argv, gpus, tensor_split,
+                group_kill: bool): object {
 	if (pid <= 0) {
 		throw "posix_spawn returned invalid pid: " + pid;
 	}
@@ -819,6 +835,8 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	// or the next agent /services list shows alive=false. Surface it now.
 	sleep(SPAWN_FAILURE_GRACE_SECONDS);
 	if (!process_alive(pid)) {
+		reap_child(pid);
+		if (group_kill) { signal_group(pid, SIGKILL); }
 		let tail = read_log_tail(log_path, 4096);
 		let msg = "spawn died immediately (pid " + pid + " exited within "
 			+ SPAWN_FAILURE_GRACE_SECONDS + "s)";
@@ -863,6 +881,161 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	};
 }
 
+// ── local engine: spawn + process-group helpers ───────────────────────
+
+// Spawn a `local` service from its agent-side declaration. The profile
+// contributes only the declared name (prof.local_service) and, through
+// placement, the port and GPU pin; its intent / extra_flags / model are
+// ignored on purpose — the CP can choose WHICH declared service runs and
+// where, never WHAT it runs.
+//
+// Differences from the engine path above, both because the child is an
+// arbitrary program rather than a single known binary:
+//   - env is built explicitly and handed to posix_spawn (`env:` replaces
+//     the environment), with cwd set via `cwd:` — no setenv on the agent,
+//     so no SPAWN_ENV_LOCK window, and the agent's shared secret is not
+//     inherited.
+//   - setsid makes the child the leader of its own process group
+//     (pgid == pid). A `run.sh` that starts python without `exec` leaves
+//     the real server as a grandchild; stop / SIGKILL escalation / the
+//     watchdog therefore signal the whole group, not just the leader.
+fn spawn_local_service(db, profile_name: string, prof, port: i32, gpus): object {
+	let decl = find_declaration(local_services_dir(), prof?.local_service);
+	let argv = local_build_argv(decl, port);
+
+	// Same three placement modes as the engines, expressed as a value
+	// rather than an env mutation. A service declared with vram_mb 0
+	// gets no GPU (CUDA hidden) unless explicitly pinned.
+	let pinned = (gpus != null && gpus.length > 0);
+	let cvd = null;
+	if (pinned) {
+		let csv = "";
+		let g = 0;
+		while (g < gpus.length) {
+			if (g > 0) { csv = csv + ","; }
+			csv = csv + gpus[g];
+			g = g + 1;
+		}
+		cvd = csv;
+	} else if (prof?.intent?.gpu_layers == 0 || decl.vram_mb == 0) {
+		cvd = "";
+	}
+	let env = local_build_env(decl, port, cvd);
+
+	let id = new_id(db);
+	let log_path = "/tmp/witchgrid-" + id + ".log";
+	let log_fd = open_fd(log_path, "w");
+	let null_fd = open_fd("/dev/null", "r");
+	let result = null;
+	try {
+		result = posix_spawn(argv, {
+			stdin: null_fd,
+			stdout: log_fd,
+			stderr: log_fd,
+			setsid: true,
+			env: env,
+			cwd: decl.cwd,
+		});
+	} catch (e) {
+		fd_close(log_fd);
+		fd_close(null_fd);
+		throw e;
+	}
+	fd_close(log_fd);
+	fd_close(null_fd);
+	print("[spawn] local " + decl.name + " port=" + port
+		+ " gpus=" + (cvd == null ? "inherit" : (cvd == "" ? "none" : cvd))
+		+ " pid=" + result.pid);
+	return finish_spawn(db, id, log_path, result.pid, profile_name, prof,
+		"local:" + decl.name, port, argv, gpus, null, true);
+}
+
+// kill(2) on a process group (negative pid). Only ever called with a pid
+// we spawned with setsid — pgid == that pid, and a pgid is not reused
+// while any member is alive, so this cannot reach someone else's group.
+// The compiled runtime's kill() returns -1 instead of throwing (the
+// interpreter throws), so check both.
+fn signal_group(pgid: i32, sig: i32): bool {
+	if (pgid <= 1) { return false; }
+	try {
+		let r = kill(0 - pgid, sig);
+		return r != -1;
+	} catch (e) {
+		return false;
+	}
+}
+
+// Does ANY process (zombie or stopped included) hold this pid?
+fn process_exists(pid: i32): bool {
+	if (pid <= 1) { return true; }
+	try {
+		let r = kill(pid, 0);
+		return r != -1;
+	} catch (e) {
+		return false;
+	}
+}
+
+fn group_alive(pgid: i32): bool {
+	return signal_group(pgid, 0);
+}
+
+// Pids in process group `pgid` (Linux /proc walk; [] elsewhere). Used to
+// tell the unmanaged-GPU-process probe that a local service's python
+// grandchild is ours, not a squatter.
+export fn group_member_pids(pgid: i32): array {
+	let out = [];
+	if (!host_has_proc() || pgid <= 1) { return out; }
+	let entries = null;
+	try { entries = list_dir("/proc"); } catch (e) { return out; }
+	for (name in entries) {
+		let c = name.substr(0, 1);
+		if (!(c >= "0" && c <= "9")) { continue; }
+		try {
+			let f = open("/proc/" + name + "/stat", "r");
+			let st = f.read();
+			f.close();
+			// "<pid> (<comm>) <state> <ppid> <pgrp> ..." — comm may hold
+			// spaces/parens, so split after the LAST ')'.
+			let rp = -1;
+			let i = 0;
+			while (i < st.length) {
+				if (st.substr(i, 1) == ")") { rp = i; }
+				i = i + 1;
+			}
+			if (rp < 0) { continue; }
+			let fields = st.substr(rp + 2, st.length - rp - 2).split(" ");
+			if (fields.length > 2 && i32(fields[2]) == pgid) { out.push(i32(name)); }
+		} catch (e) { }
+	}
+	return out;
+}
+
+// Binary of a services row's stored profile ("llama-server" for rows
+// that predate profile_json).
+fn row_binary(profile_json): string {
+	if (profile_json == null) { return "llama-server"; }
+	try { return parse(profile_json)?.binary ?? "llama-server"; } catch (e) { }
+	return "llama-server";
+}
+
+// Every pid that belongs to a running service: the tracked pids plus,
+// for local services, the members of their process groups. Feeds the
+// unmanaged-process probe's "ours" set (agent.hml collect_known_pids).
+export fn managed_pids(db): array {
+	let rows = query(db, "select pid, state, profile_json from services", []);
+	let out = [];
+	for (r in rows) {
+		out.push(r.pid);
+		if (r.state == "running" && row_binary(r.profile_json) == "local") {
+			for (p in group_member_pids(r.pid)) {
+				if (p != r.pid) { out.push(p); }
+			}
+		}
+	}
+	return out;
+}
+
 export fn list_services(db): array {
 	// Surface running services + crash-loop-exhausted ones (state='failed').
 	// 'failed' rows are the durable "needs a human" signal — the watchdog
@@ -871,7 +1044,7 @@ export fn list_services(db): array {
 	// these (a just-crashed 'running' row gets reaped within ~1 tick, too
 	// fleeting to rely on). Adoption-history ('dead'/'stopped') stays hidden.
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state "
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state, profile_json "
 		+ "from services where state in ('running', 'failed') order by started_at desc", []);
 	let out = [];
 	for (row in rows) {
@@ -899,6 +1072,7 @@ export fn list_services(db): array {
 			device: device,
 			gpus: gpus,        // pinned GPU index list (empty = CPU-only)
 			state: row?.state,
+			binary: row_binary(row?.profile_json),
 			alive: process_alive(row.pid),
 		});
 	}
@@ -907,12 +1081,15 @@ export fn list_services(db): array {
 
 export fn stop_service(db, id: string): bool {
 	let rows = query(db,
-		"select pid from services where id = ? and state = 'running'", [id]);
+		"select pid, profile_json from services where id = ? and state = 'running'", [id]);
 	if (rows.length == 0) {
 		return false;
 	}
 	let pid = rows[0].pid;
-	if (process_alive(pid)) {
+	if (row_binary(rows[0].profile_json) == "local") {
+		// The whole process group: a wrapper script's children too.
+		signal_group(pid, SIGTERM);
+	} else if (process_alive(pid)) {
 		try { kill(pid, SIGTERM); } catch (e) { /* race with exit; fine */ }
 	}
 	reap_child(pid);
@@ -965,9 +1142,16 @@ export fn finish_stops(db): i32 {
 		if (since < STOP_GRACE_SECONDS || since > STOP_ESCALATE_WINDOW_SECONDS) { continue; }
 		// Re-adopted or respawned onto the same pid: not ours to kill.
 		if (running_pids["" + row.pid] == true) { continue; }
-		let binary = "llama-server";
-		if (row.profile_json != null) {
-			try { binary = parse(row.profile_json)?.binary ?? "llama-server"; } catch (e) { }
+		let binary = row_binary(row.profile_json);
+		if (binary == "local") {
+			// The leader may have exited on SIGTERM while a grandchild
+			// (the real server under a wrapper script) did not — check
+			// and kill the group, not the leader pid.
+			if (!group_alive(row.pid)) { continue; }
+			eprint("[watchdog] local service " + row.id + " (pgid " + row.pid
+				+ ") still running " + since + "s after SIGTERM; sending SIGKILL to the group");
+			if (signal_group(row.pid, SIGKILL)) { killed = killed + 1; }
+			continue;
 		}
 		if (!service_healthy(row.pid, binary)) { continue; }
 		eprint("[watchdog] service " + row.id + " (pid " + row.pid + ") ignored SIGTERM for "
@@ -1024,7 +1208,9 @@ fn binpath_for_binary(binary: string): string {
 fn service_healthy(pid: i32, binary: string): bool {
 	if (!process_alive(pid)) { return false; }
 	if (binary == "sd-server") { return is_our_sd_server(pid); }
-	// whisper-server / piper / llama-server: treat a live pid as healthy.
+	// whisper-server / piper / local / llama-server: treat a live pid as
+	// healthy. (local: the setsid leader we spawned — the declaration's
+	// argv[0], usually a wrapper script.)
 	// is_our_llama_server only matches llama; for whisper/piper we can't
 	// cheaply fingerprint, so a live pid is good enough (PID-recycle on a
 	// short-lived CPU server is vanishingly unlikely and self-heals next
@@ -1066,7 +1252,7 @@ export fn reconcile_services(db, caps_ref): i32 {
 			continue;
 		}
 		dead.push({
-			id: row.id, profile: row.profile, model_path: row.model_path,
+			id: row.id, pid: row.pid, profile: row.profile, model_path: row.model_path,
 			port: row.port, prof: prof, binary: binary,
 			gpus_json: row.gpus_json, tensor_split_json: row.tensor_split_json,
 			restart_count: row?.restart_count ?? 0, uptime_s: row?.uptime_s,
@@ -1113,6 +1299,16 @@ export fn reconcile_services(db, caps_ref): i32 {
 		try { if (d.tensor_split_json != null) { tsplit = parse(d.tensor_split_json); } } catch (e) { }
 		let caps = caps_for_binary(caps_ref, d.binary);
 		let bin = binpath_for_binary(d.binary);
+		// A local service's leader died but its group may not have (a
+		// wrapper script crashed, its python child still holds the port
+		// and the GPU). Clear the group before respawning on that port.
+		// Only once the leader pid is fully gone: then a live group with
+		// that id can only be the one we created (the kernel doesn't hand
+		// out a pid still in use as a pgid).
+		if (d.binary == "local") {
+			reap_child(d.pid);
+			if (!process_exists(d.pid)) { signal_group(d.pid, SIGKILL); }
+		}
 		try {
 			let svc = spawn_service(db, d.profile, d.prof, d.model_path,
 				i32(d.port), gpus, tsplit, caps, bin);
@@ -1162,12 +1358,25 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 			let profile = payload?.profile;
 			let profile_name = payload?.profile_name;
 			let model = payload?.model;
+			// local engine: no model — the agent-side declaration is the
+			// whole command. Look it up now (refusing undeclared names with
+			// 403) so its declared port can be the default.
+			let local_decl = null;
+			if (profile?.binary == "local") {
+				try {
+					local_decl = find_declaration(local_services_dir(), profile?.local_service);
+				} catch (e) {
+					return { status: 403, body: stringify({ error: "" + e }) };
+				}
+				model = "local:" + local_decl.name;
+			}
 			if (profile == null || model == null) {
 				return { status: 400, body: "{\"error\":\"profile+model required (CP must inline profile object since v0.7)\"}" };
 			}
 			if (profile_name == null) { profile_name = "<unnamed>"; }
 			let port = payload?.port;
 			if (port == null) { port = profile?.default_port; }
+			if (port == null && local_decl != null) { port = local_decl.port; }
 			if (port == null) {
 				return { status: 400, body: "{\"error\":\"port required (profile has no default_port)\"}" };
 			}
@@ -1196,6 +1405,9 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				let msg = "" + e;
 				let status = 400;
 				if (msg.find("spawn died") >= 0) { status = 502; }
+				// Declaration removed/broken between the check above and
+				// the spawn: still a refusal, not a bad request.
+				if (msg.find("not declared") >= 0) { status = 403; }
 				return { status: status, body: stringify({ error: msg }) };
 			}
 		},
