@@ -157,6 +157,16 @@ check "plan: voice and familiar untouched, ports kept, downtime + estimates repo
 check "plan: luna is sized from its measurement (12010 MB on one card)" \
 	py "import json; d=json.load(open('$TMP/plan.json')); e=[x for x in d['estimates'] if x['profiles']==['luna-spark']][0]; exit(0 if e['total_mb']==12010 and e['source'].startswith('measured') else 1)"
 
+# A never-measured profile whose default_model is outside the agent's scan
+# dirs (so no node_models row) is sized from the GGUF header the CP can read
+# — the same fallback path-driven spawn placement uses — not counted as 0 MB.
+mkprofile hb-unmeasured 18938 1000
+UNMEAS='{"keep_unlisted":true,"desired":[{"profile":"hb-unmeasured","node_id":"'$NODE_ID'","gpus":[0]}]}'
+curl -s -o "$TMP/unmeas.json" -X POST "$CP_URL/api/layout/plan" -H 'content-type: application/json' -d "$UNMEAS"
+check "plan: an unmeasured default_model profile outside the catalog gets a GGUF estimate, not 0 MB" \
+	py "import json; d=json.load(open('$TMP/unmeas.json')); e=[x for x in d['estimates'] if x['profiles']==['hb-unmeasured']][0]; exit(0 if e['total_mb']>0 and e['source'].startswith('GGUF estimate') else 1)"
+curl -s -o /dev/null -X DELETE "$CP_URL/api/profiles/hb-unmeasured"
+
 INFEASIBLE='{"desired":[{"profile":"familiar-spark","node_id":"'$NODE_ID'","gpus":[3]},{"profile":"riko-narrator","node_id":"'$NODE_ID'","gpus":[3],"vram_mb":11000}]}'
 check "infeasible plan → 409 naming GPU 3 and the overflow" \
 	bash -c "curl -s -o '$TMP/inf.json' -w '%{http_code}' -X POST '$CP_URL/api/layout/plan' -H 'content-type: application/json' -d '$INFEASIBLE' | grep -q 409 && python3 -c 'import json; d=json.load(open(\"$TMP/inf.json\")); o=d[\"overflows\"][0]; exit(0 if o[\"gpu\"]==3 and o[\"over_by_mb\"]>0 and \"GPU 3\" in d[\"error\"] else 1)'"

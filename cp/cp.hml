@@ -5497,14 +5497,22 @@ fn profile_kv(p): string {
 	return "" + (p?.intent?.kv_cache_k ?? p?.kv_type ?? "f16");
 }
 
-// GGUF-catalog estimate (MB, whole service) or -1 when there is none.
+// GGUF estimate (MB, whole service) or -1 when there is none. Catalog
+// row first; when the node's catalog has no row for the profile's model
+// (a default_model outside the agent's scan dirs — spawn uses that path
+// as-is, no catalog needed), read the GGUF header directly if the CP can
+// see the path, the same fallback path-driven placement (pick_placement)
+// uses. Without it the planner counted such a profile as 0 MB.
 fn catalog_estimate_mb(node_id: string, profile, ctx: i32, ngpus: i32): i32 {
 	if ((profile?.binary ?? "llama-server") != "llama-server") { return -1; }
 	if (profile?.intent?.gpu_layers == 0) { return 0; }
 	let row = catalog_row_for(node_id, profile);
-	if (row == null) { return -1; }
+	let dm = profile?.default_model;
+	if (row == null && (dm == null || !exists(dm))) { return -1; }
 	try {
-		let t = estimate_vram_from_ingredients(row, ctx, profile_kv(profile)).total_mb;
+		let t = (row != null)
+			? estimate_vram_from_ingredients(row, ctx, profile_kv(profile)).total_mb
+			: estimate_vram_mb(read_metadata(dm), ctx, profile_kv(profile)).total_mb;
 		if (ngpus > 1) { t = t * (1.0 + MULTI_GPU_OVERHEAD_FRACTION); }
 		return i32(t);
 	} catch (e) { }

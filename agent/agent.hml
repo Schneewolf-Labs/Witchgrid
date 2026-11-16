@@ -285,11 +285,43 @@ fn local_services_public(): array {
 	return local_public_list(load_declarations(local_services_dir()));
 }
 
+// ── live state shared with the heartbeat task ──────────────────────
+//
+// spawn() DEEP-COPIES every argument (only functions cross by
+// reference), so a holder object handed to the heartbeat task is a
+// boot-time snapshot: a /rescan, pull-completion rescan, scan-dirs edit
+// or engine activate updated the main thread's holder only, and every
+// heartbeat re-registered the stale catalog/runtime with the CP (and ran
+// the watchdog against stale capabilities) until the agent restarted.
+//
+// The sqlite handle IS shared across threads (the heartbeat already
+// writes services rows through it), so it carries this state: every
+// writer of models_ref / runtime_ref / caps_ref / scan_dirs_ref mirrors
+// the new value into agent_settings under "live:<key>", and the
+// heartbeat re-reads it each tick. The main-thread holders stay — the
+// HTTP route closures share them by reference and keep serving from
+// memory. Rewritten on every boot before the heartbeat starts, so a
+// previous run's values are never read.
+fn live_put(db, key: string, value): null {
+	agent_setting_set(db, "live:" + key, stringify(value));
+	return null;
+}
+
+fn live_get(db, key: string, fallback) {
+	let raw = agent_setting_get(db, "live:" + key, "");
+	if (raw == "") { return fallback; }
+	try { return parse(raw); } catch (e) {
+		eprint("[heartbeat] bad live:" + key + " state: " + e);
+	}
+	return fallback;
+}
+
 // Transient CP failures are swallowed — we'll succeed on the next
-// tick. The only way to stop the loop is process exit.
+// tick. The only way to stop the loop is process exit. Everything that
+// can change after boot (catalog, runtime, capabilities, scan dirs) is
+// read from the shared db each tick — see live_put above.
 async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
-                        agent_url: string, canonical_dir: string,
-                        scan_dirs_ref, models_ref, runtime_ref, caps_ref, db,
+                        agent_url: string, canonical_dir: string, db,
                         interval_seconds: i32): null {
 	loop {
 		sleep(f64(interval_seconds));
@@ -297,7 +329,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		// auto_restart is on) before reporting state, so the heartbeat's
 		// runtime/unmanaged snapshot reflects the freshly-restarted pids.
 		try {
-			reconcile_services(db, caps_ref);
+			reconcile_services(db, live_get(db, "caps", {}));
 		} catch (e) {
 			eprint("[watchdog] reconcile error: " + e);
 		}
@@ -306,7 +338,7 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		} catch (e) {
 			eprint("[watchdog] finish_stops error: " + e);
 		}
-		let hw = probe(canonical_dir, scan_dirs_ref.extra);
+		let hw = probe(canonical_dir, live_get(db, "scan_dirs", []));
 		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));
 		let vram = measure_vram(db, hw.gpus);
 		try {
@@ -319,8 +351,8 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 				hardware:  hw,
 				agent_url: agent_url,
 				agent_version: WITCHGRID_VERSION,
-				models:    models_ref.entries,
-				runtime:   runtime_ref.value,
+				models:    live_get(db, "models", []),
+				runtime:   live_get(db, "runtime", {}),
 				unmanaged_processes: unmanaged,
 				auto_restart: get_auto_restart(db),
 				local_services: local_services_public(),
@@ -491,6 +523,7 @@ fn main(): null {
 			eprint("[agent] introspect " + sbin + " failed: " + e);
 			caps_ref.sd_server = {};
 		}
+		live_put(db, "caps", caps_ref);
 		return null;
 	};
 	let do_rescan_caps = fn(): null {
@@ -507,6 +540,8 @@ fn main(): null {
 				+ " (" + (lv?.build_hash ?? "?") + ") at " + bin);
 		}
 		runtime_ref.value = rt;
+		live_put(db, "caps", caps_ref);
+		live_put(db, "runtime", rt);
 		return null;
 	};
 	do_rescan_caps();
@@ -528,6 +563,7 @@ fn main(): null {
 	let do_rescan_caps_wcpp = fn(): null {
 		let wbin = wcpp_current_binary_path();
 		caps_ref.whisper_server = (wbin == "whisper-server") ? {} : { installed: true };
+		live_put(db, "caps", caps_ref);
 		return null;
 	};
 	do_rescan_caps_wcpp();
@@ -541,6 +577,7 @@ fn main(): null {
 	let do_rescan_caps_pcpp = fn(): null {
 		let pbin = pcpp_current_binary_path();
 		caps_ref.piper = (pbin == "piper") ? {} : { installed: true };
+		live_put(db, "caps", caps_ref);
 		return null;
 	};
 	do_rescan_caps_pcpp();
@@ -567,10 +604,10 @@ fn main(): null {
 	let model_entries = scan_models(canonical_dir, extra_dirs);
 	print("[agent] catalog: " + model_entries.length + " GGUF(s)");
 
-	// Wrap entries in a holder object so the heartbeat closure sees the
-	// SAME live reference after a /rescan replaces the inner list.
-	// (Hemlock arrays are passed by value in some assignment forms; the
-	// holder dodges any reassignment-vs-mutation ambiguity.)
+	// Holder object so the HTTP route closures (which capture it by
+	// reference) see a /rescan's replacement list. The heartbeat task does
+	// NOT see it — spawn() deep-copies — so every write is mirrored into
+	// the db via live_put (see heartbeat_loop).
 	let models_ref = { entries: model_entries };
 	// Extra scan dirs are editable at runtime via /scan-dirs; the holder
 	// lets the heartbeat + rescan see edits without a restart. Seeded from
@@ -590,6 +627,8 @@ fn main(): null {
 				+ models_ref.entries.length + " GGUF(s)");
 		} catch (e) { eprint("[agent] bad scan_dirs_extra override: " + e); }
 	}
+	live_put(db, "scan_dirs", scan_dirs_ref.extra);
+	live_put(db, "models", models_ref.entries);
 
 	let boot_vram = measure_vram(db, hw.gpus);
 	register_with_cp(cp_url, {
@@ -610,13 +649,12 @@ fn main(): null {
 	});
 
 	// Detached heartbeat task — fire-and-forget, runs until process exit.
-	// caps_ref rides along so the per-tick reconcile (auto-restart
-	// watchdog) can resolve a respawned service's capabilities; it's a
-	// holder object so a llama_cpp/activate hot-swap is reflected live,
-	// same as runtime_ref/models_ref.
+	// Only immutable values cross spawn() here: the catalog, runtime,
+	// capabilities (the per-tick watchdog needs them to respawn a service)
+	// and scan dirs all change at runtime, so the heartbeat re-reads them
+	// from the shared db each tick instead (live_put/live_get above).
 	let hb = spawn(heartbeat_loop, cp_url, node_id, hostname, agent_url,
-	               canonical_dir, scan_dirs_ref, models_ref, runtime_ref,
-	               caps_ref, db, HEARTBEAT_SECONDS);
+	               canonical_dir, db, HEARTBEAT_SECONDS);
 	detach(hb);
 	print("[agent] heartbeat every " + HEARTBEAT_SECONDS + "s");
 
@@ -677,6 +715,7 @@ fn main(): null {
 	fn do_rescan(): null {
 		let fresh = scan_models(canonical_dir, scan_dirs_ref.extra);
 		models_ref.entries = fresh;
+		live_put(db, "models", fresh);
 		return null;
 	}
 	let pull = make_pull_handler(db, canonical_dir, do_rescan,
@@ -732,6 +771,7 @@ fn main(): null {
 		}
 		scan_dirs_ref.extra = clean;
 		agent_setting_set(db, "scan_dirs_extra", stringify(clean));
+		live_put(db, "scan_dirs", clean);
 		do_rescan();
 		return { status: 200, body: stringify({
 			canonical: canonical_dir, extra: clean,
