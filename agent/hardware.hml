@@ -74,6 +74,7 @@ fn probe_gpus_nvidia(): array {
 			name:         parts[1].trim(),
 			total_mb:     i32(parts[2].trim()),
 			free_mb:      i32(parts[3].trim()),
+			used_mb:      i32(parts[2].trim()) - i32(parts[3].trim()),
 			uuid:         parts[4].trim(),
 			power_draw_w:  power_draw,
 			power_limit_w: power_limit,
@@ -456,6 +457,43 @@ fn port_from_cmdline(cmd: string): i32 {
 	return -1;
 }
 
+// Every process holding GPU memory, per GPU: [{ pid, gpu_index, used_mb }]
+// (nvidia-smi --query-compute-apps; [] without nvidia-smi). gpu_index comes
+// from the uuid → index map of `gpus`; -1 when the uuid isn't in it. The
+// agent attributes these to its services by pid / process group /
+// descendants (services.measure_services).
+export fn probe_compute_apps(gpus): array {
+	if (gpus == null || gpus.length == 0) { return []; }
+	let r = null;
+	try {
+		r = exec_argv(["nvidia-smi",
+			"--query-compute-apps=pid,used_memory,gpu_uuid",
+			"--format=csv,noheader,nounits"]);
+	} catch (e) {
+		return [];
+	}
+	if (r.exit_code != 0 || r.output.length == 0) { return []; }
+	let uuid_to_idx = {};
+	for (g in gpus) {
+		if (g?.uuid != null) { uuid_to_idx[g.uuid] = g.index; }
+	}
+	let out = [];
+	for (line in r.output.split("\n")) {
+		let t = line.trim();
+		if (t.length == 0) { continue; }
+		let parts = t.split(",");
+		if (parts.length < 3) { continue; }
+		let pid_s = parts[0].trim();
+		let mb_s = parts[1].trim();
+		if (!str_is_digits(pid_s) || !str_is_digits(mb_s)) { continue; }
+		let uuid = parts[2].trim();
+		let idx = -1;
+		if (uuid_to_idx.has(uuid)) { idx = uuid_to_idx[uuid]; }
+		out.push({ pid: i32(pid_s), gpu_index: idx, used_mb: i32(mb_s) });
+	}
+	return out;
+}
+
 export fn probe_unmanaged_procs(gpus, known_pids): array {
 	if (gpus.length == 0) { return []; }
 
@@ -596,6 +634,13 @@ fn probe_cpu_temp() {
 	}
 	if (best_cpu != null) { return best_cpu; }
 	return best_any;
+}
+
+// Just the GPU list (cheap: no disk / CPU-temp probes) — for GET /vram.
+export fn probe_gpu_list(): array {
+	let ram_total_mb: i32 = i32(total_memory() / 1048576);
+	let ram_free_mb:  i32 = i32(free_memory() / 1048576);
+	return probe_gpus(ram_total_mb, ram_free_mb);
 }
 
 export fn probe(canonical_dir, extra_dirs): object {

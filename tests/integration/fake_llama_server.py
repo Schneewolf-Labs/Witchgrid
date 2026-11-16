@@ -71,6 +71,12 @@ def main():
         me = os.path.abspath(__file__)
         os.execv(sys.executable, [me, me] + args)
 
+    # --fake-exit: die right away (a model that fails to load) — drives the
+    # layout apply rollback test.
+    if "--fake-exit" in args:
+        sys.stderr.write("fake: --fake-exit\n")
+        sys.exit(3)
+
     # --ignore-sigterm: behave like a llama-server stuck in a long call,
     # so the agent's stop path has to escalate to SIGKILL.
     if "--ignore-sigterm" in args:

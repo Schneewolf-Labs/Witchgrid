@@ -1,0 +1,77 @@
+// fingerprint.hml — what makes two profile versions "the same service".
+//
+// A profile is edited (and its version bumped) for many reasons that don't
+// change the process it spawns: a description, a pin, a default port, a VRAM
+// hint. The layout planner must not restart a service for those, and a VRAM
+// measurement taken under one version is only valid for another version if
+// the process would be identical. profile_fingerprint() hashes exactly the
+// fields that shape the spawned process (argv, model, adapters, sharing),
+// canonically (object keys sorted), so equal fingerprints ⇔ same process.
+//
+// Pure; shared by the agent (stamps each /services row with the fingerprint
+// of the profile it was spawned from) and the CP (compares it with the
+// current/patched profile).
+
+import { stringify } from "@stdlib/json";
+import { sha256 } from "@stdlib/hash";
+
+// Profile fields that change the spawned process. Everything else (pin,
+// default_port, description, vram_mb, ui metadata, __name, __version) is
+// bookkeeping.
+let FP_FIELDS = ["binary", "intent", "extra_flags", "model_alias", "default_model",
+	"lora", "share_group", "local_service", "context", "kv_type"];
+
+// Deterministic JSON: object keys sorted at every level.
+export fn canonical_json(v): string {
+	let t = typeof(v);
+	if (t == "object") {
+		if (v == null) { return "null"; }
+		let ks = [];
+		for (k in v.keys()) { ks.push("" + k); }
+		ks.sort();
+		let parts = [];
+		for (k in ks) { parts.push(stringify(k) + ":" + canonical_json(v[k])); }
+		return "{" + parts.join(",") + "}";
+	}
+	if (t == "array") {
+		let parts = [];
+		for (x in v) { parts.push(canonical_json(x)); }
+		return "[" + parts.join(",") + "]";
+	}
+	return stringify(v);
+}
+
+// A tree copy of a JSON-able value. Hemlock's stringify() reports ANY
+// object reached twice as a "circular reference" — even a map simply
+// shared by two entries (hemlock 2.16.0) — so values assembled from shared
+// parts go through this before being serialized.
+export fn json_tree(v) {
+	let t = typeof(v);
+	if (t == "object") {
+		if (v == null) { return null; }
+		let o = {};
+		for (k in v.keys()) { o[k] = json_tree(v[k]); }
+		return o;
+	}
+	if (t == "array") {
+		let a = [];
+		for (x in v) { a.push(json_tree(x)); }
+		return a;
+	}
+	return v;
+}
+
+// 16 hex chars of sha256 over the process-shaping fields. Absent and null
+// fields are treated alike; an empty extra_flags equals a missing one.
+export fn profile_fingerprint(prof): string {
+	if (prof == null) { return ""; }
+	let sub = {};
+	for (f in FP_FIELDS) {
+		let v = prof?[f];
+		if (v == null) { continue; }
+		if (f == "extra_flags" && typeof(v) == "array" && v.length == 0) { continue; }
+		if (f == "intent" && typeof(v) == "object" && v.keys().length == 0) { continue; }
+		sub[f] = v;
+	}
+	return sha256(canonical_json(sub)).substr(0, 16);
+}

@@ -278,6 +278,16 @@ jobs:
         if: runner.os == 'Linux'
         run: bash tests/integration/run_shared_lora.sh
 
+      - name: Integration tests — measured VRAM + declarative layout
+        # A fake nvidia-smi (4 × 16 GB) attributes --fake-vram MB to each fake
+        # llama-server: measured per-service VRAM, GET /api/layout, plan +
+        # apply of the schneewolf 2026-11-15 re-layout (never over capacity −
+        # margin), idempotent re-apply, pins, rollback, verified stop of an
+        # adopted SIGTERM-ignoring service, the spawned signal mask, stale
+        # /services while an agent restarts.
+        if: runner.os == 'Linux'
+        run: bash tests/integration/run_layout.sh
+
       # ── per-platform release artifacts ────────────────────────────
       # On tag pushes, stage the three binaries with a platform suffix and
       # upload them as workflow artifacts. The separate `release` job below

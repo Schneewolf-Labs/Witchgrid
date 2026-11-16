@@ -1,0 +1,19 @@
+{
+  "_comment": "schneewolf (4x RTX 4060 Ti 16 GB): Luna + Familiar on ONE shared B4-9B server on GPU 0 next to the Riko voice, the Riko narrator alone on GPU 1, Mahou at 64k on GPU 2, Niku alone on GPU 3. POST to /api/layout/plan to preview, then to /api/layout/apply with \"confirm\": true. Omitted ports keep each service's current port (else its pin, else default_port). vram_mb on luna-spark sizes the WHOLE shared server (the GGUF estimate overestimates hybrid B4-9B; 12 840 MB measured for this shape on an A6000) — drop it once the server has run and been measured. _comment keys are ignored.",
+  "keep_unlisted": true,
+  "pin": true,
+  "margin_mb": 512,
+  "desired": [
+    { "profile": "luna-spark",     "node_id": "schneewolf", "gpus": [0], "port": 18091, "vram_mb": 13000 },
+    { "profile": "familiar-spark", "node_id": "schneewolf", "gpus": [0], "port": 18090 },
+    { "profile": "riko-voice",     "node_id": "schneewolf", "gpus": [0] },
+    { "profile": "riko-narrator",  "node_id": "schneewolf", "gpus": [1] },
+    { "profile": "chat-mahou",     "node_id": "schneewolf", "gpus": [2] },
+    { "profile": "image-niku",     "node_id": "schneewolf", "gpus": [3] }
+  ],
+  "profile_patches": {
+    "luna-spark":     { "share_group": "spark-b4-9b" },
+    "familiar-spark": { "share_group": "spark-b4-9b" },
+    "chat-mahou":     { "intent": { "context": 65536 }, "context": 65536 }
+  }
+}

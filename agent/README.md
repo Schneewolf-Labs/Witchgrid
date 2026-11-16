@@ -17,7 +17,9 @@ binary's capabilities.
 | File | Role |
 |---|---|
 | `agent.hml` | Entry point. Reads env, probes hardware, introspects engines, registers, starts the heartbeat + watchdog task, opens sqlite, dispatches routes. |
-| `services.hml` | Service supervisor: `posix_spawn` with `setsid`, raw-fd log redirection, transient `CUDA_VISIBLE_DEVICES`/`LD_LIBRARY_PATH`, sqlite-tracked PIDs, SIGTERM stop. Plus the **auto-restart watchdog** (`reconcile_services`), orphan adoption, and the `agent_settings` store. |
+| `services.hml` | Service supervisor: `posix_spawn` with `setsid`, raw-fd log redirection, transient `CUDA_VISIBLE_DEVICES`/`LD_LIBRARY_PATH`, sqlite-tracked PIDs, verified stop (SIGTERM → SIGKILL → reap). Plus the **auto-restart watchdog** (`reconcile_services`, honours `profile.pin`), orphan adoption, per-service VRAM attribution (`measure_services`), and the `agent_settings` store. |
+| `sigmask.hml` | Clears the spawning thread's signal mask around `posix_spawn` (FFI `pthread_sigmask`) so services don't inherit Hemlock's blocked worker-thread mask. |
+| `fingerprint.hml` | `profile_fingerprint` (hash of the process-shaping profile fields; stamped on `/services` rows) + `json_tree` (tree copy before `stringify`). |
 | `hardware.hml` | `nvidia-smi` parser → `{ role: "gpu"\|"cpu", gpus, cpu_cores, ram_*, disks }`. Also probes unmanaged GPU processes. |
 | `capabilities.hml` | Runs `<binary> --help`, parses into `{flag → {short, longs, value, description}}`. Cached per agent lifetime. |
 | `intent.hml` | Translates witchgrid intents (`flash_attention`, `kv_cache_k`, …) into the binary's actual flag form using the capability map. Handles `boolean_or_enum` for flags that changed shape across llama.cpp versions. |
@@ -199,8 +201,17 @@ reachable from the CP.
 # services (supervisor)
 POST /services         { profile, profile_name, model?, port?, gpus?, tensor_split? } → 201 {id,...}
 GET  /services                                                         → [{id,profile,pid,port,alive,...}]
-POST /services/stop    { id }                                          → 204  (SIGTERM now; the watchdog
-                                                                         SIGKILLs after 15s if still ours, and reaps)
+POST /services/stop    { id, grace_s?, report? }                       → 204 once the process group is gone
+                                                                         (SIGTERM → grace_s [10; 1 if SIGTERM is
+                                                                         blocked/ignored] → SIGKILL → reap; adopted
+                                                                         services too). report:true → 200 {gone,
+                                                                         killed, sigterm_unreceivable, waited_s};
+                                                                         202 + report if it outlived SIGKILL (row kept,
+                                                                         listed as state "stopping")
+GET  /vram                                                             → measure now: { gpus: [{index, total_mb,
+                                                                         used_mb, free_mb, services_mb, other_mb}],
+                                                                         services: [{id, profile, port, gpus, vram_mb,
+                                                                         vram_total_mb, uptime_s, profile_fp}], other }
 GET  /services/log/{id}                                                → text/plain (tail)
 
 # per-agent settings (auto-restart watchdog toggle)
@@ -285,6 +296,11 @@ State persists in `witchgrid-agent.db` (sqlite, WAL). Re-registers every 30 s
   every heartbeat, any service whose process is gone is respawned from its stored
   profile/model/GPU pinning — covering crashes *and* host reboots. Crash-loop
   guard parks a service in `failed` after 5 rapid restarts. Toggle via `/settings`.
+- **Pins**: a profile with `pin: {node_id, gpus, port}` naming this node is
+  respawned on exactly those GPUs/port.
+- **Signal mask**: services start with nothing blocked (see `sigmask.hml`);
+  ones started by an agent older than that keep SIGTERM blocked until
+  restarted, which the stop path detects and SIGKILLs after 1 s.
 - **Orphan adoption**: services spawned with `setsid` survive an agent *crash*;
   on restart the agent re-attaches them by port (no double-spawn).
 - The watchdog's liveness checks use `/proc` on Linux and fall back to `ps` on
@@ -292,5 +308,9 @@ State persists in `witchgrid-agent.db` (sqlite, WAL). Re-registers every 30 s
 
 ## Hardware probe
 
-`nvidia-smi --query-gpu=...` → one entry per GPU. No `nvidia-smi` on PATH →
+`nvidia-smi --query-gpu=...` → one entry per GPU (with `used_mb`). On every
+heartbeat (and `GET /vram`) `nvidia-smi --query-compute-apps` is attributed to
+services by pid, process group and descendants; `/services` rows carry the
+result as `vram_mb` (`{"<gpu>": MB}`), the heartbeat sends it to the CP
+(`service_vram`, `gpu_usage`). No `nvidia-smi` on PATH →
 `{ role: "cpu", gpus: [] }`, registers anyway (CPU profiles still spawn there).

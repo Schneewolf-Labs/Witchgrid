@@ -1,0 +1,67 @@
+// sigmask.hml — give spawned services a clean signal mask.
+//
+// posix_spawn(3) children inherit the CALLING THREAD's signal mask
+// (Hemlock's posix_spawn sets no POSIX_SPAWN_SETSIGMASK), and Hemlock's
+// async runtime blocks nearly every signal on its worker threads so that
+// signals are delivered to the main thread. Every service the agent spawns
+// from an HTTP handler or the heartbeat/watchdog task therefore used to
+// start with SIGTERM/SIGINT/SIGHUP *blocked*: `kill -TERM` stayed pending
+// forever and only the SIGKILL escalation ended it (seen on schneewolf, and
+// in docs/shared-lora.md "Hemlock runtime issues").
+//
+// Fix: around each posix_spawn, set this thread's mask to the empty set
+// (pthread_sigmask SIG_SETMASK), spawn, then restore the previous mask. The
+// child inherits the empty mask; the window on this thread is the
+// fork+exec of posix_spawn (microseconds). A process-directed signal that
+// lands on this thread in that window gets the same disposition it would
+// get on the main thread (the agent installs no SIGTERM/SIGINT handler;
+// SIGPIPE has the agent's no-op handler).
+//
+// An empty sigset_t is all-zero bytes on Linux (glibc, 128 bytes) and macOS
+// (u32), so the set is built by zeroing a buffer — no sigemptyset(), which
+// is a macro on macOS. SIG_SETMASK is 2 on Linux and 3 on macOS.
+
+import { platform } from "@stdlib/os";
+
+let _sm_platform = platform();
+if (_sm_platform == "macos") {
+	import "libSystem.B.dylib";
+} else {
+	import "libc.so.6";
+}
+extern fn pthread_sigmask(how: i32, set: ptr, oldset: ptr): i32;
+
+let SIGSET_BYTES = 128;
+let SETMASK_HOW = (_sm_platform == "macos") ? 3 : 2;
+
+fn zeroed(n: i32): ptr {
+	let p = alloc(n);
+	let i = 0;
+	while (i < n) {
+		ptr_write_i64(ptr_offset(p, i, 1), 0);
+		i = i + 8;
+	}
+	return p;
+}
+
+// Clear this thread's signal mask. Returns a token for sigmask_restore
+// (null when the call failed — then nothing was changed).
+export fn sigmask_clear() {
+	let empty = zeroed(SIGSET_BYTES);
+	let old = zeroed(SIGSET_BYTES);
+	let rc = pthread_sigmask(SETMASK_HOW, empty, old);
+	free(empty);
+	if (rc != 0) {
+		free(old);
+		return null;
+	}
+	return old;
+}
+
+// Put back the mask saved by sigmask_clear.
+export fn sigmask_restore(token): null {
+	if (token == null) { return null; }
+	pthread_sigmask(SETMASK_HOW, token, null);
+	free(token);
+	return null;
+}

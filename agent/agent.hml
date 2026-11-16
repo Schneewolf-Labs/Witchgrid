@@ -65,9 +65,10 @@ import { socket_create, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR } from "@
 import { serve } from "./http_server";
 import { ignore as ignore_signal, SIGPIPE as SIG_PIPE } from "@stdlib/signal";
 import { WITCHGRID_VERSION } from "../version";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set, managed_pids, ensure_member_proxies } from "./services";
+import { measure_services, init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set, managed_pids, ensure_member_proxies } from "./services";
 import { local_services_dir, load_declarations, public_list as local_public_list, public_view as local_public_view } from "./local_services";
-import { probe, probe_unmanaged_procs } from "./hardware";
+import { probe, probe_unmanaged_procs, probe_compute_apps, probe_gpu_list } from "./hardware";
+import { json_tree } from "./fingerprint";
 import { introspect, probe_version } from "./capabilities";
 import { scan as scan_models } from "./models";
 import { init_transfers_schema, make_pull_handler, list_transfers } from "./transfers";
@@ -176,7 +177,7 @@ fn agent_auth_check(req, route) {
 // the day Hemlock gains POST-with-headers we can drop the body field.
 fn cp_post_json(url: string, data) {
 	let secret = shared_secret();
-	let payload = data;
+	let payload = json_tree(data);
 	if (secret != "" && payload != null) { payload["_auth_token"] = secret; }
 	let body = stringify(payload);
 	let h = ["Content-Type: application/json"];
@@ -307,8 +308,11 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 		}
 		let hw = probe(canonical_dir, scan_dirs_ref.extra);
 		let unmanaged = probe_unmanaged_procs(hw.gpus, collect_known_pids(db));
+		let vram = measure_vram(db, hw.gpus);
 		try {
 			let resp = cp_post_json(cp_url + "/register", {
+				service_vram: vram.services,
+				gpu_usage:  vram.gpus,
 				node_id:   node_id,
 				hostname:  hostname,
 				role:      hw.role,
@@ -332,6 +336,18 @@ async fn heartbeat_loop(cp_url: string, node_id: string, hostname: string,
 
 // Strip URL → bare host. Handed to make_pull_handler so peer pulls
 // can refuse self-targeting cleanly.
+// Per-service measured VRAM + per-GPU used/total (services.measure_services
+// over nvidia-smi compute apps). Never throws: a failed probe reports
+// nothing rather than skipping the heartbeat.
+fn measure_vram(db, gpus): object {
+	try {
+		return measure_services(db, gpus, probe_compute_apps(gpus));
+	} catch (e) {
+		eprint("[vram] measure failed: " + e);
+	}
+	return { services: [], gpus: [], other: [] };
+}
+
 fn extract_url_host(url: string): string {
 	let rest = url;
 	let scheme = rest.find("://");
@@ -437,6 +453,8 @@ fn main(): null {
 	init_sd_cpp_schema(db);
 	init_whisper_cpp_schema(db);
 	init_piper_cpp_schema(db);
+	// The watchdog compares a profile's pin.node_id with this.
+	agent_setting_set(db, "node_id", node_id);
 	// Shared-LoRA member ports are proxies inside this process, so they
 	// went down with the previous agent while the shared llama-server kept
 	// running. Re-bind them first thing — before the catalog/register/
@@ -573,7 +591,10 @@ fn main(): null {
 		} catch (e) { eprint("[agent] bad scan_dirs_extra override: " + e); }
 	}
 
+	let boot_vram = measure_vram(db, hw.gpus);
 	register_with_cp(cp_url, {
+		service_vram: boot_vram.services,
+		gpu_usage: boot_vram.gpus,
 		node_id:   node_id,
 		hostname:  hostname,
 		role:      hw.role,
@@ -782,6 +803,14 @@ fn main(): null {
 		// Per-agent settings (auto-restart watchdog toggle). CP proxies
 		// these for the dashboard; default-on so a fresh agent supervises.
 		{ method: "GET",  path: "/settings",      handler: svc.get_settings },
+		// GET /vram — measure now: per-service GPU memory (pid + process
+		// group + descendants) and per-GPU used/total. Also refreshes the
+		// vram_mb that GET /services reports. The CP's layout apply calls
+		// this after every step.
+		{ method: "GET",  path: "/vram",          handler: fn(req): object {
+			let gl = probe_gpu_list();
+			return { status: 200, body: stringify(json_tree(measure_vram(db, gl))) };
+		} },
 		{ method: "PUT",  path: "/settings",      handler: svc.put_settings },
 		// /profiles gone in v0.7 — profiles live on CP. The handler
 		// stub returns 410; route left out so 404 is the response.

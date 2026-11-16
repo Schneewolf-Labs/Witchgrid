@@ -41,11 +41,16 @@ import { WITCHGRID_VERSION } from "../version";
 import { on_shutdown } from "@stdlib/signal";
 import { exit, exec_argv } from "@stdlib/process";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
+// Declarative layout: the pure planner + the profile fingerprint the agent
+// stamps on every service row.
+import { plan_layout, merge_patch, spread_mb, validate_layout_request, same_gpus, sorted_ints,
+	gpu_key, mb_total } from "./layout";
+import { profile_fingerprint, canonical_json, json_tree } from "../agent/fingerprint";
 // Shared-base LoRA: the same pure rules the agent applies (validation,
 // adapters, slot/context sizing) for profile checks + join placement.
 import { is_sharing_profile, sharing_profile_error, profile_adapters, member_slots,
-	member_ctx_per_slot } from "../agent/lora_share";
-import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
+	member_ctx_per_slot, desired_config } from "../agent/lora_share";
+import { render_layout, render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
          OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
 
@@ -295,7 +300,7 @@ let CP_AGENT_TIMEOUT_MS = 60000;
 
 fn cp_post_json(url: string, data) {
 	let secret = shared_secret();
-	let payload = data;
+	let payload = json_tree(data);
 	if (secret != "" && payload != null) { payload["_auth_token"] = secret; }
 	let body = stringify(payload);
 	let h = ["Content-Type: application/json"];
@@ -388,6 +393,54 @@ fn init_db(db): null {
 	// argv/env), replaced on every register. Placement for a `local`
 	// profile reads it; null = an agent too old to report any.
 	try { exec(db, "alter table nodes add column local_services_json text", []); } catch (e) { }
+	// Measured GPU memory from the agent's heartbeat (newer agents):
+	// service_vram_json — per-service { id, profile, port, gpus, vram_mb
+	// {gpu: MB}, … }; gpu_usage_json — per-GPU { index, total_mb, used_mb,
+	// services_mb, other_mb }. Replaced on every register.
+	try { exec(db, "alter table nodes add column service_vram_json text", []); } catch (e) { }
+	try { exec(db, "alter table nodes add column gpu_usage_json text", []); } catch (e) { }
+
+	// Last measured VRAM per profile (or per shared-server member set), so
+	// the layout planner can size a service it is about to start from what
+	// it actually used last time instead of the GGUF estimate (which
+	// overestimates hybrid models). Keyed by name; valid for the profile
+	// fingerprint it was measured under (agent/fingerprint.hml). The
+	// largest value seen for the same fingerprint + GPU set is kept
+	// (compute buffers can grow after load, e.g. sd-server).
+	exec(db, "create table if not exists profile_vram ("
+		+ "key text primary key,"            // profile name | shared:<group>|<member fps>
+		+ "fp text not null,"                // fingerprint the numbers are valid for
+		+ "node_id text,"
+		+ "gpus_json text,"                  // GPU set it was measured on
+		+ "vram_json text not null,"         // { "<gpu>": MB }
+		+ "total_mb integer not null,"
+		+ "startup_s real,"                  // last measured time-to-healthy (layout apply)
+		+ "est_mb real,"                     // GGUF estimate for the measured profile (scaling)
+		+ "measured_at text not null"
+		+ ")", []);
+
+	try { exec(db, "alter table profile_vram add column est_mb real", []); } catch (e) { }
+
+	// Last good GET /services answer per node. When an agent can't be
+	// reached (restarting, busy) GET /services serves these entries marked
+	// stale instead of silently dropping the node's services.
+	exec(db, "create table if not exists node_services_cache ("
+		+ "node_id text primary key,"
+		+ "body text not null,"
+		+ "fetched_at text not null"
+		+ ")", []);
+
+	// Layout apply runs (POST /api/layout/apply): request, status, step log.
+	exec(db, "create table if not exists layout_runs ("
+		+ "id text primary key,"
+		+ "status text not null,"            // running | done | noop | failed | rolled_back
+		+ "request_json text not null,"
+		+ "plan_json text,"
+		+ "log_json text,"
+		+ "result_json text,"
+		+ "started_at text not null,"
+		+ "finished_at text"
+		+ ")", []);
 	// Per-node GGUF catalog. Replaced wholesale on each /register so we
 	// don't accumulate stale entries when an operator deletes a model
 	// from disk. Indexed on alias for the placement-time "which nodes
@@ -1478,6 +1531,14 @@ fn handle_register(req): object {
 	let ar_val = (ar == null) ? null : (ar == true ? 1 : 0);
 	let agent_ver = payload?.agent_version;
 	let local_json = sanitize_local_services(payload?.local_services);
+	let svram_json = null;
+	if (payload?.service_vram != null && typeof(payload.service_vram) == "array") {
+		svram_json = stringify(json_tree(payload.service_vram));
+	}
+	let gusage_json = null;
+	if (payload?.gpu_usage != null && typeof(payload.gpu_usage) == "array") {
+		gusage_json = stringify(json_tree(payload.gpu_usage));
+	}
 	exec(DB,
 		"insert into nodes (node_id, hostname, role, hardware_json, agent_url, registered_at, last_seen_at, runtime_json, auto_restart, agent_version, local_services_json) "
 		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -1491,6 +1552,15 @@ fn handle_register(req): object {
 		+ "local_services_json=excluded.local_services_json",
 		[node_id, hostname, payload?.role ?? "worker", hw_json, agent_url, now, now, runtime_json, ar_val, agent_ver, local_json]
 	);
+	if (svram_json != null || gusage_json != null) {
+		exec(DB, "update nodes set service_vram_json = ?, gpu_usage_json = ? where node_id = ?",
+			[svram_json, gusage_json, node_id]);
+		if (payload?.service_vram != null) {
+			try { record_measurements(node_id, payload.service_vram); } catch (e) {
+				eprint("[vram] recording measurements from " + node_id + " failed: " + e);
+			}
+		}
+	}
 
 	// Catalog ingest. Replace-all-for-this-node so deleted models drop
 	// out automatically — no separate /unregister-model bookkeeping.
@@ -1525,11 +1595,16 @@ fn handle_register(req): object {
 			// Older agents omit ports/cmdline → store null (rendered as "—").
 			let ports_json = null;
 			if (u?.ports != null) { ports_json = stringify(u.ports); }
+			// nvidia-smi lists a process once PER GPU it uses (a tensor-split
+			// server on 2-4 cards): one row per pid with the memory summed —
+			// a plain insert hit the (node_id, pid) key and failed the whole
+			// register, which then made the node go stale.
 			exec(DB,
 				"insert into node_unmanaged_procs "
 				+ "(node_id, pid, process_name, vram_mb, gpu_index, "
 				+ " owner_uid, owner_name, ports, cmdline, observed_at) "
-				+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+				+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+				+ "on conflict(node_id, pid) do update set vram_mb = vram_mb + excluded.vram_mb",
 				[node_id, u.pid, u.process_name, u.vram_mb,
 				 u?.gpu_index, u?.owner_uid, u?.owner_name,
 				 ports_json, u?.cmdline, now]);
@@ -1588,14 +1663,133 @@ fn handle_register(req): object {
 	})};
 }
 
+// ── measured VRAM bookkeeping ────────────────────────────────────────
+
+// A service has to be up this long before its measurement is trusted as
+// "what this profile uses" (model + KV + compute buffers are allocated at
+// load; a just-spawned process is still loading).
+// WITCHGRID_MEASURE_MIN_UPTIME_S overrides it (tests).
+let _mmu_env = getenv("WITCHGRID_MEASURE_MIN_UPTIME_S");
+let MEASURE_MIN_UPTIME_S = (_mmu_env == null || _mmu_env.length == 0) ? 45 : i32(_mmu_env);
+
+// profile_vram key + fingerprint for a measured service entry. A shared
+// server's memory is keyed by its member set ("shared:<group>|a=fp,b=fp").
+fn measurement_key(e) {
+	let prof = "" + (e?.profile ?? "");
+	if (prof.starts_with("shared:")) {
+		let parts = [];
+		for (m in (e?.members ?? [])) { parts.push(m.profile + "=" + m.fp); }
+		if (parts.length == 0) { return null; }
+		parts.sort();
+		let k = prof + "|" + parts.join(",");
+		return { key: k, fp: k };
+	}
+	return { key: prof, fp: "" + (e?.profile_fp ?? "") };
+}
+
+fn record_measurements(node_id: string, entries): null {
+	for (e in entries) {
+		if (e?.state != "running") { continue; }
+		let total = i32(e?.vram_total_mb ?? 0);
+		if (total <= 0) { continue; }
+		if (i32(e?.uptime_s ?? 0) < MEASURE_MIN_UPTIME_S) { continue; }
+		let mk = measurement_key(e);
+		if (mk == null || mk.fp == "") { continue; }
+		record_profile_vram(mk.key, mk.fp, node_id, e?.gpus ?? [], e?.vram_mb ?? {}, total);
+		// The GGUF estimate for the profile this was measured under, so a
+		// later version (e.g. half the context) can be sized by ratio.
+		if (!("" + e.profile).starts_with("shared:")) {
+			let p = fetch_profile_by_name(e.profile);
+			if (p != null && profile_fp_of(p) == mk.fp) {
+				let est = catalog_estimate_mb(node_id, p, profile_ctx(p), (e?.gpus ?? []).length);
+				if (est > 0) {
+					exec(DB, "update profile_vram set est_mb = ? where key = ?", [f64(est), mk.key]);
+				}
+			}
+		}
+	}
+	return null;
+}
+
+// Keep the largest measurement for the same fingerprint + GPU set; a new
+// fingerprint or GPU set replaces it.
+fn record_profile_vram(key: string, fp: string, node_id: string, gpus, vram, total: i32): null {
+	let gj = stringify(gpus);
+	let ex = query(DB, "select fp, gpus_json, total_mb from profile_vram where key = ?", [key]);
+	if (ex.length > 0 && ex[0].fp == fp && ex[0].gpus_json == gj && ex[0].total_mb >= total) {
+		return null;
+	}
+	exec(DB,
+		"insert into profile_vram (key, fp, node_id, gpus_json, vram_json, total_mb, measured_at) "
+		+ "values (?, ?, ?, ?, ?, ?, datetime('now')) on conflict(key) do update set "
+		+ "fp = excluded.fp, node_id = excluded.node_id, gpus_json = excluded.gpus_json, "
+		+ "vram_json = excluded.vram_json, total_mb = excluded.total_mb, "
+		+ "measured_at = excluded.measured_at",
+		[key, fp, node_id, gj, stringify(vram), total]);
+	return null;
+}
+
+fn record_startup_s(key: string, secs: f64): null {
+	exec(DB,
+		"insert into profile_vram (key, fp, vram_json, total_mb, startup_s, measured_at) "
+		+ "values (?, '', '{}', 0, ?, datetime('now')) "
+		+ "on conflict(key) do update set startup_s = excluded.startup_s",
+		[key, secs]);
+	return null;
+}
+
+fn profile_vram_row(key: string) {
+	let r = query(DB, "select key, fp, node_id, gpus_json, vram_json, total_mb, startup_s, "
+		+ "est_mb, measured_at from profile_vram where key = ?", [key]);
+	if (r.length == 0) { return null; }
+	let row = r[0];
+	try { row["gpus"] = parse(row.gpus_json); } catch (e) { row["gpus"] = []; }
+	try { row["vram"] = parse(row.vram_json); } catch (e) { row["vram"] = {}; }
+	return row;
+}
+
+// Per-GPU view for /nodes: total/used/free plus which services hold what
+// (from the last heartbeat's measurements). gpus: hardware.gpus.
+fn gpus_with_usage(gpus, gusage, svram) {
+	let out = [];
+	for (g in (gpus ?? [])) {
+		let used = g?.used_mb ?? (g.total_mb - g.free_mb);
+		let svcs = [];
+		let svc_mb = 0;
+		for (e in (svram ?? [])) {
+			let mb = e?.vram_mb?["" + g.index];
+			if (mb == null || i32(mb) <= 0) { continue; }
+			svcs.push({ id: e.id, profile: e.profile, port: e.port, mb: i32(mb),
+				state: e?.state });
+			svc_mb = svc_mb + i32(mb);
+		}
+		let other = used - svc_mb;
+		if (other < 0) { other = 0; }
+		g["used_mb"] = used;
+		if (gusage != null) {
+			g["services"] = svcs;
+			g["services_mb"] = svc_mb;
+			g["other_mb"] = other;
+		}
+		out.push(g);
+	}
+	return out;
+}
+
 fn handle_list_nodes(req): object {
 	let rows = query(DB,
 		"select node_id, hostname, role, hardware_json, agent_url, "
 		+ "registered_at, last_seen_at, state, runtime_json, auto_restart, agent_version, "
-		+ "local_services_json "
+		+ "local_services_json, service_vram_json, gpu_usage_json "
 		+ "from nodes order by registered_at desc", []);
 	let out = [];
 	for (row in rows) {
+		let hwobj = parse(row.hardware_json);
+		let svram = null;
+		let gusage = null;
+		try { if (row?.service_vram_json != null) { svram = parse(row.service_vram_json); } } catch (e) { }
+		try { if (row?.gpu_usage_json != null) { gusage = parse(row.gpu_usage_json); } } catch (e) { }
+		if (hwobj?.gpus != null) { hwobj["gpus"] = gpus_with_usage(hwobj.gpus, gusage, svram); }
 		let runtime = null;
 		if (row?.runtime_json != null) {
 			try { runtime = parse(row.runtime_json); } catch (e) { }
@@ -1608,7 +1802,7 @@ fn handle_list_nodes(req): object {
 			node_id: row.node_id,
 			hostname: row.hostname,
 			role: row.role,
-			hardware: parse(row.hardware_json),
+			hardware: hwobj,
 			agent_url: row.agent_url,
 			registered_at: row.registered_at,
 			last_seen_at: row.last_seen_at,
@@ -1622,7 +1816,7 @@ fn handle_list_nodes(req): object {
 			local_services: local_services,
 		});
 	}
-	return { status: 200, body: stringify(out) };
+	return { status: 200, body: stringify(json_tree(out)) };
 }
 
 // PATCH /api/nodes/{node_id}  body: {state: "active"|"disabled"|"draining"}
@@ -1874,6 +2068,16 @@ fn lookup_agent(node_id: string) {
 // WITCHGRID_HEARTBEAT_SECONDS so a single missed beat doesn't flap.
 let _stale_env = getenv("WITCHGRID_STALE_NODE_SECONDS");
 let STALE_NODE_SECONDS = (_stale_env == null || _stale_env.length == 0) ? 90 : i32(_stale_env);
+
+// Heartbeating, active, has an agent_url.
+fn node_is_live(node_id): bool {
+	if (node_id == null) { return false; }
+	let r = query(DB,
+		"select node_id from nodes where node_id = ? and agent_url is not null "
+		+ "and state = 'active' and last_seen_at > datetime('now', ?)",
+		["" + node_id, "-" + STALE_NODE_SECONDS + " seconds"]);
+	return r.length > 0;
+}
 
 fn list_all_agents(): array {
 	let rows = query(DB,
@@ -2212,7 +2416,10 @@ fn shared_join_cost_mb(profile, sh, cand): f64 {
 fn find_shared_join(profile_name: string, profile, explicit_model) {
 	if (!is_sharing_profile(profile)) { return null; }
 	let group = "" + profile.share_group;
+	let pin = profile?.pin;
 	for (a in list_all_agents()) {
+		// Pinned: only the server on the pinned node + GPU set qualifies.
+		if (pin != null && a.node_id != pin.node_id) { continue; }
 		let entries = null;
 		try {
 			let resp = cp_get_fast(a.agent_url + "/services");
@@ -2243,6 +2450,7 @@ fn find_shared_join(profile_name: string, profile, explicit_model) {
 				if (rows.length > 0) { cand = rows[0]; }
 			}
 			let gpus = s?.gpus ?? [];
+			if (pin != null && stringify(gpus) != stringify(pin.gpus)) { continue; }
 			let need = shared_join_cost_mb(profile, sh, cand);
 			if (gpus.length > 0 && need > 0.0) {
 				let free = gpu_free_mb(a.node_id, gpus);
@@ -2525,6 +2733,23 @@ fn handle_spawn_proxy(req): object {
 	let device = resolve_device(req_device, profile);
 	profile = apply_device(profile, device);
 
+	// profile.pin: a request that doesn't place the service itself (no
+	// node_id/gpus) goes where the pin says. ignore_pin: true opts out.
+	let pinned_by_profile = false;
+	if (node_id == null && gpus == null && profile?.pin != null && payload?.ignore_pin != true) {
+		node_id = profile.pin.node_id;
+		gpus = profile.pin.gpus;
+		if (port == null) { port = profile.pin?.port; }
+		pinned_by_profile = true;
+		if (!node_is_live(node_id)) {
+			return { status: 503, body: stringify({
+				error: "profile " + profile_name + " is pinned to node " + node_id
+					+ " which is not live (stale, disabled or unknown); "
+					+ "pass ignore_pin: true to place it elsewhere",
+			})};
+		}
+	}
+
 	if (profile?.binary == "local") {
 		// local engine: placement by declaration, no model. A request
 		// `model` is ignored — the agent's declaration is the command.
@@ -2636,7 +2861,8 @@ fn handle_spawn_proxy(req): object {
 		if (resp.status_code >= 200 && resp.status_code < 300) {
 			let body = parse(resp.body);
 			body["node_id"] = node_id;
-			body["placed_by"] = "cp";
+			body["placed_by"] = pinned_by_profile ? "pin" : "cp";
+			body["gpus"] = gpus ?? [];
 			body["device"] = device_label(profile);
 			if (profile?.binary == "local") {
 				body["device"] = (gpus != null && gpus.length > 0) ? "gpu" : "cpu";
@@ -2746,6 +2972,7 @@ fn collect_services(): object {
 	let agents = list_all_agents();
 	let merged = [];
 	let unreachable = [];
+	let stale = [];
 	for (a in agents) {
 		let ok = false;
 		try {
@@ -2757,22 +2984,62 @@ fn collect_services(): object {
 					merged.push(e);
 				}
 				ok = true;
+				cache_node_services(a.node_id, resp.body);
 			}
 		} catch (e) { }
-		if (!ok) { unreachable.push(a.node_id); }
+		if (!ok) {
+			unreachable.push(a.node_id);
+			// Serve the node's last good answer, marked stale, instead of
+			// dropping its services: an agent that is restarting (or busy
+			// past the 6 s fan-out budget) still has its services running —
+			// they're setsid children that outlive it.
+			let cached = cached_node_services(a.node_id);
+			if (cached != null) {
+				for (e in cached.entries) {
+					e["node_id"] = a.node_id;
+					e["stale"] = true;
+					e["stale_as_of"] = cached.fetched_at;
+					merged.push(e);
+				}
+				stale.push(a.node_id);
+			}
+		}
 	}
-	return { services: merged, unreachable: unreachable };
+	return { services: merged, unreachable: unreachable, stale: stale };
 }
 
-// GET /services. The body stays a plain array for existing clients; nodes
+fn cache_node_services(node_id: string, body: string): null {
+	try {
+		exec(DB,
+			"insert into node_services_cache (node_id, body, fetched_at) values (?, ?, datetime('now')) "
+			+ "on conflict(node_id) do update set body = excluded.body, fetched_at = excluded.fetched_at",
+			[node_id, body]);
+	} catch (e) { }
+	return null;
+}
+
+fn cached_node_services(node_id: string) {
+	let r = query(DB, "select body, fetched_at from node_services_cache where node_id = ?", [node_id]);
+	if (r.length == 0) { return null; }
+	let entries = null;
+	try { entries = parse(r[0].body); } catch (e) { return null; }
+	return { entries: entries, fetched_at: r[0].fetched_at };
+}
+
+// GET /services. The body stays a plain array for existing clients. Nodes
 // whose agent didn't answer are listed in the x-witchgrid-unreachable
 // header (comma-separated node_ids) so a client can tell "no services"
-// from "couldn't ask".
+// from "couldn't ask"; their last known services are still in the body,
+// each marked "stale": true with "stale_as_of" (x-witchgrid-stale lists
+// those nodes).
 fn handle_list_services(req): object {
 	let c = collect_services();
 	let headers = { "content-type": "application/json" };
 	if (c.unreachable.length > 0) {
 		headers["x-witchgrid-unreachable"] = c.unreachable.join(",");
+	}
+	if (c.stale.length > 0) {
+		headers["x-witchgrid-stale"] = c.stale.join(",");
 	}
 	return { status: 200, body: stringify(c.services), headers: headers };
 }
@@ -3016,6 +3283,10 @@ fn auto_spawn(profile_name: string) {
 	// override exists here — /v1/llama/* is profile-derived).
 	profile = apply_device(profile, resolve_device(null, profile));
 
+	// A pinned profile auto-spawns exactly where its pin says (never
+	// "wherever fits"), through the same path as POST /services.
+	if (profile?.pin != null) { return auto_spawn_pinned(profile_name, profile); }
+
 	if (profile?.binary == "local") { return auto_spawn_local(profile_name, profile); }
 
 	// Same priority ladder as handle_spawn_proxy: alias-driven first,
@@ -3107,6 +3378,30 @@ fn auto_spawn(profile_name: string) {
 	}
 	print("[autospawn] " + profile_name + " ready on " + host + ":" + port);
 	return { agent_host: host, port: port };
+}
+
+// auto_spawn for a pinned profile: POST /services semantics (the pin
+// places it), then wait for health on the pinned node.
+fn auto_spawn_pinned(profile_name: string, profile) {
+	let resp = handle_spawn_proxy({ method: "POST", path: "/services", headers: {},
+		body: stringify({ profile: profile_name }) });
+	if (resp.status < 200 || resp.status >= 300) {
+		return { error: { status: resp.status, body: resp.body }};
+	}
+	let svc = parse(resp.body);
+	let agent_url = lookup_agent(svc.node_id);
+	let host = extract_host(agent_url ?? "");
+	let timeout = AUTOSPAWN_READY_TIMEOUT_SECONDS;
+	if (profile?.binary == "local") {
+		timeout = local_decl_on_node(svc.node_id, profile?.local_service)?.startup_timeout_s ?? timeout;
+	}
+	print("[autospawn] " + profile_name + " (pinned) on " + svc.node_id + " port=" + svc.port);
+	if (!wait_for_service_ready(host, svc.port, health_path_for_profile(profile), timeout)) {
+		return { error: { status: 503, body: stringify({
+			error: "auto-spawned (pinned) service did not become ready in " + timeout + "s",
+		})}};
+	}
+	return { agent_host: host, port: svc.port };
 }
 
 // auto_spawn for a `local` profile: declaration-driven placement, then
@@ -3351,6 +3646,41 @@ fn unmanaged_by_node(): object {
 		});
 	}
 	return out;
+}
+
+// GET /ui/layout — per-GPU bars from the last heartbeat's measurements
+// (no agent calls: cheap enough to poll).
+fn handle_ui_layout(req): object {
+	let rows = query(DB,
+		"select node_id, hardware_json, service_vram_json, gpu_usage_json from nodes "
+		+ "where last_seen_at > datetime('now', ?) order by node_id asc",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
+	let view = [];
+	for (r in rows) {
+		let hw = null;
+		let sv = null;
+		let gu = null;
+		try { hw = parse(r.hardware_json); } catch (e) { hw = {}; }
+		try { if (r?.service_vram_json != null) { sv = parse(r.service_vram_json); } } catch (e) { }
+		try { if (r?.gpu_usage_json != null) { gu = parse(r.gpu_usage_json); } } catch (e) { }
+		if ((hw?.gpus ?? []).length == 0) { continue; }
+		let gl = gpus_with_usage(hw.gpus, gu ?? [], sv ?? []);
+		// shared servers: label with their members
+		for (g in gl) {
+			for (s in (g?.services ?? [])) {
+				for (e in (sv ?? [])) {
+					if (e?.id == s.id && e?.members != null) {
+						let ms = [];
+						for (m in e.members) { ms.push(m.profile); }
+						s["members"] = ms;
+					}
+				}
+			}
+		}
+		view.push({ node_id: r.node_id, gpus: gl });
+	}
+	return { status: 200, body: render_layout(view),
+		headers: { "content-type": "text/html; charset=utf-8" } };
 }
 
 fn handle_ui_services(req): object {
@@ -4746,6 +5076,11 @@ fn validate_profile(profile, is_put: bool) {
 	if (profile?.extra_flags != null && typeof(profile.extra_flags) != "array") {
 		return "extra_flags must be an array of strings";
 	}
+	let perr = pin_error(profile?.pin);
+	if (perr != null) { return perr; }
+	if (profile?.vram_mb != null && (!is_int_value(profile.vram_mb) || profile.vram_mb < 0)) {
+		return "vram_mb must be a non-negative integer (MB the service needs, summed over its GPUs)";
+	}
 	if (profile?.share_group != null) {
 		if (profile?.binary != null && profile.binary != "llama-server") {
 			return "share_group is only for llama-server profiles";
@@ -4770,6 +5105,29 @@ fn validate_profile(profile, is_put: bool) {
 				|| profile.default_port < 1024 || profile.default_port > 65535)) {
 			return "default_port must be an integer 1024-65535";
 		}
+	}
+	return null;
+}
+
+// profile.pin = { node_id, gpus: [int], port? } — where this profile runs.
+// Honoured by POST /services when the request doesn't place it itself,
+// by /v1/llama auto-spawn, by the agent watchdog's respawn and by
+// shared-group joins (a pinned spawn joins the server on exactly that GPU
+// set). Written by POST /api/layout/apply (pin: true). null = unpinned.
+fn pin_error(pin) {
+	if (pin == null) { return null; }
+	if (typeof(pin) != "object") { return "pin must be an object { node_id, gpus, port? } or null"; }
+	if (pin?.node_id == null || typeof(pin.node_id) != "string" || pin.node_id.length == 0) {
+		return "pin.node_id (string) is required";
+	}
+	if (pin?.gpus == null || typeof(pin.gpus) != "array") {
+		return "pin.gpus must be an array of GPU indices ([] = CPU)";
+	}
+	for (g in pin.gpus) {
+		if (!is_int_value(g) || g < 0 || g > 255) { return "pin.gpus must hold GPU indices (0-255)"; }
+	}
+	if (pin?.port != null && (!is_int_value(pin.port) || pin.port < 1024 || pin.port > 65535)) {
+		return "pin.port must be an integer 1024-65535";
 	}
 	return null;
 }
@@ -5045,6 +5403,948 @@ fn handle_logo(req): object {
 			"cache-control": ASSET_CACHE } };
 }
 
+// ── declarative layout (GET /api/layout, POST /api/layout/plan|apply) ──
+//
+// The fleet as a document: per node, per GPU, which services hold how much
+// (measured), plus a `desired` list in exactly the shape POST
+// /api/layout/plan and /apply accept. The planner itself is pure
+// (cp/layout.hml); this section builds its inputs from live agents
+// (fresh GET /vram + GET /services per node), the profile store and the
+// last-measured table, and executes plans step by step.
+//
+// Request body (plan + apply):
+//   { desired: [{ profile, node_id, gpus, port?, vram_mb? }],
+//     profile_patches?: { name: <JSON merge patch (RFC 7386) or full profile> },
+//     keep_unlisted?: true,     // false: stop running services not listed
+//     pin?: true,               // write profile.pin = {node_id, gpus, port}
+//     margin_mb?: 512,          // per-GPU headroom kept free at every step
+//     confirm: true,            // apply only
+//     wait_s?: 900, health_timeout_s?: 300 }   // apply only
+
+let LAYOUT_DEFAULT_MARGIN_MB = 512;
+let LAYOUT_HEALTH_TIMEOUT_S = 300;
+let LAYOUT_SETTLE_S: f64 = 1.0;
+// Replans tolerated per apply before giving up (each step replans once).
+let LAYOUT_MAX_ITERATIONS = 60;
+
+// Default seconds to healthy when a profile has never been timed.
+fn default_startup_s(profile, node_id): f64 {
+	let b = profile?.binary ?? "llama-server";
+	if (b == "sd-server") { return 20.0; }
+	if (b == "whisper-server" || b == "piper") { return 5.0; }
+	if (b == "local") {
+		let d = local_decl_on_node(node_id, profile?.local_service);
+		if (d?.startup_timeout_s != null) { return f64(d.startup_timeout_s) / 2.0; }
+		return 30.0;
+	}
+	return 30.0;
+}
+
+// Object without null-valued keys (recursively): "pin": null and no pin
+// are the same profile.
+fn drop_nulls(v) {
+	if (v == null || typeof(v) != "object") { return v; }
+	let o = {};
+	for (k in v.keys()) {
+		if (v[k] == null) { continue; }
+		o[k] = drop_nulls(v[k]);
+	}
+	return o;
+}
+
+fn strip_meta(p) {
+	if (p == null) { return null; }
+	let o = {};
+	for (k in p.keys()) {
+		if (k == "__name" || k == "__version") { continue; }
+		o[k] = p[k];
+	}
+	return o;
+}
+
+// The profile as a spawn would inline it (device default applied) — what
+// the agent fingerprints.
+fn spawn_shape(p) {
+	let c = parse(stringify(p));
+	return apply_device(c, resolve_device(null, c));
+}
+
+fn profile_fp_of(p): string {
+	if (p == null) { return ""; }
+	return profile_fingerprint(spawn_shape(p));
+}
+
+// Catalog row for a profile's model on a node (alias first, then path).
+fn catalog_row_for(node_id: string, profile) {
+	let cols = "select node_id, path, size_mb, architecture, n_layers, n_heads, "
+		+ "n_kv_heads, embedding_length, claimed_context from node_models ";
+	if (profile?.model_alias != null) {
+		let r = query(DB, cols + "where alias = ? and node_id = ?", [profile.model_alias, node_id]);
+		if (r.length > 0) { return r[0]; }
+	}
+	if (profile?.default_model != null) {
+		let r = query(DB, cols + "where path = ? and node_id = ?", [profile.default_model, node_id]);
+		if (r.length > 0) { return r[0]; }
+	}
+	return null;
+}
+
+fn profile_ctx(p): i32 {
+	return i32(p?.intent?.context ?? p?.context ?? 4096);
+}
+
+fn profile_kv(p): string {
+	return "" + (p?.intent?.kv_cache_k ?? p?.kv_type ?? "f16");
+}
+
+// GGUF-catalog estimate (MB, whole service) or -1 when there is none.
+fn catalog_estimate_mb(node_id: string, profile, ctx: i32, ngpus: i32): i32 {
+	if ((profile?.binary ?? "llama-server") != "llama-server") { return -1; }
+	if (profile?.intent?.gpu_layers == 0) { return 0; }
+	let row = catalog_row_for(node_id, profile);
+	if (row == null) { return -1; }
+	try {
+		let t = estimate_vram_from_ingredients(row, ctx, profile_kv(profile)).total_mb;
+		if (ngpus > 1) { t = t * (1.0 + MULTI_GPU_OVERHEAD_FRACTION); }
+		return i32(t);
+	} catch (e) { }
+	return -1;
+}
+
+// { mb: {"<gpu>": MB}, source, note? } for one dedicated service.
+fn estimate_service(name: string, profile, entry, node_id: string, gpus): object {
+	let g = sorted_ints(gpus);
+	if (g.length == 0) { return { mb: {}, source: "cpu (no GPU)" }; }
+	let vm = entry?.vram_mb;
+	if (vm != null) {
+		if (typeof(vm) == "object") { return { mb: vm, source: "request vram_mb" }; }
+		return { mb: spread_mb(vm, g), source: "request vram_mb" };
+	}
+	if (profile?.vram_mb != null) {
+		return { mb: spread_mb(profile.vram_mb, g), source: "profile vram_mb" };
+	}
+	let fp = profile_fp_of(profile);
+	let pv = profile_vram_row(name);
+	if (pv != null && i32(pv.total_mb) > 0) {
+		if (pv.fp == fp) {
+			if (same_gpus(pv.gpus, g)) {
+				return { mb: pv.vram, source: "measured " + pv.measured_at };
+			}
+			let t = i32(pv.total_mb);
+			if (g.length > pv.gpus.length) { t = i32(f64(t) * (1.0 + MULTI_GPU_OVERHEAD_FRACTION)); }
+			return { mb: spread_mb(t, g), source: "measured on GPUs " + pv.gpus_json + ", respread" };
+		}
+		let est_new = catalog_estimate_mb(node_id, profile, profile_ctx(profile), g.length);
+		if (est_new > 0 && pv?.est_mb != null && f64(pv.est_mb) > 0.0) {
+			let scaled = i32(f64(pv.total_mb) * f64(est_new) / f64(pv.est_mb));
+			return { mb: spread_mb(scaled, g),
+				source: "measured under an older profile version, scaled by the GGUF estimate" };
+		}
+	}
+	if (profile?.binary == "local") {
+		let d = local_decl_on_node(node_id, profile?.local_service);
+		return { mb: spread_mb(d?.vram_mb ?? 0, g), source: "local declaration vram_mb" };
+	}
+	let est = catalog_estimate_mb(node_id, profile, profile_ctx(profile), g.length);
+	if (est >= 0) {
+		return { mb: spread_mb(est, g), source: "GGUF estimate (overestimates hybrid models; pass vram_mb)" };
+	}
+	return { mb: spread_mb(0, g), source: "unknown",
+		note: name + ": no measurement or estimate; counted as 0 MB — pass vram_mb" };
+}
+
+// Shared-server estimate for a member set.
+fn estimate_shared(group: string, members, node_id: string, gpus): object {
+	let g = sorted_ints(gpus);
+	for (m in members) {
+		let vm = m.entry?.vram_mb;
+		if (vm != null) {
+			if (typeof(vm) == "object") { return { mb: vm, source: "request vram_mb (whole shared server)" }; }
+			return { mb: spread_mb(vm, g), source: "request vram_mb (whole shared server)" };
+		}
+	}
+	let parts = [];
+	for (m in members) { parts.push(m.name + "=" + profile_fp_of(m.profile)); }
+	parts.sort();
+	let key = "shared:" + group + "|" + parts.join(",");
+	let pv = profile_vram_row(key);
+	if (pv != null && i32(pv.total_mb) > 0) {
+		if (same_gpus(pv.gpus, g)) { return { mb: pv.vram, source: "measured " + pv.measured_at }; }
+		return { mb: spread_mb(pv.total_mb, g), source: "measured on GPUs " + pv.gpus_json + ", respread" };
+	}
+	let profs = [];
+	for (m in members) { profs.push(m.profile); }
+	let ctx = 0;
+	let nad = 0;
+	let per_ad = SHARED_LORA_DEFAULT_MB;
+	try {
+		let cfg = desired_config(profs);
+		ctx = cfg.context;
+		nad = cfg.adapters.length;
+	} catch (e) { ctx = profile_ctx(profs[0]); }
+	for (p in profs) { if (p?.lora_mb != null) { per_ad = f64(p.lora_mb); } }
+	let est = catalog_estimate_mb(node_id, profs[0], ctx, g.length);
+	if (est < 0) {
+		return { mb: spread_mb(0, g), source: "unknown",
+			note: "shared:" + group + ": no measurement or estimate; pass vram_mb on a member" };
+	}
+	let total = i32(f64(est) + per_ad * f64(nad));
+	return { mb: spread_mb(total, g),
+		source: "GGUF estimate for the shared server (overestimates hybrid models; pass vram_mb)" };
+}
+
+// One live node, measured now: GET /vram (fresh nvidia-smi attribution,
+// refreshes vram_mb) then GET /services.
+fn layout_fetch_node(node_id: string, agent_url: string): object {
+	let vram = null;
+	try {
+		let r = cp_get_fast(agent_url + "/vram");
+		if (r.status_code == 200) { vram = parse(r.body); }
+	} catch (e) { }
+	let services = null;
+	try {
+		let r = cp_get_fast(agent_url + "/services");
+		if (r.status_code >= 200 && r.status_code < 300) {
+			services = parse(r.body);
+			cache_node_services(node_id, r.body);
+		}
+	} catch (e) { }
+	return { vram: vram, services: services };
+}
+
+// Fleet snapshot for the planner + GET /api/layout.
+//   { nodes: [{ node_id, agent_url, reachable, stale_services, gpus:
+//       [{ index, name, total_mb, used_mb, free_mb, other_mb }], services }] }
+fn layout_snapshot(): object {
+	let nodes = [];
+	let rows = query(DB,
+		"select node_id, agent_url, hardware_json, state from nodes where agent_url is not null "
+		+ "and last_seen_at > datetime('now', ?) order by node_id asc",
+		["-" + STALE_NODE_SECONDS + " seconds"]);
+	for (row in rows) {
+		let f = layout_fetch_node(row.node_id, row.agent_url);
+		let hw = null;
+		try { hw = parse(row.hardware_json); } catch (e) { hw = {}; }
+		let services = f.services;
+		let reachable = (services != null);
+		if (services == null) {
+			let c = cached_node_services(row.node_id);
+			services = (c != null) ? c.entries : [];
+		}
+		let gpus = [];
+		if (f.vram != null && (f.vram?.gpus ?? []).length > 0) {
+			for (g in f.vram.gpus) {
+				gpus.push({ index: g.index, name: g?.name, total_mb: g.total_mb, used_mb: g.used_mb,
+					free_mb: g.free_mb, other_mb: g.other_mb });
+			}
+		} else {
+			for (g in (hw?.gpus ?? [])) {
+				let used = g?.used_mb ?? (g.total_mb - g.free_mb);
+				let svc_mb = 0;
+				for (e in services) { svc_mb = svc_mb + i32(e?.vram_mb?["" + g.index] ?? 0); }
+				let oth = used - svc_mb;
+				if (oth < 0) { oth = 0; }
+				gpus.push({ index: g.index, name: g?.name, total_mb: g.total_mb, used_mb: used,
+					free_mb: g.free_mb, other_mb: oth });
+			}
+		}
+		nodes.push({ node_id: row.node_id, agent_url: row.agent_url, state: row?.state,
+			reachable: reachable, measured: f.vram != null, gpus: gpus, services: services });
+	}
+	return { nodes: nodes };
+}
+
+fn snap_node(snap, node_id) {
+	for (n in snap.nodes) { if (n.node_id == node_id) { return n; } }
+	return null;
+}
+
+// A running service's memory for planning: what it holds now, raised to
+// the largest value recorded for the same profile fingerprint + GPU set
+// (an sd-server allocates its VAE/compute buffers on the first image, so
+// "now" can be well below what it will hold).
+fn with_recorded_peak(profile: string, fp: string, gpus, mb) {
+	let pv = profile_vram_row(profile);
+	if (pv == null || pv.fp != fp || !same_gpus(pv.gpus, gpus)) { return mb; }
+	let out = {};
+	for (k in mb.keys()) { out[k] = mb[k]; }
+	for (k in pv.vram.keys()) {
+		if (i32(pv.vram[k]) > i32(out?[k] ?? 0)) { out[k] = i32(pv.vram[k]); }
+	}
+	return out;
+}
+
+// Planner `current` units + `fixed` memory from a snapshot.
+fn current_units_from(snap): object {
+	let units = [];
+	let fixed = {};
+	let by_id = {};
+	let gpus = [];
+	for (n in snap.nodes) {
+		for (g in n.gpus) {
+			gpus.push({ node_id: n.node_id, index: g.index, total_mb: g.total_mb });
+			fixed[gpu_key(n.node_id, g.index)] = i32(g?.other_mb ?? 0);
+		}
+		for (e in n.services) {
+			if (e?.stale == true) { continue; }
+			let st = e?.state ?? "running";
+			if (st == "failed") { continue; }
+			let mb = e?.vram_mb ?? {};
+			if (st == "stopping") {
+				units.push({ uid: e.id, kind: "stopping", node_id: n.node_id, gpus: e?.gpus ?? [],
+					mb: mb, members: [], ports: [e.port] });
+				continue;
+			}
+			let sh = e?.shared;
+			if (sh?.role == "member") { continue; }
+			if (sh?.role == "server") {
+				let u = { uid: e.id, kind: "shared", node_id: n.node_id, gpus: e?.gpus ?? [], mb: mb,
+					group: sh?.group, members: [],
+					config: { adapters: sh?.adapters ?? [], slots: sh?.slots ?? 0,
+						ctx_per_slot: sh?.ctx_per_slot ?? 0 } };
+				units.push(u);
+				by_id[e.id] = u;
+				continue;
+			}
+			units.push({ uid: e.id, kind: "service", node_id: n.node_id, gpus: e?.gpus ?? [],
+				mb: with_recorded_peak(e.profile, e?.profile_fp ?? "", e?.gpus ?? [], mb),
+				members: [{ profile: e.profile, port: e.port, id: e.id, fp: e?.profile_fp ?? "",
+					model_path: e?.model_path, binary: e?.binary }] });
+		}
+		for (e in n.services) {
+			if (e?.stale == true || e?.shared?.role != "member" || e?.state != "running") { continue; }
+			let u = by_id?[e.shared?.server_id];
+			if (u == null) { continue; }
+			let share = null;
+			let p = fetch_profile_by_name(e.profile);
+			try {
+				share = { adapters: e.shared?.adapters ?? [], slots: member_slots(p),
+					ctx_per_slot: member_ctx_per_slot(p) };
+			} catch (x) { share = null; }
+			u.members.push({ profile: e.profile, port: e.port, id: e.id, fp: e?.profile_fp ?? "",
+				model_path: e?.model_path, share: share });
+		}
+	}
+	return { units: units, fixed: fixed, gpus: gpus };
+}
+
+// Where a profile runs now (first fresh instance), or null.
+fn current_instance(snap, profile: string) {
+	for (n in snap.nodes) {
+		for (e in n.services) {
+			if (e?.stale == true || e?.profile != profile) { continue; }
+			if ((e?.state ?? "running") != "running") { continue; }
+			return { node_id: n.node_id, port: e.port, gpus: e?.gpus ?? [], id: e.id };
+		}
+	}
+	return null;
+}
+
+// Build everything a plan needs from a request body + snapshot. Returns
+// { error, status } or { input (planner), eff (name → new profile), patches
+// (name → { old, new, patch }), estimates, desired_doc }.
+fn layout_build(body, snap) {
+	let verr = validate_layout_request(body);
+	if (verr != null) { return { error: verr, status: 400 }; }
+	let margin = i32(body?.margin_mb ?? LAYOUT_DEFAULT_MARGIN_MB);
+	let keep = (body?.keep_unlisted ?? true) == true;
+	let want_pin = (body?.pin ?? true) == true;
+	let patches_in = body?.profile_patches ?? {};
+
+	for (n in snap.nodes) {
+		if (!n.reachable) {
+			return { error: "node " + n.node_id + " is live but its agent didn't answer; its "
+				+ "services are unknown, so no plan is safe. Retry when it answers.", status: 503 };
+		}
+	}
+	// effective profiles: current ⊕ patch (⊕ pin, below)
+	let names = [];
+	for (e in body.desired) { names.push(e.profile); }
+	for (k in patches_in.keys()) { if (!names.contains(k)) { names.push(k); } }
+	let cur = {};
+	let eff = {};
+	for (nm in names) {
+		let p = fetch_profile_by_name(nm);
+		if (p == null) {
+			return { error: "unknown profile '" + nm + "' (create it with POST /api/profiles first)",
+				status: 400 };
+		}
+		cur[nm] = strip_meta(p);
+		let np = cur[nm];
+		if (patches_in.has(nm)) {
+			let pt = patches_in[nm];
+			if (pt == null || typeof(pt) != "object") {
+				return { error: "profile_patches." + nm + " must be an object", status: 400 };
+			}
+			np = merge_patch(cur[nm], pt);
+		}
+		eff[nm] = np;
+	}
+
+	// desired entries → resolved ports, members
+	let doc = [];
+	let svc_units = [];
+	let shared_groups = {};     // "group|node|gpus|model" → { group, node_id, gpus, members }
+	let estimates = [];
+	let notes = [];
+	for (e in body.desired) {
+		let p = eff[e.profile];
+		let n = snap_node(snap, e.node_id);
+		if (n == null) {
+			return { error: "node '" + e.node_id + "' (for " + e.profile + ") is not live", status: 400 };
+		}
+		for (gi in e.gpus) {
+			let found = false;
+			for (g in n.gpus) { if (g.index == gi) { found = true; } }
+			if (!found) {
+				return { error: e.node_id + " has no GPU " + gi + " (for " + e.profile + ")", status: 400 };
+			}
+		}
+		let port = e?.port;
+		let ci = current_instance(snap, e.profile);
+		if (port == null && ci != null && ci.node_id == e.node_id) { port = ci.port; }
+		if (port == null) { port = p?.pin?.port; }
+		if (port == null) { port = p?.default_port; }
+		if (port == null && p?.binary == "local") {
+			port = local_decl_on_node(e.node_id, p?.local_service)?.port;
+		}
+		if (port == null) {
+			return { error: e.profile + ": no port (give port, or set the profile's default_port)", status: 400 };
+		}
+		if (port == extract_port(n.agent_url)) {
+			return { error: e.profile + ": port " + port + " is the agent's own port", status: 400 };
+		}
+		let gs = sorted_ints(e.gpus);
+		if (want_pin) {
+			let pinned = eff[e.profile];
+			pinned = merge_patch(pinned, { pin: null });
+			pinned["pin"] = { node_id: e.node_id, gpus: gs, port: i32(port) };
+			eff[e.profile] = pinned;
+			p = pinned;
+		}
+		let perr = validate_profile(p, true);
+		if (perr != null) { return { error: e.profile + ": " + perr, status: 400 }; }
+		doc.push({ profile: e.profile, node_id: e.node_id, gpus: gs, port: i32(port) });
+		let pv = profile_vram_row(e.profile);
+		let startup = default_startup_s(p, e.node_id);
+		if (pv?.startup_s != null) { startup = f64(pv.startup_s); }
+		let member = { profile: e.profile, port: i32(port), fp: profile_fp_of(p), startup_s: startup };
+		if (is_sharing_profile(p) && gs.length > 0) {
+			let model = p?.model_alias ?? p?.default_model ?? "";
+			let key = p.share_group + "|" + e.node_id + "|" + stringify(gs) + "|" + model;
+			if (!shared_groups.has(key)) {
+				shared_groups[key] = { group: "" + p.share_group, node_id: e.node_id, gpus: gs, members: [] };
+			}
+			let share = null;
+			try {
+				let ads = [];
+				for (a in profile_adapters(p)) { ads.push(a.path); }
+				share = { adapters: ads, slots: member_slots(p), ctx_per_slot: member_ctx_per_slot(p) };
+			} catch (x) { }
+			member["share"] = share;
+			shared_groups[key].members.push({ name: e.profile, profile: p, entry: e, member: member });
+			continue;
+		}
+		let est = estimate_service(e.profile, p, e, e.node_id, gs);
+		if (est?.note != null) { notes.push(est.note); }
+		estimates.push({ profiles: [e.profile], node_id: e.node_id, gpus: gs, mb: est.mb,
+			total_mb: mb_total(est.mb), source: est.source });
+		svc_units.push({ uid: e.profile, kind: "service", node_id: e.node_id, gpus: gs, mb: est.mb,
+			source: est.source, members: [member] });
+	}
+	for (k in shared_groups.keys()) {
+		let sg = shared_groups[k];
+		let est = estimate_shared(sg.group, sg.members, sg.node_id, sg.gpus);
+		if (est?.note != null) { notes.push(est.note); }
+		let ms = [];
+		let pn = [];
+		for (m in sg.members) { ms.push(m.member); pn.push(m.name); }
+		estimates.push({ profiles: pn, shared_group: sg.group, node_id: sg.node_id, gpus: sg.gpus,
+			mb: est.mb, total_mb: mb_total(est.mb), source: est.source });
+		svc_units.push({ uid: "shared:" + k, kind: "shared", group: sg.group, node_id: sg.node_id,
+			gpus: sg.gpus, mb: est.mb, source: est.source, members: ms });
+	}
+
+	// keep_unlisted: false + pin: true — the layout owns the pins. A running
+	// profile it stops loses its pin, so a later /v1/llama auto-spawn of it
+	// goes through capacity-aware placement instead of back onto a card the
+	// new layout gave to something else.
+	if (!keep && want_pin) {
+		for (n in snap.nodes) {
+			for (e in n.services) {
+				let pn = e?.profile;
+				if (pn == null || names.contains(pn) || ("" + pn).starts_with("shared:")) { continue; }
+				if (e?.stale == true || (e?.state ?? "running") != "running") { continue; }
+				let sp = fetch_profile_by_name(pn);
+				if (sp == null || sp?.pin == null) { continue; }
+				names.push(pn);
+				cur[pn] = strip_meta(sp);
+				eff[pn] = merge_patch(cur[pn], { pin: null });
+			}
+		}
+	}
+
+	// patch steps: profiles whose stored JSON changes
+	let patch_steps = [];
+	let patches = {};
+	for (nm in names) {
+		if (canonical_json(drop_nulls(eff[nm])) == canonical_json(drop_nulls(cur[nm]))) { continue; }
+		let shown = parse(stringify(json_tree(patches_in?[nm] ?? {})));
+		if (want_pin && eff[nm]?.pin != null) {
+			shown["pin"] = eff[nm].pin;
+		} else if (want_pin && cur[nm]?.pin != null && eff[nm]?.pin == null) {
+			shown["pin"] = null;
+		}
+		let restart = profile_fp_of(eff[nm]) != profile_fp_of(cur[nm]);
+		patch_steps.push({ profile: nm, patch: shown, restart: restart });
+		patches[nm] = { old: cur[nm], new: eff[nm] };
+	}
+
+	let cu = current_units_from(snap);
+	let input = {
+		margin_mb: margin, keep_unlisted: keep, gpus: cu.gpus, fixed: cu.fixed,
+		current: cu.units, desired: svc_units, patches: patch_steps,
+	};
+	return { input: input, eff: eff, patches: patches, estimates: estimates, notes: notes,
+		desired_doc: doc, keep: keep, margin: margin };
+}
+
+// Plan from a body: { status, plan } (plan carries ok/error).
+fn layout_plan_now(body) {
+	let snap = layout_snapshot();
+	let b = layout_build(body, snap);
+	if (b?.error != null) { return { status: b.status, plan: { ok: false, error: b.error }, snap: snap }; }
+	let plan = plan_layout(b.input);
+	plan["estimates"] = b.estimates;
+	let w = plan?.warnings ?? [];
+	for (nt in b.notes) { w.push(nt); }
+	plan["warnings"] = w;
+	plan["layout"] = { desired: b.desired_doc, keep_unlisted: b.keep, margin_mb: b.margin };
+	return { status: (plan.ok ? 200 : 409), plan: plan, build: b, snap: snap };
+}
+
+// ── GET /api/layout ──
+
+fn layout_document(snap): object {
+	let desired = [];
+	let nodes = [];
+	let all_pinned = true;
+	let any = false;
+	for (n in snap.nodes) {
+		let gv = [];
+		for (g in n.gpus) {
+			let svcs = [];
+			for (e in n.services) {
+				let mb = i32(e?.vram_mb?["" + g.index] ?? 0);
+				if (e?.shared?.role == "member") { continue; }
+				let on_gpu = (e?.gpus ?? []).contains(g.index);
+				if (mb <= 0 && !on_gpu) { continue; }
+				let label = e.profile;
+				let item = { profile: e.profile, port: e.port, mb: mb, service_id: e.id,
+					state: e?.state ?? "running" };
+				if (e?.shared?.role == "server") {
+					let names = [];
+					for (m in (e.shared?.members ?? [])) { names.push(m.profile); }
+					item["shared_group"] = e.shared?.group;
+					item["members"] = names;
+					item["profile"] = "shared:" + (e.shared?.group ?? "?");
+				}
+				if (e?.stale == true) { item["stale"] = true; }
+				svcs.push(item);
+			}
+			gv.push({ index: g.index, name: g?.name, total_mb: g.total_mb, used_mb: g?.used_mb,
+				free_mb: g?.free_mb, other_mb: g?.other_mb ?? 0, services: svcs });
+		}
+		nodes.push({ node_id: n.node_id, reachable: n.reachable, measured: n.measured, gpus: gv });
+		for (e in n.services) {
+			let st = e?.state ?? "running";
+			if (st != "running") { continue; }
+			if (e?.shared?.role == "server") { continue; }
+			if (e?.profile == null || ("" + e.profile).starts_with("shared:")) { continue; }
+			let item = { profile: e.profile, node_id: n.node_id, gpus: sorted_ints(e?.gpus ?? []),
+				port: e.port, measured_mb: e?.vram_mb ?? {}, service_id: e.id };
+			if (e?.shared?.role == "member") {
+				item["shared_group"] = e.shared?.group;
+				item["measured_mb"] = {};
+			}
+			if (e?.stale == true) { item["stale"] = true; }
+			desired.push(item);
+			any = true;
+			let p = fetch_profile_by_name(e.profile);
+			let pin = p?.pin;
+			if (pin == null || pin.node_id != n.node_id || !same_gpus(pin?.gpus ?? [], item.gpus)
+				|| (pin?.port != null && pin.port != e.port)) {
+				all_pinned = false;
+			}
+		}
+	}
+	return {
+		keep_unlisted: true,
+		pin: (any && all_pinned),
+		margin_mb: LAYOUT_DEFAULT_MARGIN_MB,
+		desired: desired,
+		nodes: nodes,
+	};
+}
+
+fn handle_get_layout(req): object {
+	let snap = layout_snapshot();
+	return { status: 200, body: stringify(json_tree(layout_document(snap))),
+		headers: { "content-type": "application/json" } };
+}
+
+fn handle_plan_layout(req): object {
+	let body = null;
+	try { body = parse(req?.body ?? ""); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	let r = layout_plan_now(body);
+	return { status: r.status, body: stringify(json_tree(r.plan)),
+		headers: { "content-type": "application/json" } };
+}
+
+// ── apply ──
+
+fn write_profile(name: string, prof): i32 {
+	let ex = query(DB, "select version from profiles where name = ?", [name]);
+	if (ex.length == 0) { throw "no such profile: " + name; }
+	let v = ex[0].version + 1;
+	exec(DB, "update profiles set profile_json = ?, version = ?, updated_at = ? where name = ?",
+		[stringify(json_tree(prof)), v, iso_now(), name]);
+	return v;
+}
+
+fn run_set(id: string, status: string, log, result): null {
+	exec(DB, "update layout_runs set status = ?, log_json = ?, result_json = ?, "
+		+ "finished_at = case when ? = 'running' then null else datetime('now') end where id = ?",
+		[status, stringify(json_tree(log)), (result == null ? null : stringify(json_tree(result))), status, id]);
+	return null;
+}
+
+fn agent_stop_verified(node_id: string, service_id: string): object {
+	let url = lookup_agent(node_id);
+	if (url == null) { return { ok: false, error: "no agent for " + node_id }; }
+	try {
+		let r = cp_post_json(url + "/services/stop", { id: service_id, report: true });
+		if (r.status_code == 404) { return { ok: true, gone: true, note: "already gone" }; }
+		if (r.status_code == 204) { return { ok: true, gone: true }; }
+		let rep = null;
+		try { rep = parse(r.body); } catch (e) { }
+		if (r.status_code == 200) { return { ok: (rep?.gone ?? true) == true, report: rep }; }
+		return { ok: false, error: "agent stop " + r.status_code + ": " + r.body, report: rep };
+	} catch (e) {
+		return { ok: false, error: "agent unreachable: " + e };
+	}
+}
+
+fn health_timeout_for(profile, node_id: string, body): i32 {
+	if (body?.health_timeout_s != null) { return i32(body.health_timeout_s); }
+	if (profile?.binary == "local") {
+		let d = local_decl_on_node(node_id, profile?.local_service);
+		if (d?.startup_timeout_s != null && i32(d.startup_timeout_s) > LAYOUT_HEALTH_TIMEOUT_S) {
+			return i32(d.startup_timeout_s);
+		}
+	}
+	return LAYOUT_HEALTH_TIMEOUT_S;
+}
+
+// Start a profile pinned at (node, gpus, port) and wait for health.
+fn layout_start(profile_name: string, node_id: string, gpus, port, model, body): object {
+	let req_body = { profile: profile_name, node_id: node_id, gpus: gpus, port: port,
+		ignore_pin: true };
+	if (model != null) { req_body["model"] = model; }
+	let t0 = unix_ms();
+	let resp = handle_spawn_proxy({ method: "POST", path: "/services", headers: {},
+		body: stringify(req_body) });
+	if (resp.status < 200 || resp.status >= 300) {
+		return { ok: false, error: "spawn " + resp.status + ": " + resp.body };
+	}
+	let svc = parse(resp.body);
+	let profile = fetch_profile_by_name(profile_name);
+	let host = extract_host(lookup_agent(node_id) ?? "");
+	let tmo = health_timeout_for(profile, node_id, body);
+	if (!wait_for_service_ready(host, i32(svc.port), health_path_for_profile(profile), tmo)) {
+		return { ok: false, id: svc?.id, error: profile_name + " did not become healthy within "
+			+ tmo + "s on " + node_id + ":" + svc.port };
+	}
+	let secs = f64(unix_ms() - t0) / 1000.0;
+	record_startup_s(profile_name, secs);
+	return { ok: true, id: svc?.id, port: svc.port, startup_s: secs };
+}
+
+fn measured_now(snap): object {
+	let out = {};
+	for (n in snap.nodes) {
+		for (g in n.gpus) { out[gpu_key(n.node_id, g.index)] = i32(g?.used_mb ?? 0); }
+	}
+	return out;
+}
+
+fn find_entry_in_snap(snap, profile: string, node_id) {
+	for (n in snap.nodes) {
+		if (node_id != null && n.node_id != node_id) { continue; }
+		for (e in n.services) {
+			if (e?.profile == profile && e?.stale != true && (e?.state ?? "running") == "running") {
+				return { node_id: n.node_id, e: e };
+			}
+		}
+	}
+	return null;
+}
+
+// Undo what a run changed: stop what it started, restore profiles,
+// restart what it stopped where it was. Returns the rollback log.
+fn layout_rollback(run_id: string, ex, body): array {
+	let log = [];
+	let si = ex.started.length - 1;
+	while (si >= 0) {
+		let s = ex.started[si];
+		let snap = layout_snapshot();
+		let cur = find_entry_in_snap(snap, s.profile, s.node_id);
+		if (cur != null && cur.e.id == s.id) {
+			let r = agent_stop_verified(s.node_id, s.id);
+			log.push({ op: "stop", profile: s.profile, node_id: s.node_id, ok: r.ok, error: r?.error });
+		}
+		si = si - 1;
+	}
+	let pi = ex.patched.length - 1;
+	while (pi >= 0) {
+		let p = ex.patched[pi];
+		try {
+			let v = write_profile(p.profile, p.old);
+			log.push({ op: "restore_profile", profile: p.profile, version: v, ok: true });
+		} catch (e) {
+			log.push({ op: "restore_profile", profile: p.profile, ok: false, error: "" + e });
+		}
+		pi = pi - 1;
+	}
+	for (s in ex.stopped) {
+		let snap = layout_snapshot();
+		if (find_entry_in_snap(snap, s.profile, null) != null) { continue; }
+		let model = (s?.binary == "local") ? null : s?.model_path;
+		let r = layout_start(s.profile, s.node_id, s.gpus, s.port, model, body);
+		log.push({ op: "start", profile: s.profile, node_id: s.node_id, gpus: s.gpus, port: s.port,
+			ok: r.ok, error: r?.error });
+	}
+	return log;
+}
+
+// Execute one plan step. Mutates `ex` (what to roll back).
+fn layout_exec_step(step, b, snap, ex, body): object {
+	if (step.op == "patch_profile") {
+		let pt = b.patches?[step.profile];
+		if (pt == null) { return { ok: true, note: "nothing to patch" }; }
+		let already = false;
+		for (x in ex.patched) { if (x.profile == step.profile) { already = true; } }
+		if (!already) { ex.patched.push({ profile: step.profile, old: pt.old }); }
+		let v = write_profile(step.profile, pt.new);
+		return { ok: true, version: v };
+	}
+	let res = { ok: true };
+	if (step.op == "stop" || step.op == "restart") {
+		let from = step?.from ?? { node_id: step.node_id, gpus: step.gpus, port: step.port,
+			service_id: step?.service_id };
+		let ent = null;
+		for (n in snap.nodes) {
+			for (e in n.services) { if (e.id == from.service_id) { ent = e; } }
+		}
+		let r = agent_stop_verified(from.node_id, from.service_id);
+		if (!r.ok) { return { ok: false, error: "stop of " + step.profile + " failed: " + (r?.error ?? "process still present after SIGKILL") , report: r?.report }; }
+		res["stop"] = r?.report;
+		if (ent != null && !(ent?.profile ?? "").starts_with("shared:")) {
+			ex.stopped.push({ profile: step.profile, node_id: from.node_id, gpus: from?.gpus ?? [],
+				port: from.port, model_path: ent?.model_path, binary: ent?.binary });
+		}
+	}
+	if (step.op == "start" || step.op == "restart") {
+		let r = layout_start(step.profile, step.node_id, step.gpus, step.port, null, body);
+		if (r?.id != null) { ex.started.push({ profile: step.profile, node_id: step.node_id, id: r.id }); }
+		if (!r.ok) { return { ok: false, error: r.error }; }
+		res["service_id"] = r.id;
+		res["startup_s"] = r.startup_s;
+	}
+	return res;
+}
+
+fn step_brief(s): object {
+	return { op: s.op, profile: s.profile, node_id: s?.node_id, gpus: s?.gpus, port: s?.port };
+}
+
+async fn layout_apply_task(run_id: string): null {
+	let rows = query(DB, "select request_json from layout_runs where id = ?", [run_id]);
+	if (rows.length == 0) { return null; }
+	let body = parse(rows[0].request_json);
+	let log = [];
+	let ex = { patched: [], stopped: [], started: [] };
+	try {
+		layout_apply_run(run_id, body, log, ex);
+	} catch (e) {
+		eprint("[layout] apply " + run_id + " crashed: " + e);
+		log.push({ error: "internal error: " + e });
+		let rb = [];
+		try { rb = layout_rollback(run_id, ex, body); } catch (e2) {
+			rb = [{ error: "rollback failed: " + e2 }];
+		}
+		run_set(run_id, "rolled_back", log, { ok: false, error: "internal error: " + e, rollback: rb });
+	}
+	return null;
+}
+
+fn layout_apply_run(run_id: string, body, log, ex): null {
+	let it = 0;
+	let prev_rest = null;
+	let first_plan = null;
+	loop {
+		it = it + 1;
+		if (it > LAYOUT_MAX_ITERATIONS) {
+			log.push({ error: "gave up after " + LAYOUT_MAX_ITERATIONS + " steps (plan keeps changing)" });
+			let rb = layout_rollback(run_id, ex, body);
+			run_set(run_id, "rolled_back", log, { ok: false, error: "did not converge", rollback: rb,
+				layout: layout_document(layout_snapshot()) });
+			return null;
+		}
+		let r = layout_plan_now(body);
+		let plan = r.plan;
+		if (first_plan == null) {
+			first_plan = plan;
+			exec(DB, "update layout_runs set plan_json = ? where id = ?", [stringify(json_tree(plan)), run_id]);
+		}
+		if (!plan.ok) {
+			log.push({ error: plan.error, plan: plan });
+			if (ex.patched.length == 0 && ex.stopped.length == 0 && ex.started.length == 0) {
+				run_set(run_id, "failed", log, { ok: false, error: plan.error, plan: plan });
+				return null;
+			}
+			let rb = layout_rollback(run_id, ex, body);
+			run_set(run_id, "rolled_back", log, { ok: false, error: plan.error, rollback: rb,
+				layout: layout_document(layout_snapshot()) });
+			return null;
+		}
+		if (plan.steps.length == 0) {
+			let status = (log.length == 0) ? "noop" : "done";
+			run_set(run_id, status, log, { ok: true, status: status,
+				layout: layout_document(layout_snapshot()) });
+			return null;
+		}
+		let step = plan.steps[0];
+		// replanned = the remaining plan differs from what the previous
+		// iteration expected after this point
+		let replanned = false;
+		if (prev_rest != null) {
+			let now_rest = [];
+			for (s in plan.steps) { now_rest.push(step_brief(s)); }
+			replanned = stringify(json_tree(now_rest)) != stringify(json_tree(prev_rest));
+		}
+		let t0 = unix_ms();
+		let out = null;
+		try {
+			out = layout_exec_step(step, r.build, r.snap, ex, body);
+		} catch (e) {
+			out = { ok: false, error: "" + e };
+		}
+		// patches don't move memory; everything else settles before measuring
+		if (step.op != "patch_profile") { sleep(LAYOUT_SETTLE_S); }
+		let after = (step.op == "patch_profile") ? r.snap : layout_snapshot();
+		let measured = measured_now(after);
+		let entry = { n: log.length + 1, op: step.op, profile: step.profile,
+			node_id: step?.node_id, gpus: step?.gpus, port: step?.port,
+			ok: out.ok, seconds: f64(unix_ms() - t0) / 1000.0,
+			projected_mb: step?.projected_mb, measured_mb: measured, replanned: replanned };
+		if (out?.error != null) { entry["error"] = out.error; }
+		if (out?.stop != null) { entry["stop"] = out.stop; }
+		if (out?.service_id != null) { entry["service_id"] = out.service_id; }
+		if (out?.version != null) { entry["version"] = out.version; }
+		let drift = [];
+		for (k in measured.keys()) {
+			let pr = step?.projected_mb?[k];
+			if (pr != null && measured[k] > i32(pr) + 512) {
+				drift.push(k + " measured " + measured[k] + " MB vs projected " + pr);
+			}
+		}
+		if (drift.length > 0) { entry["drift"] = drift; }
+		log.push(entry);
+		run_set(run_id, "running", log, null);
+		if (!out.ok) {
+			let rb = layout_rollback(run_id, ex, body);
+			run_set(run_id, "rolled_back", log, { ok: false, error: out.error, failed_step: entry,
+				rollback: rb, layout: layout_document(layout_snapshot()) });
+			return null;
+		}
+		let rest = [];
+		let ri = 1;
+		while (ri < plan.steps.length) { rest.push(step_brief(plan.steps[ri])); ri = ri + 1; }
+		prev_rest = rest;
+	}
+}
+
+fn run_row_obj(row): object {
+	let o = { run_id: row.id, status: row.status, started_at: row.started_at,
+		finished_at: row?.finished_at };
+	try { if (row?.log_json != null) { o["log"] = parse(row.log_json); } } catch (e) { }
+	try { if (row?.result_json != null) { o["result"] = parse(row.result_json); } } catch (e) { }
+	try { if (row?.plan_json != null) { o["plan"] = parse(row.plan_json); } } catch (e) { }
+	return o;
+}
+
+fn handle_apply_layout(req): object {
+	let body = null;
+	try { body = parse(req?.body ?? ""); } catch (e) {
+		return { status: 400, body: "{\"error\":\"bad json\"}" };
+	}
+	if (body?.confirm != true) {
+		return { status: 400, body: stringify({
+			error: "apply changes the fleet: send confirm: true (preview first with POST /api/layout/plan)",
+		})};
+	}
+	let verr = validate_layout_request(body);
+	if (verr != null) { return { status: 400, body: stringify({ error: verr }) }; }
+	let busy = query(DB, "select id from layout_runs where status = 'running' "
+		+ "and started_at > datetime('now', '-2 hours')", []);
+	if (busy.length > 0) {
+		return { status: 409, body: stringify({ error: "a layout apply is already running",
+			run_id: busy[0].id }) };
+	}
+	let id = query(DB, "select lower(hex(randomblob(8))) as id", [])[0].id;
+	exec(DB, "insert into layout_runs (id, status, request_json, started_at) "
+		+ "values (?, 'running', ?, datetime('now'))", [id, stringify(body)]);
+	let t = spawn(layout_apply_task, id);
+	detach(t);
+	let wait_s = i32(body?.wait_s ?? 900);
+	let waited = 0.0;
+	loop {
+		let r = query(DB, "select * from layout_runs where id = ?", [id]);
+		if (r.length > 0 && r[0].status != "running") {
+			let o = run_row_obj(r[0]);
+			let code = 200;
+			if (o.status == "failed" || o.status == "rolled_back") { code = 409; }
+			return { status: code, body: stringify(json_tree(o)), headers: { "content-type": "application/json" } };
+		}
+		if (waited >= f64(wait_s)) {
+			let o = (r.length > 0) ? run_row_obj(r[0]) : { run_id: id, status: "running" };
+			o["note"] = "still running; poll GET /api/layout/runs/" + id;
+			return { status: 202, body: stringify(json_tree(o)), headers: { "content-type": "application/json" } };
+		}
+		sleep(1.0);
+		waited = waited + 1.0;
+	}
+}
+
+fn handle_get_layout_run(req): object {
+	let prefix = "/api/layout/runs/";
+	let id = req.path.substr(prefix.length, req.path.length - prefix.length);
+	if (id.length == 0) {
+		let rows = query(DB, "select id, status, started_at, finished_at from layout_runs "
+			+ "order by started_at desc limit 20", []);
+		let out = [];
+		for (r in rows) { out.push({ run_id: r.id, status: r.status, started_at: r.started_at,
+			finished_at: r?.finished_at }); }
+		return { status: 200, body: stringify(out) };
+	}
+	let r = query(DB, "select * from layout_runs where id = ?", [id]);
+	if (r.length == 0) { return { status: 404, body: stringify({ error: "no such run: " + id }) }; }
+	return { status: 200, body: stringify(json_tree(run_row_obj(r[0]))) };
+}
+
 // ── MCP server (cp/mcp.hml) ──────────────────────────────────────────
 //
 // Each tool wraps an existing CP handler by synthesizing the request it
@@ -5089,6 +6389,22 @@ fn mcp_invoke(name: string, args): object {
 	}
 	if (name == "stop_service") {
 		return handle_stop_proxy(mcp_req("POST", "/services/stop", stringify(args)));
+	}
+	if (name == "get_layout") {
+		return handle_get_layout(mcp_req("GET", "/api/layout", ""));
+	}
+	if (name == "plan_layout") {
+		return handle_plan_layout(mcp_req("POST", "/api/layout/plan", stringify(args)));
+	}
+	if (name == "apply_layout") {
+		// MCP clients time out long calls: wait at most 120 s by default,
+		// then hand back the run id for get_layout_run.
+		let a = args;
+		if (a?.wait_s == null) { a["wait_s"] = 120; }
+		return handle_apply_layout(mcp_req("POST", "/api/layout/apply", stringify(a)));
+	}
+	if (name == "get_layout_run") {
+		return handle_get_layout_run(mcp_req("GET", "/api/layout/runs/" + (args?.run_id ?? ""), ""));
 	}
 	return { status: 404, body: stringify({ error: "unknown tool: " + name }) };
 }
@@ -5166,6 +6482,105 @@ fn mcp_tools(): array {
 						description: "Force CPU/GPU placement. Optional, defaults to the profile's setting." },
 				},
 				required: ["profile"],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "get_layout",
+			description: "Current fleet layout: per node and GPU, total/used/free MB and the services "
+				+ "on it with MEASURED MB; plus `desired`, the running services in the exact shape "
+				+ "plan_layout/apply_layout accept. Start here: edit `desired`, then plan.",
+			schema: { "type": "object", properties: {}, additionalProperties: false },
+		},
+		{
+			name: "plan_layout",
+			description: "Dry run: the ordered steps (patch_profile/stop/start/restart) that reach "
+				+ "`desired` without any GPU exceeding capacity minus margin at any step, with "
+				+ "projected MB per GPU after each step, expected downtime per service and the "
+				+ "estimates used. Only what changes is touched; ports are kept. Infeasible → "
+				+ "error naming each GPU and by how many MB it overflows. Changes nothing.",
+			schema: {
+				"type": "object",
+				properties: {
+					desired: {
+					"type": "array",
+					description: "The services to run and where: one entry per profile.",
+					items: {
+						"type": "object",
+						properties: {
+							profile: { "type": "string" },
+							node_id: { "type": "string" },
+							gpus:    { "type": "array", items: { "type": "integer" },
+								description: "GPU indices on that node; [] = CPU." },
+							port:    { "type": "integer",
+								description: "Optional; default keeps the current port, else pin/default_port." },
+							vram_mb: { description: "Optional size override: MB for the whole service, or {\"<gpu>\": MB}. For a share_group, the whole shared server." },
+						},
+						required: ["profile", "node_id", "gpus"],
+					},
+				},
+					profile_patches: { "type": "object",
+						description: "Optional { profile: JSON merge patch } applied first, e.g. {\"chat-mahou\": {\"intent\": {\"context\": 65536}}}. null deletes a key." },
+					keep_unlisted: { "type": "boolean",
+						description: "Default true. false = stop every running service not in desired." },
+					pin: { "type": "boolean",
+						description: "Default true: record each placement as profile.pin so respawns land there." },
+					margin_mb: { "type": "integer", description: "Free MB kept on every GPU at every step (default 512)." },
+				},
+				required: ["desired"],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "apply_layout",
+			description: "Execute plan_layout's plan: one step at a time, waiting for each started "
+				+ "service's health and for each stopped process to be gone (SIGKILL if needed), "
+				+ "re-measuring VRAM and re-planning after every step. On a failed step it rolls "
+				+ "back (restores profiles, restarts what it stopped). Applying the current layout "
+				+ "is a no-op. Needs confirm: true. Returns the step log, or a run_id to poll with "
+				+ "get_layout_run if it runs longer than wait_s (default 120).",
+			schema: {
+				"type": "object",
+				properties: {
+					desired: {
+					"type": "array",
+					description: "The services to run and where: one entry per profile.",
+					items: {
+						"type": "object",
+						properties: {
+							profile: { "type": "string" },
+							node_id: { "type": "string" },
+							gpus:    { "type": "array", items: { "type": "integer" },
+								description: "GPU indices on that node; [] = CPU." },
+							port:    { "type": "integer",
+								description: "Optional; default keeps the current port, else pin/default_port." },
+							vram_mb: { description: "Optional size override: MB for the whole service, or {\"<gpu>\": MB}. For a share_group, the whole shared server." },
+						},
+						required: ["profile", "node_id", "gpus"],
+					},
+				},
+					profile_patches: { "type": "object",
+						description: "Optional { profile: JSON merge patch } applied first, e.g. {\"chat-mahou\": {\"intent\": {\"context\": 65536}}}. null deletes a key." },
+					keep_unlisted: { "type": "boolean",
+						description: "Default true. false = stop every running service not in desired." },
+					pin: { "type": "boolean",
+						description: "Default true: record each placement as profile.pin so respawns land there." },
+					margin_mb: { "type": "integer", description: "Free MB kept on every GPU at every step (default 512)." },
+					confirm: { "type": "boolean", description: "Must be true." },
+					wait_s:  { "type": "integer", description: "Seconds to wait before returning a run_id (default 120)." },
+					health_timeout_s: { "type": "integer", description: "Per-start health wait (default 300)." },
+				},
+				required: ["desired", "confirm"],
+				additionalProperties: false,
+			},
+		},
+		{
+			name: "get_layout_run",
+			description: "Status + step log of a layout apply (run_id from apply_layout); omit "
+				+ "run_id to list recent runs.",
+			schema: {
+				"type": "object",
+				properties: { run_id: { "type": "string" } },
 				additionalProperties: false,
 			},
 		},
@@ -5298,6 +6713,7 @@ fn main(): null {
 		// Dashboard live fragments + JSON profiles (the form needs structured data)
 		{ method: "GET",  path: "/ui/nodes",        handler: handle_ui_nodes,         scope: "read" },
 		{ method: "GET",  path: "/ui/services",     handler: handle_ui_services,      scope: "read" },
+		{ method: "GET",  path: "/ui/layout",       handler: handle_ui_layout,        scope: "read" },
 		{ method: "GET",  path: "/ui/profiles",     handler: handle_ui_profiles,      scope: "read" },
 		{ method: "GET",  path: "/ui/capabilities", handler: handle_ui_capabilities,  scope: "read" },
 		// Live state stream (SSE) — pushes fleet snapshots on change so the
@@ -5336,6 +6752,12 @@ fn main(): null {
 		{ method: "POST", path: "/api/hf/discover", handler: handle_hf_discover },
 		{ method: "POST", path: "/models/pull_hf",  handler: handle_pull_hf },
 		{ method: "POST", path: "/api/placement_preview", handler: handle_placement_preview, scope: "read" },
+		// Declarative layout (cp/layout.hml): the fleet as a document, a
+		// capacity-safe ordered plan to reach another one, and its executor.
+		{ method: "GET",  path: "/api/layout",       handler: handle_get_layout,       scope: "read" },
+		{ method: "POST", path: "/api/layout/plan",  handler: handle_plan_layout,      scope: "read" },
+		{ method: "POST", path: "/api/layout/apply", handler: handle_apply_layout },
+		{ method: "GET",  path: "/api/layout/runs/", prefix: true, handler: handle_get_layout_run, scope: "read" },
 		{ method: "GET",  path: "/api/transfers",   handler: handle_list_transfers,   scope: "read" },
 		// Bench (v0.7+ slice C3): operator-triggered benchmarks of
 		// (node × profile × build) combos. POST kicks off async,

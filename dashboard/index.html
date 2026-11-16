@@ -156,6 +156,12 @@
       </div>
     </section>
 
+    <section>
+      <h2>GPU layout</h2>
+      <p class="meta">Measured memory per card (per service, then other processes/driver). Change it declaratively with <code>POST /api/layout/plan</code> → <code>/apply</code>, or the <code>plan_layout</code>/<code>apply_layout</code> MCP tools.</p>
+      <div hx-get="/ui/layout" hx-trigger="load, every 30s">loading…</div>
+    </section>
+
     <section x-data="serviceLogModal()">
       <h2>Services</h2>
       <div hx-get="/ui/services" hx-trigger="load, every 30s">loading…</div>
