@@ -28,10 +28,19 @@ PATCH /api/nodes/{id}            { state: active|disabled|draining }        → 
 PUT  /api/nodes/{id}/auto-restart { auto_restart: bool }                    → proxies to agent
 
 # ── services (proxied to the owning agent) ─────────────────────
-POST /services        { profile, node_id?, model?, port?, gpus? }           → 201
-GET  /services                                                              → [...]  (x-witchgrid-unreachable: node_ids that didn't answer)
-POST /services/stop   { id, node_id }                                       → 204  (SIGTERM; SIGKILL after 15s)
+POST /services        { profile, node_id?, model?, port?, gpus?, ignore_pin? } → 201  (placed_by: cp|pin)
+GET  /services                                                              → [...]  (vram_mb per GPU, profile_fp, uptime_s;
+#       x-witchgrid-unreachable: node_ids that didn't answer; their last known services
+#       are still listed with "stale": true — x-witchgrid-stale names those nodes)
+POST /services/stop   { id, node_id, grace_s?, report? }                    → 204 once the process is gone
+#       (SIGTERM → grace (10 s; 1 s if SIGTERM is blocked/ignored) → SIGKILL → reap); 202 + report if it outlived SIGKILL
 GET  /services/log/{id}                                                     → text/plain (public)
+
+# ── declarative layout (see docs/operations.md#declarative-layout) ──
+GET  /api/layout                                                            → { desired: [...], nodes: [per-GPU measured MB] }
+POST /api/layout/plan   { desired, profile_patches?, keep_unlisted?, pin?, margin_mb? } → ordered steps (dry run)
+POST /api/layout/apply  { ...same, confirm: true, wait_s?, health_timeout_s? } → step log (or 202 + run_id)
+GET  /api/layout/runs/{id} · GET /api/layout/runs/                          → a run's status + log · recent runs
 
 # ── routing ────────────────────────────────────────────────────
 GET  /resolve/{profile}                                                     → { host, port, base_url }  (public)
@@ -55,7 +64,9 @@ GET/PUT /api/settings            (db_backup_interval_min, db_backup_dir, db_back
 GET/POST /api/bench · GET /api/bench/{id}
 GET  /metrics                                                              → Prometheus text  (public)
 GET  /healthz                                                             → ok  (public)
-GET  /  ·  /assets/*  ·  /ui/*                                            → dashboard (public)
+GET  /  ·  /assets/*  ·  /ui/*                                            → dashboard (public; /ui/layout = per-GPU bars)
+POST /mcp                                                                   → MCP (JSON-RPC): list_*, fleet_status, resolve_profile,
+#       spawn_service, stop_service, get_layout, plan_layout, apply_layout, get_layout_run
 ```
 
 `POST /services` **without** `node_id` triggers capacity-aware placement: CP
@@ -67,9 +78,17 @@ the same way placement does: the profile's `model_alias` in that node's catalog,
 then its `default_model`.
 
 `GET /services` fans out to every live agent. An agent that doesn't answer within
-6 s (down, or busy, e.g. re-probing a newly activated engine) contributes nothing
-to the list; its node_id is listed in the `x-witchgrid-unreachable` response
-header, and the dashboard's services panel says which nodes it couldn't reach.
+6 s (down, restarting, or busy, e.g. re-probing a newly activated engine) is
+listed in the `x-witchgrid-unreachable` response header, and its **last known**
+services are served from the CP's cache marked `"stale": true` (with
+`"stale_as_of"`; header `x-witchgrid-stale`) — a restarting agent's services are
+still running. The dashboard's services panel says which nodes it couldn't reach.
+
+A profile may carry `pin: {node_id, gpus, port?}`: `POST /services` without
+`node_id`/`gpus` then spawns exactly there (`placed_by: "pin"`; a pin to a node
+that isn't live is a 503; `ignore_pin: true` places normally), and so do
+`/v1/llama` auto-spawn, shared-group joins and the agent watchdog. `vram_mb`
+on a profile is a size hint for the layout planner.
 
 Profile writes are checked for shape: the body must be an object, `binary` (if
 set) must be a known engine, `intent` an object and `extra_flags` an array. A PUT

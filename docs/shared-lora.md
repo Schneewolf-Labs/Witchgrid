@@ -261,7 +261,11 @@ that much free (+10%), the profile joins it; otherwise normal placement runs
 (which may start a second shared server elsewhere). The catalog's KV estimate
 counts every layer as attention, so it **overestimates hybrid models**
 (B4-9B has full attention in 8 of 32 layers) — for those, spawn pinned
-(`node_id` + `gpus`), which skips the estimate.
+(`node_id` + `gpus`), which skips the estimate, or let the layout planner
+place them: it sizes a shared server from its last **measured** memory
+(per member set) or a `vram_mb` you give it — see
+[operations.md](operations.md#declarative-layout) and
+[`examples/layouts/schneewolf.json`](examples/layouts/schneewolf.json).
 
 ## Example: Luna + Familiar on one server
 
@@ -308,9 +312,17 @@ dedicated (no `share_group`).
   loopback connects). The proxy serializes its connects.
 - `posix_spawn` doesn't reset the signal mask, and Hemlock blocks signals in
   spawned tasks: a service spawned from an HTTP handler or the heartbeat
-  thread starts with SIGTERM **blocked** and only dies on the SIGKILL
-  escalation (15 s). Pre-existing for every engine; the shared-server
-  restart path SIGKILLs after 1 s so a join doesn't wait 15 s.
+  thread started with SIGTERM **blocked** and only died on the SIGKILL
+  escalation. **Fixed in the agent**: every spawn clears the calling
+  thread's mask first (`agent/sigmask.hml`, `pthread_sigmask(SIG_SETMASK,
+  ∅)` via FFI) and restores it after, so children start with nothing
+  blocked. Services started before that keep their blocked mask until
+  restarted; stop detects it (`SigBlk`/`SigIgn`) and SIGKILLs after 1 s.
+  (Upstream ask: a `sigmask`/`sigdefault` option on `posix_spawn`, i.e.
+  `POSIX_SPAWN_SETSIGMASK`.)
+- `stringify()` reports any object reached twice as a circular reference,
+  even a map merely shared by two entries; the CP/agent tree-copy
+  (`json_tree`) values assembled from shared parts before serializing.
 - `hemlockc` emits `#undef <name>` for imported names, which can clobber C
   macros (`SIGTERM`, `AF_INET`, …) used by modules initialized later —
   imports of those names are aliased in `agent/services.hml`.

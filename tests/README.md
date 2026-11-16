@@ -108,6 +108,31 @@ BASE_GGUF=… LORA_A=… LORA_B=… LLAMA_SERVER=… CP_PORT=8865 AGENT_PORT=886
   bash tests/gpu/run_shared_lora_gpu.sh
 ```
 
+### Declarative layout + measured VRAM
+
+`tests/layout_test.hml` (unit) drives the pure planner (`cp/layout.hml`) and
+replays every plan with an independent simulator: the schneewolf 2026-11-15
+re-layout (4 × 16 380 MB; niku/Luna-split/voice/Mahou-split/Familiar → one
+main service per card, Mahou patched) must never overflow a card and must
+reach the goal; plus no-op, infeasible (GPU + overflow), keep_unlisted,
+restart-in-place, cross-node make-before-break, port swap, shared-server
+join restart, merge patch and request validation.
+
+`tests/integration/run_layout.sh` (CI, fake backend + `fake_nvidia_smi.py`,
+which "holds" `--fake-vram N` MB per fake server split over its
+`CUDA_VISIBLE_DEVICES`): the spawned signal mask, measured `vram_mb` in
+`/services`/`/vram`/`/nodes`, `GET /api/layout` round-trip no-op, plan
+assertions, infeasible 409, MCP tools, apply of the same re-layout (measured
+usage within capacity − margin after every step, old pids gone, pins
+written), idempotent re-apply, pinned auto-spawn + `placed_by: pin`,
+rollback of a failing step, a share_group layout (one server, both ports),
+unpinning on keep_unlisted: false, stale `/services` while the agent is
+down, and the verified stop of an adopted SIGTERM-ignoring service.
+
+```bash
+CP_PORT=8865 AGENT_PORT=8866 bash tests/integration/run_layout.sh
+```
+
 ## Adding tests
 
 New tests should sit alongside the file they cover:

@@ -22,7 +22,8 @@ Built in [Hemlock](https://hemlang.dev) (2.16.0). Each binary is a single ~10 MB
 - **Intent-driven argv** — profiles declare normalized intents (`flash_attention: true`, `kv_cache_k: "q4_0"`, `context: 131072`); the agent translates each into the binary's actual flag form from its parsed `--help`, so one profile produces the right argv across llama.cpp versions.
 - **Routing + SSE** — direct `/resolve/{profile}` for resolve-then-connect consumers (CP stays off the data path), or the `/v1/llama` proxy with **SSE passthrough** (`stream:true` streams `text/event-stream` straight through).
 - **Observability** — Prometheus `/metrics` (node liveness, per-GPU VRAM, watchdog state) + a live HTMX dashboard (nodes, services, profiles, capabilities, catalog, transfers, bench).
-- **MCP server** — the CP speaks the [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP at `POST /mcp`, exposing the fleet as tools (`list_nodes`, `list_services`, `list_profiles`, `list_catalog`, `fleet_status`, `resolve_profile`, `spawn_service`, `stop_service`). Point Claude (or any MCP client) at it to introspect and drive Witchgrid in natural language. Gated by the same shared bearer as the rest of the operator API.
+- **Declarative layout on measured VRAM** — agents attribute nvidia-smi memory to each service (pid + process group + descendants) and report it per GPU. `GET /api/layout` is the fleet as a document; `POST /api/layout/plan` turns an edited one into an ordered, capacity-safe list of patch/stop/start/restart steps (never over capacity − margin on any card, only what changes, ports kept, blockers moved first, infeasible → which GPU and by how much); `POST /api/layout/apply` executes it step by step with health waits, verified stops, re-measurement + re-planning and rollback. Placements become sticky `pin`s honoured by spawns, auto-spawn, the watchdog and shared joins. See [`docs/operations.md`](docs/operations.md#declarative-layout).
+- **MCP server** — the CP speaks the [Model Context Protocol](https://modelcontextprotocol.io) over Streamable HTTP at `POST /mcp`, exposing the fleet as tools (`list_nodes`, `list_services`, `list_profiles`, `list_catalog`, `fleet_status`, `resolve_profile`, `spawn_service`, `stop_service`, `get_layout`, `plan_layout`, `apply_layout`, `get_layout_run`). Point Claude (or any MCP client) at it to introspect and drive Witchgrid in natural language. Gated by the same shared bearer as the rest of the operator API.
 
 ## What it isn't
 
@@ -96,7 +97,8 @@ Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub rele
 
 | Doc | What's in it |
 |-----|--------------|
-| [`docs/operations.md`](docs/operations.md) | **Deploy + run in production**: service units (systemd / pm2 / launchd), the full env-var reference, auto-restart, metrics scraping, backup/restore, reboot recovery, upgrades. |
+| [`docs/operations.md`](docs/operations.md) | **Deploy + run in production**: service units (systemd / pm2 / launchd), the full env-var reference, auto-restart, **declarative layout** (measured VRAM, pins, plan/apply), metrics scraping, backup/restore, reboot recovery, upgrades. |
+| [`docs/examples/layouts/schneewolf.json`](docs/examples/layouts/schneewolf.json) | A layout document: one main service per 16 GB card, two profiles sharing one server. |
 | [`cp/README.md`](cp/README.md) | Control-plane endpoint reference + build/run + smoke test. |
 | [`agent/README.md`](agent/README.md) | Agent endpoints, config, profiles (owned by CP), engine install lifecycle, restart behavior. |
 | [`CLAUDE.md`](CLAUDE.md) | Architecture, components, design decisions, project relationships. |
@@ -119,9 +121,10 @@ Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub rele
 ## Tests
 
 ```bash
-hemlock tests/run.hml                         # unit: intent / capabilities / GGUF parser
+hemlock tests/run.hml                         # unit: intent / capabilities / GGUF parser / layout planner …
 bash tests/integration/run_integration.sh     # integration: real CP+agent, fake backend
 bash tests/integration/run_shared_lora.sh     # integration: shared-base LoRA serving, fake backend
+bash tests/integration/run_layout.sh          # integration: measured VRAM + layout plan/apply, fake nvidia-smi
 bash tests/gpu/run_shared_lora_gpu.sh         # opt-in, GPU + GGUFs: equivalence/cache/concurrency (see the script)
 ```
 
