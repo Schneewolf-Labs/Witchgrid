@@ -23,6 +23,8 @@ binary's capabilities.
 | `intent.hml` | Translates witchgrid intents (`flash_attention`, `kv_cache_k`, …) into the binary's actual flag form using the capability map. Handles `boolean_or_enum` for flags that changed shape across llama.cpp versions. |
 | `llama_cpp.hml`, `sd_cpp.hml`, `whisper_cpp.hml`, `piper_cpp.hml` | Per-engine install lifecycle (download/build a binary, list installed, activate `current`) + binary-path resolution. |
 | `local_services.hml` | The `local` engine's declaration files: load + validate, refuse undeclared names, build the explicit argv/env for a spawn, and the public view sent to the CP. |
+| `lora_share.hml` | Shared-base LoRA serving rules (pure): adapters a `share_group` profile wants, the compatibility key, shared-server sizing, the per-request `lora` selection, which endpoints get it. |
+| `lora_proxy.hml` | The member-port proxy for shared-LoRA profiles: byte-level HTTP/1.1 forwarding to the shared llama-server, selection injection, unbuffered SSE. |
 | `transfers.hml` | Peer-to-peer model pulls (stream a GGUF from another node, bounded memory). |
 | `http_server.hml` | Minimal HTTP/1.1 server (shared shape with `cp/`). |
 
@@ -136,6 +138,57 @@ curl -s http://<cp>:8765/resolve/riko-voice              # → base_url http://<
 Consumers reach a local service **directly** at the resolved `node:port`
 (`GET /resolve/{profile}`); the CP has no binary-safe proxy route for them (the
 `/v1/llama` proxy is JSON-only, built for llama-server).
+
+## Shared-base LoRA serving (`share_group`)
+
+Profiles that run the **same base GGUF** with different LoRAs (Luna, Familiar
+and Riko on B4-9B) can opt in to sharing one llama-server instead of loading
+the base once per profile. Full design + measurements:
+[`../docs/shared-lora.md`](../docs/shared-lora.md).
+
+```jsonc
+"luna-spark": {
+  "binary": "llama-server",
+  "share_group": "spark-b4-9b",           // the opt-in
+  "intent": { "context": 65536, "parallel_slots": 2, "gpu_layers": 99, "flash_attention": true },
+  "extra_flags": ["--jinja", "--lora", "/path/B4-9B-Luna-F2-f16.gguf"],   // or "lora": "/path/…"
+  "default_port": 18091
+}
+```
+
+What the agent does with a spawn of such a profile:
+
+- **One server per (group, base model path, server settings, GPU set)** —
+  the `shared:<group>` row. llama-server with every member's adapter at
+  global scale 0 (`--lora-scaled <path>:0`), `--cache-ram 0` (the host-RAM
+  prompt cache isn't adapter-aware), `--host 127.0.0.1`, an internal port
+  from `WITCHGRID_SHARED_PORT_BASE` (default 18700). Sized: slots = sum of
+  members' `parallel_slots`, per-slot context = max of members'.
+- **Each member keeps its port**: a proxy inside the agent listens there and
+  forwards everything (any path/method/headers, SSE unbuffered) to the
+  shared server, appending the member's `"lora":[{"id":N,"scale":S},…]` (all
+  ids explicit) to generation requests. A client-sent `lora` is overridden.
+  `POST /lora-adapters` and `POST /slots/*` are refused (403). `/v1/models`
+  and `/props` report the member's `-a` alias if it has one.
+- **Join** restarts the server only if it doesn't already have the member's
+  adapter / enough slots / per-slot context (llama-server can't load an
+  adapter at runtime). **Leave** never restarts; the **last** member stops
+  the server; stopping the **server row** stops all members.
+- Incompatible settings within one group + base (e.g. one profile has
+  `--jinja`, one doesn't) → **409** with both settings.
+- **Watchdog**: the server respawns like any llama-server row; member ports
+  are re-checked every tick and re-bound at boot (the proxies live in the
+  agent process — an agent restart closes member ports until the new agent
+  is up, while the shared server keeps running and is re-adopted).
+- `/services` entries carry `shared`: `{role: "server", group, key, adapters,
+  slots, ctx_per_slot, context, members: [{profile, port}], …}` or `{role:
+  "member", group, key, server_id, server_port, server_alive, adapters,
+  alias}`; the dashboard shows "shared · N members" / "↳ group" badges.
+
+Trade-off: llama-server never batches requests with different adapter sets,
+so when two members generate at once the second waits for the first to
+finish (measured TTFT 3.9 s behind a 256-token generation). Don't share
+latency-critical profiles.
 
 ## Endpoints
 

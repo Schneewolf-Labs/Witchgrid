@@ -77,6 +77,37 @@ bash tests/integration/run_integration.sh    # exits non-zero on any failure
 
 CI runs it on the Linux leg after the unit tests + CP smoke test.
 
+### Shared-base LoRA serving
+
+`tests/lora_share_test.hml` (unit) covers the pure rules in
+`agent/lora_share.hml`: adapter parsing from `lora` / `--lora` /
+`--lora-scaled`, the compatibility signature + share key, sizing (summed
+slots, max per-slot context), covers/restart decisions, the per-request
+selection (every id explicit, never `[]`), body injection (last-key
+override, bytes kept), endpoint policy and alias rewrite.
+
+`tests/integration/run_shared_lora.sh` (CI, fake backend — the fake
+implements llama-server's `lora` semantics and echoes what it got): join with
+and without restart, per-member selection through member ports and the CP
+`/v1/llama` route, client-`lora` override, SSE unbuffered, chunked and
+`Expect: 100-continue` bodies, byte-identical passthrough, alias rewrite,
+refused endpoints, incompatible settings (409), a 40-request concurrent
+burst, member leave (no restart) and rejoin, watchdog respawn, agent restart
+(server adopted, ports re-bound), last-member stop, server-row stop,
+auto-spawn through `/v1/llama`.
+
+`tests/gpu/run_shared_lora_gpu.sh` (**opt-in**, needs a GPU, a base GGUF and
+two matching LoRA GGUFs; not in CI): output equivalence vs dedicated servers
+on tokens and logprobs, prompt-cache safety across adapters (plus a control
+without `--cache-ram 0`), concurrency latency, VRAM. Results are in
+[`../docs/shared-lora.md`](../docs/shared-lora.md#measurements).
+
+```bash
+CP_PORT=8865 AGENT_PORT=8866 bash tests/integration/run_shared_lora.sh
+BASE_GGUF=… LORA_A=… LORA_B=… LLAMA_SERVER=… CP_PORT=8865 AGENT_PORT=8866 \
+  bash tests/gpu/run_shared_lora_gpu.sh
+```
+
 ## Adding tests
 
 New tests should sit alongside the file they cover:

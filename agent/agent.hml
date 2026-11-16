@@ -61,10 +61,11 @@ import { sha256 } from "@stdlib/hash";
 import { sleep } from "@stdlib/time";
 import { homedir } from "@stdlib/os";
 import { exists, make_dirs, remove_file } from "@stdlib/fs";
-import { socket_create, AF_INET, SOCK_STREAM } from "@stdlib/net";
+import { socket_create, AF_INET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR } from "@stdlib/net";
 import { serve } from "./http_server";
+import { ignore as ignore_signal, SIGPIPE as SIG_PIPE } from "@stdlib/signal";
 import { WITCHGRID_VERSION } from "../version";
-import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set, managed_pids } from "./services";
+import { init_services_schema, make_handlers, reap_zombie_services, discover_orphan_llama_servers, discover_orphan_sd_servers, init_agent_settings_schema, get_auto_restart, reconcile_services, finish_stops, agent_setting_get, agent_setting_set, managed_pids, ensure_member_proxies } from "./services";
 import { local_services_dir, load_declarations, public_list as local_public_list, public_view as local_public_view } from "./local_services";
 import { probe, probe_unmanaged_procs } from "./hardware";
 import { introspect, probe_version } from "./capabilities";
@@ -355,6 +356,11 @@ fn port_is_free(port: i32): bool {
 		// surface the real error.
 		return true;
 	}
+	// SO_REUSEADDR like the real binders (llama-server, the agent's own
+	// listeners): without it a port whose last connections sit in
+	// TIME_WAIT reads as taken, and the CP moves a restarted service to
+	// another port. A port some socket is LISTENing on still fails.
+	try { s.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1); } catch (e) { }
 	let free = true;
 	try {
 		s.bind("0.0.0.0", port);
@@ -385,6 +391,11 @@ fn ensure_canonical_dir(path: string): null {
 
 fn main(): null {
 	print("[agent] witchgrid agent " + WITCHGRID_VERSION);
+	// A client that disconnects mid-response (an SSE consumer closing its
+	// tab, a health probe timing out) must cost one failed write, not the
+	// agent: the default SIGPIPE action kills the process. The shared-LoRA
+	// member proxies relay streaming responses, so this matters here.
+	ignore_signal(SIG_PIPE);
 	init_auth();
 	let cp_url     = require_env("WITCHGRID_CP_URL");
 	let agent_url  = require_env("WITCHGRID_AGENT_URL");
@@ -400,6 +411,39 @@ fn main(): null {
 	let canonical_dir = env_or("WITCHGRID_MODEL_DIR", default_canonical_dir());
 	let extra_dirs    = split_paths(env_or("WITCHGRID_MODEL_DIRS_EXTRA", ""));
 	ensure_canonical_dir(canonical_dir);
+
+	// Open db first: before the initial register (the heartbeat and the
+	// very first /register include the unmanaged-proc list, which needs
+	// the services table to know which PIDs are ours) and before the slow
+	// boot steps (hardware probe, --help introspection, catalog scan), so
+	// shared-LoRA member ports can be re-bound right away (below).
+	let db_path = resolve_data_path(DB_PATH);
+	if (!exists(db_path)) {
+		print("[agent] creating NEW database at " + db_path
+			+ " — if unexpected, check CWD or set WITCHGRID_DATA_DIR");
+	}
+	let db = open_db(db_path);
+	// Concurrency + durability pragmas (see cp.hml for rationale). The
+	// detached heartbeat task runs reconcile_services writes concurrently
+	// with the HTTP loop's spawn/stop writes on this same handle, so
+	// busy_timeout + WAL keep them from colliding into "database is locked".
+	db_exec(db, "PRAGMA busy_timeout=5000", []);
+	db_exec(db, "PRAGMA journal_mode=WAL", []);
+	db_exec(db, "PRAGMA synchronous=NORMAL", []);
+	init_services_schema(db);
+	init_agent_settings_schema(db);
+	init_transfers_schema(db);
+	init_llama_cpp_schema(db);
+	init_sd_cpp_schema(db);
+	init_whisper_cpp_schema(db);
+	init_piper_cpp_schema(db);
+	// Shared-LoRA member ports are proxies inside this process, so they
+	// went down with the previous agent while the shared llama-server kept
+	// running. Re-bind them first thing — before the catalog/register/
+	// reconcile work below — to keep the gap a consumer sees (e.g. nginx →
+	// a member port) as short as possible. The watchdog re-checks each tick.
+	let rebound = ensure_member_proxies(db);
+	if (rebound > 0) { print("[agent] re-bound " + rebound + " shared-LoRA member port(s)"); }
 
 	let hw = probe(canonical_dir, extra_dirs);
 	print("[agent] " + node_id + " (" + hostname + ", " + hw.role + ") "
@@ -515,30 +559,6 @@ fn main(): null {
 	// the env value; a persisted override (below, once the db is open)
 	// replaces it.
 	let scan_dirs_ref = { extra: extra_dirs };
-
-	// Open db before initial register so the heartbeat (and the very
-	// first /register) can include the unmanaged-proc list — needs the
-	// services table to know which PIDs are ours vs. the rest.
-	let db_path = resolve_data_path(DB_PATH);
-	if (!exists(db_path)) {
-		print("[agent] creating NEW database at " + db_path
-			+ " — if unexpected, check CWD or set WITCHGRID_DATA_DIR");
-	}
-	let db = open_db(db_path);
-	// Concurrency + durability pragmas (see cp.hml for rationale). The
-	// detached heartbeat task runs reconcile_services writes concurrently
-	// with the HTTP loop's spawn/stop writes on this same handle, so
-	// busy_timeout + WAL keep them from colliding into "database is locked".
-	db_exec(db, "PRAGMA busy_timeout=5000", []);
-	db_exec(db, "PRAGMA journal_mode=WAL", []);
-	db_exec(db, "PRAGMA synchronous=NORMAL", []);
-	init_services_schema(db);
-	init_agent_settings_schema(db);
-	init_transfers_schema(db);
-	init_llama_cpp_schema(db);
-	init_sd_cpp_schema(db);
-	init_whisper_cpp_schema(db);
-	init_piper_cpp_schema(db);
 
 	// Apply a persisted scan-dirs override (set via POST /scan-dirs) over
 	// the env default, then re-scan so the first register reflects it.

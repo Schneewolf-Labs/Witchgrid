@@ -858,8 +858,29 @@ export fn render_services(services_data, live_profiles, unreachable?: []): strin
 		} else {
 			dev_badge = "<span class=\"meta\">—</span>";
 		}
+		// Shared-base LoRA: the server row lists its members + adapters; a
+		// member row points at the server it's served by (its port is a
+		// proxy inside the agent).
+		let share_badge = "";
+		let sh = s?.shared;
+		if (sh?.role == "server") {
+			let names = [];
+			for (m in (sh?.members ?? [])) { names.push(esc("" + m.profile) + ":" + m.port); }
+			share_badge = " <span class=\"badge badge-state-active\" title=\""
+				+ esc("shared base, adapters: " + (sh?.adapters ?? []).join(", ")
+					+ "; " + (sh?.slots ?? "?") + " slots x " + (sh?.ctx_per_slot ?? "?") + " ctx")
+				+ "\">shared · " + (sh?.members ?? []).length + " member"
+				+ ((sh?.members ?? []).length == 1 ? "" : "s") + "</span>"
+				+ "<div class=\"meta\" style=\"font-size:0.8em\">" + names.join(", ") + "</div>";
+		} else if (sh?.role == "member") {
+			share_badge = " <span class=\"badge\" title=\""
+				+ esc("served by shared server " + (sh?.key ?? "") + " on 127.0.0.1:"
+					+ (sh?.server_port ?? "?") + "; adapter: "
+					+ ((sh?.adapters ?? []).length > 0 ? (sh.adapters).join(", ") : "none (base)"))
+				+ "\">↳ " + esc("" + (sh?.group ?? "shared")) + "</span>";
+		}
 		html = html + "<tr>"
-			+ "<td><strong>" + esc(s.profile) + "</strong>" + stale_badge + "</td>"
+			+ "<td><strong>" + esc(s.profile) + "</strong>" + stale_badge + share_badge + "</td>"
 			+ "<td>" + esc(s.node_id) + "</td>"
 			+ "<td>" + dev_badge + "</td>"
 			+ "<td><code>" + s.port + "</code></td>"

@@ -269,6 +269,15 @@ jobs:
         if: runner.os == 'Linux'
         run: bash tests/integration/run_integration.sh
 
+      - name: Integration tests — shared-base LoRA serving
+        # share_group profiles on one llama-server: member-port proxies,
+        # per-request adapter selection, restart/no-restart joins, SSE,
+        # watchdog + agent-restart re-adoption (fake backend, no GPU).
+        # The real-model equivalence/cache checks are opt-in:
+        # tests/gpu/run_shared_lora_gpu.sh.
+        if: runner.os == 'Linux'
+        run: bash tests/integration/run_shared_lora.sh
+
       # ── per-platform release artifacts ────────────────────────────
       # On tag pushes, stage the three binaries with a platform suffix and
       # upload them as workflow artifacts. The separate `release` job below

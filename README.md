@@ -17,6 +17,7 @@ Built in [Hemlock](https://hemlang.dev) (2.16.0). Each binary is a single ~10 MB
 - **Auto-spawn on demand** — `POST /v1/llama/{profile}/*` proxies to a running instance, or — if none — places + spawns one, waits for its `/health`, then completes the request. Spawn nothing by hand.
 - **Self-healing supervision** — the agent keeps its services as *desired state*: an **auto-restart watchdog** (default on, per-node toggle) respawns any service that dies, covering both crashes and host reboots, with crash-loop backoff. Orphan adoption re-attaches services that outlived an agent crash.
 - **Multi-engine** — not just llama.cpp. Manages **`llama-server`** (chat/embeddings/vision), **`sd-server`** (stable-diffusion.cpp images), **`whisper-server`** (STT), and **`piper`** (TTS), each with a normalized profile + on-demand install/activate — plus **`local`**: any HTTP service that is "a command + a port" (e.g. a Python venv), declared in a file on the agent and supervised like the rest (GPU pin, watchdog, re-adoption). The CP can only *name* a declared local service, never send a command; see [`agent/README.md`](agent/README.md#local-services-local-engine).
+- **Shared-base LoRA serving** — profiles that run the same base GGUF with different LoRAs can opt in with `share_group`: one llama-server holds the base once with every member's adapter, each member keeps its own port (an agent-side proxy selects its adapter per request, SSE included), outputs are bit-identical to dedicated servers. Trade-off: different-adapter requests don't batch. See [`docs/shared-lora.md`](docs/shared-lora.md).
 - **Model management** — agents scan model dirs into a per-node catalog (advertised by alias, so profiles stop pinning host paths); CP can pull from HuggingFace and distribute models peer-to-peer between nodes.
 - **Intent-driven argv** — profiles declare normalized intents (`flash_attention: true`, `kv_cache_k: "q4_0"`, `context: 131072`); the agent translates each into the binary's actual flag form from its parsed `--help`, so one profile produces the right argv across llama.cpp versions.
 - **Routing + SSE** — direct `/resolve/{profile}` for resolve-then-connect consumers (CP stays off the data path), or the `/v1/llama` proxy with **SSE passthrough** (`stream:true` streams `text/event-stream` straight through).
@@ -99,6 +100,7 @@ Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub rele
 | [`cp/README.md`](cp/README.md) | Control-plane endpoint reference + build/run + smoke test. |
 | [`agent/README.md`](agent/README.md) | Agent endpoints, config, profiles (owned by CP), engine install lifecycle, restart behavior. |
 | [`CLAUDE.md`](CLAUDE.md) | Architecture, components, design decisions, project relationships. |
+| [`docs/shared-lora.md`](docs/shared-lora.md) | Shared-base LoRA serving: `share_group` profiles, the member-port proxy, llama-server LoRA/cache semantics, equivalence + cache + concurrency measurements, the Luna/Familiar example. |
 | [`docs/test-cases-todo.md`](docs/test-cases-todo.md) | Test backlog (what's automated vs. still manual). |
 | [`docs/llama-cpp-as-managed-runtime.md`](docs/llama-cpp-as-managed-runtime.md) | The "Witchgrid as the llama.cpp manager" long-game (vendoring, canary/rollback). |
 
@@ -119,6 +121,8 @@ Prebuilt binaries (linux-x86_64 + macos-arm64) are attached to each [GitHub rele
 ```bash
 hemlock tests/run.hml                         # unit: intent / capabilities / GGUF parser
 bash tests/integration/run_integration.sh     # integration: real CP+agent, fake backend
+bash tests/integration/run_shared_lora.sh     # integration: shared-base LoRA serving, fake backend
+bash tests/gpu/run_shared_lora_gpu.sh         # opt-in, GPU + GGUFs: equivalence/cache/concurrency (see the script)
 ```
 
 CI (`.github/workflows/build.yml`) builds both platforms, runs the unit + integration suites, and on a `v*` tag attaches per-platform binaries + `SHA256SUMS` to the release. See [`tests/README.md`](tests/README.md).
