@@ -1,0 +1,380 @@
+// layout_test.hml — the declarative-layout planner (cp/layout.hml).
+//
+// The planner is pure: units with measured/estimated MB per GPU in, an
+// ordered step list out. Every test replays the steps with an independent
+// little simulator (not the planner's own projection) and checks that no
+// GPU ever exceeds capacity − margin and that the end state is the goal.
+//
+// The headline case is schneewolf on 2026-11-15 (4× RTX 4060 Ti 16 GB):
+// getting from the morning's layout to "one main service per card" took a
+// hand-sequenced series of curls because the naive orders overflow a card.
+
+import { describe, test } from "@stdlib/testing";
+import { stringify } from "@stdlib/json";
+import { plan_layout, merge_patch, spread_mb, validate_layout_request, same_gpus,
+	gpu_key } from "../cp/layout";
+
+// Local asserts with a message (the stdlib ones take none).
+fn ok(c, msg?: ""): null {
+	if (c != true) { throw "assertion failed: " + msg; }
+	return null;
+}
+fn not_ok(c, msg?: ""): null {
+	if (c != false) { throw "expected false: " + msg; }
+	return null;
+}
+fn eq(a, b, msg?: ""): null {
+	if (a != b) { throw "expected " + stringify(b) + ", got " + stringify(a) + (msg == "" ? "" : ": " + msg); }
+	return null;
+}
+
+let CAP = 16380;
+let MARGIN = 512;
+
+fn gpus4(node: string): array {
+	return [
+		{ node_id: node, index: 0, total_mb: CAP }, { node_id: node, index: 1, total_mb: CAP },
+		{ node_id: node, index: 2, total_mb: CAP }, { node_id: node, index: 3, total_mb: CAP },
+	];
+}
+
+fn svc(uid: string, profile: string, node: string, gpus, mb, port: i32, fp: string): object {
+	return { uid: uid, kind: "service", node_id: node, gpus: gpus, mb: mb,
+		members: [{ profile: profile, port: port, id: uid, fp: fp }] };
+}
+
+fn want(uid: string, profile: string, node: string, gpus, mb, port: i32, fp: string, startup: f64): object {
+	return { uid: uid, kind: "service", node_id: node, gpus: gpus, mb: mb, source: "test",
+		members: [{ profile: profile, port: port, fp: fp, startup_s: startup }] };
+}
+
+// Independent replay. Tracks units (process → {node, mb, members}) and
+// asserts every step keeps every GPU within capacity − margin (or, for a
+// GPU that started above it, not higher than before). Returns
+// { ok, error, where: profile → "node[gpus]:port" , peak }.
+fn replay(inp, plan): object {
+	let usage = {};
+	for (g in inp.gpus) { usage[gpu_key(g.node_id, g.index)] = 0; }
+	for (k in (inp?.fixed ?? {}).keys()) { usage[k] = usage[k] + inp.fixed[k]; }
+	let units = {};      // uid → { node, mb, members: {profile: true} }
+	let where = {};      // profile → { uid, place }
+	for (cu in inp.current) {
+		let ms = {};
+		for (m in cu.members) {
+			ms[m.profile] = true;
+			where[m.profile] = [{ uid: "c" + cu.uid,
+				place: cu.node_id + "[" + stringify(cu.gpus) + "]:" + m.port }];
+		}
+		units["c" + cu.uid] = { node: cu.node_id, mb: cu.mb, members: ms };
+		for (g in cu.mb.keys()) {
+			let k = gpu_key(cu.node_id, g);
+			usage[k] = usage[k] + cu.mb[g];
+		}
+	}
+	let peak = {};
+	for (k in usage.keys()) { peak[k] = usage[k]; }
+	let du_of = {};
+	for (du in inp.desired) { for (m in du.members) { du_of[m.profile] = du; } }
+	for (s in plan.steps) {
+		let before = {};
+		for (k in usage.keys()) { before[k] = usage[k]; }
+		if (s.op == "stop" || s.op == "restart") {
+			let ws = where?[s.profile] ?? [];
+			if (ws.length == 0) { return { ok: false, error: "step " + s.n + ": stop of a profile that isn't running: " + s.profile }; }
+			let w = ws.shift();          // the oldest instance
+			if (ws.length == 0) { where.delete(s.profile); }
+			let u = units[w.uid];
+			u.members.delete(s.profile);
+			if (u.members.keys().length == 0) {
+				for (g in u.mb.keys()) {
+					let k = gpu_key(u.node, g);
+					usage[k] = usage[k] - u.mb[g];
+				}
+				units.delete(w.uid);
+			}
+		}
+		if (s.op == "start" || s.op == "restart") {
+			if (where.has(s.profile) && s?.make_before_break != true) {
+				return { ok: false, error: "step " + s.n + ": start of a running profile " + s.profile };
+			}
+			let du = du_of[s.profile];
+			let uid = "d" + du.uid;
+			if (!units.has(uid)) {
+				units[uid] = { node: du.node_id, mb: du.mb, members: {} };
+				for (g in du.mb.keys()) {
+					let k = gpu_key(du.node_id, g);
+					usage[k] = usage[k] + du.mb[g];
+				}
+			}
+			units[uid].members[s.profile] = true;
+			let port = 0;
+			for (m in du.members) { if (m.profile == s.profile) { port = m.port; } }
+			if (!where.has(s.profile)) { where[s.profile] = []; }
+			where[s.profile].push({ uid: uid, place: du.node_id + "[" + stringify(du.gpus) + "]:" + port });
+		}
+		for (k in usage.keys()) {
+			if (usage[k] > peak[k]) { peak[k] = usage[k]; }
+			if (usage[k] > CAP - MARGIN && usage[k] > before[k]) {
+				return { ok: false, error: "step " + s.n + " (" + s.op + " " + s.profile + ") puts "
+					+ k + " at " + usage[k] + " MB > " + (CAP - MARGIN) };
+			}
+		}
+	}
+	let places = {};
+	for (p in where.keys()) {
+		if (where[p].length != 1) { return { ok: false, error: p + " ends with " + where[p].length + " instances" }; }
+		places[p] = where[p][0].place;
+	}
+	return { ok: true, where: places, peak: peak };
+}
+
+fn goal_places(inp): object {
+	let out = {};
+	for (du in inp.desired) {
+		for (m in du.members) {
+			out[m.profile] = du.node_id + "[" + stringify(du.gpus) + "]:" + m.port;
+		}
+	}
+	return out;
+}
+
+fn sorted_json(m): string {
+	let ks = [];
+	for (k in m.keys()) { ks.push(k); }
+	ks.sort();
+	let parts = [];
+	for (k in ks) { parts.push(k + "=" + m[k]); }
+	return parts.join(", ");
+}
+
+fn ops(plan): string {
+	let parts = [];
+	for (s in plan.steps) { parts.push(s.op + " " + s.profile); }
+	return parts.join(" | ");
+}
+
+// schneewolf, morning of 2026-11-15 (MB from nvidia-smi, rounded)
+export fn schneewolf_input(): object {
+	let N = "schneewolf";
+	return {
+		margin_mb: MARGIN,
+		keep_unlisted: true,
+		gpus: gpus4(N),
+		fixed: {},
+		current: [
+			svc("niku", "image-niku", N, [0], { "0": 4450 }, 18100, "fp-niku"),
+			svc("luna", "luna-spark", N, [0, 1, 2, 3],
+				{ "0": 3950, "1": 2260, "2": 2500, "3": 3300 }, 18091, "fp-luna"),
+			svc("voice", "riko-voice", N, [0], { "0": 900 }, 19300, "fp-voice"),
+			svc("mahou", "chat-mahou", N, [1, 2], { "1": 8350, "2": 7770 }, 18080, "fp-mahou-128k"),
+			svc("fam", "familiar-spark", N, [3], { "3": 10870 }, 18090, "fp-fam"),
+		],
+		desired: [
+			// GPU0: Luna alone (last measured 12 010 MB total, now on one card)
+			want("luna", "luna-spark", N, [0], { "0": 12010 }, 18091, "fp-luna", 25.0),
+			want("voice", "riko-voice", N, [0], { "0": 900 }, 19300, "fp-voice", 60.0),
+			// GPU1: the Riko narrator (not running yet; declared ~11 GB)
+			want("riko", "riko-narrator", N, [1], { "1": 11000 }, 18310, "fp-riko", 25.0),
+			// GPU2: Mahou at 64k (profile patched → new fingerprint)
+			want("mahou", "chat-mahou", N, [2], { "2": 9600 }, 18080, "fp-mahou-64k", 20.0),
+			// GPU3: Familiar stays, Niku joins it
+			want("fam", "familiar-spark", N, [3], { "3": 10870 }, 18090, "fp-fam", 25.0),
+			want("niku", "image-niku", N, [3], { "3": 4450 }, 18100, "fp-niku", 15.0),
+		],
+		patches: [{ profile: "chat-mahou", patch: { intent: { context: 65536 } }, restart: true }],
+	};
+}
+
+export fn register(): null {
+	describe("layout planner: schneewolf 2026-11-15", fn() {
+		test("plan exists, never overflows a card, and reaches the goal", fn() {
+			let inp = schneewolf_input();
+			let plan = plan_layout(inp);
+			ok(plan.ok, "plan failed: " + (plan?.error ?? ""));
+			let r = replay(inp, plan);
+			ok(r.ok, r?.error ?? "");
+			eq(sorted_json(r.where), sorted_json(goal_places(inp)), "end state: " + ops(plan));
+			for (k in r.peak.keys()) {
+				ok(r.peak[k] <= CAP - MARGIN, k + " peaked at " + r.peak[k]);
+			}
+		});
+		test("leaves voice and familiar alone; patches Mahou first", fn() {
+			let plan = plan_layout(schneewolf_input());
+			eq(plan.steps[0].op, "patch_profile");
+			eq(plan.steps[0].profile, "chat-mahou");
+			for (s in plan.steps) {
+				ok(s.profile != "riko-voice" && s.profile != "familiar-spark",
+					"touched an unchanged service: " + ops(plan));
+			}
+			ok(plan.unchanged.contains("riko-voice"));
+			ok(plan.unchanged.contains("familiar-spark"));
+		});
+		test("Mahou leaves GPU1 before the narrator starts there", fn() {
+			let plan = plan_layout(schneewolf_input());
+			let mahou_start = -1;
+			let riko_start = -1;
+			for (s in plan.steps) {
+				if (s.op == "start" && s.profile == "chat-mahou") { mahou_start = s.n; }
+				if (s.op == "start" && s.profile == "riko-narrator") { riko_start = s.n; }
+			}
+			ok(mahou_start > 0 && riko_start > mahou_start, ops(plan));
+		});
+		test("the Niku/Luna deadlock is broken by parking exactly one of them", fn() {
+			let plan = plan_layout(schneewolf_input());
+			let parked = 0;
+			for (s in plan.steps) { if (s?.parked == true) { parked = parked + 1; } }
+			eq(parked, 1, ops(plan));
+		});
+		test("every step carries a projection within capacity − margin", fn() {
+			let plan = plan_layout(schneewolf_input());
+			for (s in plan.steps) {
+				for (k in s.projected_mb.keys()) {
+					ok(s.projected_mb[k] <= CAP - MARGIN,
+						"step " + s.n + " projects " + k + "=" + s.projected_mb[k]);
+				}
+			}
+			ok(plan.downtime.length >= 3, stringify(plan.downtime));
+		});
+		test("ports are preserved", fn() {
+			let plan = plan_layout(schneewolf_input());
+			for (s in plan.steps) {
+				if (s.op == "start" && s.profile == "luna-spark") { eq(s.port, 18091); }
+				if (s.op == "start" && s.profile == "image-niku") { eq(s.port, 18100); }
+			}
+		});
+	});
+
+	describe("layout planner: rules", fn() {
+		test("the current layout is a no-op", fn() {
+			let N = "n";
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: false, gpus: gpus4(N), fixed: { "n:0": 300 },
+				current: [svc("a", "a", N, [0], { "0": 8000 }, 18000, "fa"),
+					svc("b", "b", N, [1, 2], { "1": 5000, "2": 5000 }, 18001, "fb")],
+				desired: [want("a", "a", N, [0], { "0": 8000 }, 18000, "fa", 10.0),
+					want("b", "b", N, [2, 1], { "1": 5000, "2": 5000 }, 18001, "fb", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			ok(plan.ok);
+			ok(plan.noop, ops(plan));
+		});
+		test("infeasible: names the GPU and the overflow", fn() {
+			let N = "n";
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: true, gpus: gpus4(N), fixed: { "n:2": 1000 },
+				current: [svc("a", "a", N, [2], { "2": 9000 }, 18000, "fa")],
+				desired: [want("a", "a", N, [2], { "2": 9000 }, 18000, "fa", 10.0),
+					want("b", "b", N, [2], { "2": 7000 }, 18001, "fb", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			not_ok(plan.ok);
+			eq(plan.overflows.length, 1);
+			eq(plan.overflows[0].gpu, 2);
+			eq(plan.overflows[0].over_by_mb, 9000 + 7000 + 1000 - (CAP - MARGIN));
+			ok(plan.error.find("GPU 2") >= 0, plan.error);
+		});
+		test("keep_unlisted: false stops what the layout doesn't mention, first", fn() {
+			let N = "n";
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: false, gpus: gpus4(N), fixed: {},
+				current: [svc("x", "x", N, [0], { "0": 12000 }, 18000, "fx")],
+				desired: [want("y", "y", N, [0], { "0": 12000 }, 18001, "fy", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			ok(plan.ok, plan?.error ?? "");
+			eq(ops(plan), "stop x | start y");
+			let inp2 = inp;
+			inp2["keep_unlisted"] = true;
+			not_ok(plan_layout(inp2).ok);
+		});
+		test("a profile change in place is one restart step", fn() {
+			let N = "n";
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: true, gpus: gpus4(N), fixed: {},
+				current: [svc("a", "a", N, [1], { "1": 14000 }, 18000, "old")],
+				desired: [want("a", "a", N, [1], { "1": 9000 }, 18000, "new", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			eq(ops(plan), "restart a");
+			eq(plan.steps[0].from.port, 18000);
+		});
+		test("a move to another node starts the new copy first (no downtime)", fn() {
+			let gpus = [{ node_id: "n1", index: 0, total_mb: CAP }, { node_id: "n2", index: 0, total_mb: CAP }];
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: true, gpus: gpus, fixed: {},
+				current: [svc("a", "a", "n1", [0], { "0": 9000 }, 18000, "fa")],
+				desired: [want("a", "a", "n2", [0], { "0": 9000 }, 18000, "fa", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			eq(ops(plan), "start a | stop a");
+			ok(plan.steps[0]?.make_before_break == true);
+			eq(plan.downtime.length, 0);
+		});
+		test("swapping two services' ports orders the stops before the starts", fn() {
+			let N = "n";
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: true, gpus: gpus4(N), fixed: {},
+				current: [svc("a", "a", N, [0], { "0": 1000 }, 18000, "fa"),
+					svc("b", "b", N, [1], { "1": 1000 }, 18001, "fb")],
+				desired: [want("a", "a", N, [0], { "0": 1000 }, 18001, "fa", 10.0),
+					want("b", "b", N, [1], { "1": 1000 }, 18000, "fb", 10.0)],
+			};
+			let plan = plan_layout(inp);
+			ok(plan.ok, plan?.error ?? "");
+			let r = replay(inp, plan);
+			ok(r.ok, r?.error ?? "");
+			eq(sorted_json(r.where), sorted_json(goal_places(inp)), ops(plan));
+		});
+		test("shared group: second member's join restarts the server once", fn() {
+			let N = "n";
+			let share_l = { adapters: ["/l.gguf"], slots: 2, ctx_per_slot: 32768 };
+			let share_f = { adapters: [], slots: 2, ctx_per_slot: 32768 };
+			let inp = {
+				margin_mb: MARGIN, keep_unlisted: true, gpus: gpus4(N), fixed: {},
+				current: [svc("l", "luna", N, [0, 1], { "0": 6000, "1": 6000 }, 18091, "fl"),
+					svc("f", "fam", N, [3], { "3": 10870 }, 18090, "ff")],
+				desired: [{ uid: "g", kind: "shared", group: "spark", node_id: N, gpus: [0],
+					mb: { "0": 13000 }, source: "test",
+					members: [{ profile: "luna", port: 18091, fp: "fl", startup_s: 20.0, share: share_l },
+						{ profile: "fam", port: 18090, fp: "ff", startup_s: 20.0, share: share_f }] }],
+			};
+			let plan = plan_layout(inp);
+			ok(plan.ok, plan?.error ?? "");
+			let restarts = 0;
+			for (s in plan.steps) { if (s?.restarts_shared == true) { restarts = restarts + 1; } }
+			eq(restarts, 1, ops(plan));
+			let r = replay(inp, plan);
+			ok(r.ok, r?.error ?? "");
+		});
+	});
+
+	describe("layout helpers", fn() {
+		test("merge_patch: nested merge, null deletes, arrays replace", fn() {
+			let p = { binary: "llama-server", intent: { context: 131072, gpu_layers: 99 },
+				extra_flags: ["--jinja"], pin: { node_id: "a", gpus: [0] } };
+			let m = merge_patch(p, { intent: { context: 65536 }, extra_flags: [], pin: null });
+			eq(m.intent.context, 65536);
+			eq(m.intent.gpu_layers, 99);
+			eq(m.extra_flags.length, 0);
+			not_ok(m.has("pin"));
+			eq(p.intent.context, 131072);
+		});
+		test("spread_mb splits evenly, remainder on the first GPU", fn() {
+			eq(stringify(spread_mb(10, [3, 1])), "{\"1\":5,\"3\":5}");
+			eq(stringify(spread_mb(11, [0, 1])), "{\"0\":6,\"1\":5}");
+			eq(stringify(spread_mb(500, [])), "{}");
+		});
+		test("validate_layout_request", fn() {
+			ok(validate_layout_request({}) != null);
+			ok(validate_layout_request({ desired: [{ profile: "a", node_id: "n", gpus: [0] },
+				{ profile: "a", node_id: "n", gpus: [1] }] }).find("twice") >= 0);
+			ok(validate_layout_request({ desired: [
+				{ profile: "a", node_id: "n", gpus: [0], port: 18000 },
+				{ profile: "b", node_id: "n", gpus: [1], port: 18000 }] }).find("port 18000") >= 0);
+			eq(validate_layout_request({ desired: [{ profile: "a", node_id: "n", gpus: [0],
+				port: 18000, vram_mb: 9000 }] }), null);
+			ok(same_gpus([2, 1], [1, 2]));
+		});
+	});
+	return null;
+}

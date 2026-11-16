@@ -1117,3 +1117,55 @@ export fn render_bench(rows): string {
 	html = html + "</tbody></table>";
 	return html;
 }
+
+// ── GPU layout view ─────────────────────────────────────────────────
+// GET /ui/layout: one bar per GPU, a segment per service sized by its
+// MEASURED memory (heartbeat), then "other" (processes that aren't ours +
+// driver overhead), then free. The same numbers GET /api/layout and the
+// layout planner use. view: [{ node_id, gpus: [{ index, name, total_mb,
+// used_mb, other_mb, services: [{ profile, port, mb, members? }] }] }]
+export fn render_layout(view): string {
+	if (view.length == 0) {
+		return "<p class=\"empty\">No GPU nodes reporting measurements.</p>";
+	}
+	let html = "<div class=\"layout-view\">\n";
+	for (n in view) {
+		html = html + "<div class=\"layout-node\"><h3>" + esc(n.node_id) + "</h3>\n";
+		if (n.gpus.length == 0) {
+			html = html + "<p class=\"meta\">no GPUs</p>";
+		}
+		for (g in n.gpus) {
+			let total = i32(g?.total_mb ?? 0);
+			if (total <= 0) { continue; }
+			let used = i32(g?.used_mb ?? 0);
+			html = html + "<div class=\"layout-row\"><div class=\"layout-label\">GPU " + g.index
+				+ "<span class=\"meta\"> " + fmt_mb(used) + " / " + fmt_mb(total) + "</span></div>"
+				+ "<div class=\"layout-bar\" role=\"img\" aria-label=\"GPU " + g.index + " "
+				+ used + " of " + total + " MB used\">";
+			let ci = 0;
+			for (s in (g?.services ?? [])) {
+				let mb = i32(s?.mb ?? 0);
+				if (mb <= 0) { continue; }
+				let w = f64(mb) * 100.0 / f64(total);
+				let name = "" + s.profile;
+				if (s?.members != null && s.members.length > 0) {
+					name = name + " (" + s.members.join(", ") + ")";
+				}
+				let tip = name + " :" + s.port + " — " + mb + " MB";
+				html = html + "<div class=\"layout-seg seg-" + (ci % 6) + "\" style=\"width:"
+					+ i32(w * 10.0) / 10.0 + "%\" title=\"" + esc(tip) + "\"><span>" + esc(name)
+					+ "</span></div>";
+				ci = ci + 1;
+			}
+			let other = i32(g?.other_mb ?? 0);
+			if (other > 0) {
+				let w = f64(other) * 100.0 / f64(total);
+				html = html + "<div class=\"layout-seg seg-other\" style=\"width:" + i32(w * 10.0) / 10.0
+					+ "%\" title=\"other processes + driver: " + other + " MB\"><span>other</span></div>";
+			}
+			html = html + "</div><div class=\"layout-free meta\">" + fmt_mb(total - used) + " free</div></div>\n";
+		}
+		html = html + "</div>\n";
+	}
+	return html + "</div>";
+}

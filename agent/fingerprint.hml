@@ -41,6 +41,26 @@ export fn canonical_json(v): string {
 	return stringify(v);
 }
 
+// A tree copy of a JSON-able value. Hemlock's stringify() reports ANY
+// object reached twice as a "circular reference" — even a map simply
+// shared by two entries (hemlock 2.16.0) — so values assembled from shared
+// parts go through this before being serialized.
+export fn json_tree(v) {
+	let t = typeof(v);
+	if (t == "object") {
+		if (v == null) { return null; }
+		let o = {};
+		for (k in v.keys()) { o[k] = json_tree(v[k]); }
+		return o;
+	}
+	if (t == "array") {
+		let a = [];
+		for (x in v) { a.push(json_tree(x)); }
+		return a;
+	}
+	return v;
+}
+
 // 16 hex chars of sha256 over the process-shaping fields. Absent and null
 // fields are treated alike; an empty extra_flags equals a missing one.
 export fn profile_fingerprint(prof): string {

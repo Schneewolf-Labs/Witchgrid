@@ -1216,3 +1216,47 @@ p.note-lg { margin: 0 0 0.75rem; }
   .hf-card { flex-direction: column; }
   .hf-card-art { width: 100%; height: auto; max-height: 240px; }
 }
+
+/* GPU layout view (/ui/layout): one bar per card, a segment per service */
+.layout-view { display: grid; gap: 1rem; }
+.layout-node h3 { font-size: 0.95rem; margin: 0 0 0.4rem; color: var(--fg-2); }
+.layout-row {
+  display: grid;
+  grid-template-columns: minmax(7rem, 11rem) 1fr 5.5rem;
+  gap: 0.6rem;
+  align-items: center;
+  margin-bottom: 0.35rem;
+}
+.layout-label { font-size: 0.82rem; white-space: nowrap; }
+.layout-bar {
+  display: flex;
+  height: 1.5rem;
+  background: var(--bg-3);
+  border-radius: 4px;
+  overflow: hidden;
+  min-width: 0;
+}
+.layout-seg {
+  height: 100%;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 0.72rem;
+  line-height: 1.5rem;
+  padding: 0 0.35rem;
+  color: var(--bg-base);
+  border-right: 1px solid var(--bg-base);
+  min-width: 2px;
+}
+.layout-seg span { overflow: hidden; text-overflow: ellipsis; display: block; }
+.seg-0 { background: var(--accent); }
+.seg-1 { background: var(--brand); }
+.seg-2 { background: var(--ok); }
+.seg-3 { background: var(--warn); }
+.seg-4 { background: #7dcfff; }
+.seg-5 { background: #ff9e64; }
+.seg-other { background: var(--fg-dim); color: var(--fg-1); }
+.layout-free { font-size: 0.78rem; text-align: right; white-space: nowrap; }
+@media (max-width: 600px) {
+  .layout-row { grid-template-columns: 1fr; gap: 0.2rem; }
+  .layout-free { text-align: left; }
+}

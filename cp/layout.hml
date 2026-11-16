@@ -1,0 +1,840 @@
+// layout.hml — the declarative-layout planner (pure; no DB, no HTTP).
+//
+// Given the fleet as it is (current units with measured VRAM per GPU) and
+// the layout the operator wants (desired units with estimated VRAM per
+// GPU), produce an ORDERED list of steps — patch_profile, stop, start,
+// restart — such that projected per-GPU usage never exceeds
+// (capacity − margin) after any step, touching only what changes and
+// keeping ports. cp.hml builds the inputs (measurements, estimates,
+// profile fingerprints) and executes the steps; this file only decides.
+//
+// Model
+//   A *unit* is one process holding GPU memory: a dedicated service (one
+//   member: its profile) or a shared-LoRA server (members: the profiles it
+//   serves). A unit's memory is freed when its last member stops; a
+//   member joining a running shared server adds max(0, desired − current)
+//   per GPU. "stopping" units (a process that outlived SIGKILL) have no
+//   members, hold their memory and ports, and are never touched.
+//
+//   current: [{ uid, kind: "service"|"shared"|"stopping", node_id, gpus,
+//               mb: {"<gpu>": MB}, group?, config?: {adapters, slots,
+//               ctx_per_slot}, ports?: [int],
+//               members: [{ profile, port, id, fp, model_path? }] }]
+//   desired: [{ uid, kind: "service"|"shared", node_id, gpus,
+//               mb: {"<gpu>": MB}, source, group?,
+//               members: [{ profile, port, fp, startup_s, share?: {adapters,
+//                           slots, ctx_per_slot} }] }]
+//   gpus:    [{ node_id, index, total_mb }]
+//   fixed:   { "<node>:<gpu>": MB }  — memory nobody in `current` owns
+//            (other users' processes, driver/context overhead)
+//   patches: [{ profile, patch, restart }]  — emitted first, in order
+//   margin_mb, keep_unlisted
+//
+// Ordering (greedy, deterministic)
+//   1. profile patches (they only affect the next spawn);
+//   2. stops of services not in the layout (keep_unlisted: false) and of
+//      extra instances of listed profiles — they only free memory;
+//   3. repeatedly, among pending changes (start / move / restart) that fit
+//      right now, run the one that unblocks the most other pending
+//      changes ("move the blockers first"), ties in request order. A move
+//      to another node (or another port) starts the new copy before
+//      stopping the old one when it fits (no downtime); otherwise the old
+//      copy is stopped right before the new one starts (same port).
+//   4. nothing fits: park (stop without restarting yet) the old copy of a
+//      pending change whose removal lets something else fit, preferring
+//      the cheapest unblock; its start comes later.
+//   The end state is checked first: if it doesn't fit, the result is an
+//   error naming each GPU and by how much it overflows.
+
+import { stringify } from "@stdlib/json";
+
+// ── small helpers ───────────────────────────────────────────────────
+
+export fn gpu_key(node_id, idx): string {
+	return "" + node_id + ":" + idx;
+}
+
+fn ival(v): i32 {
+	if (v == null) { return 0; }
+	return i32(v);
+}
+
+fn copy_map(m): object {
+	let o = {};
+	if (m == null) { return o; }
+	for (k in m.keys()) { o[k] = m[k]; }
+	return o;
+}
+
+export fn sorted_ints(a): array {
+	let c = [];
+	if (a == null) { return c; }
+	for (x in a) { c.push(i32(x)); }
+	c.sort(fn(x, y) { return x - y; });
+	return c;
+}
+
+export fn same_gpus(a, b): bool {
+	let x = sorted_ints(a);
+	let y = sorted_ints(b);
+	if (x.length != y.length) { return false; }
+	let i = 0;
+	while (i < x.length) {
+		if (x[i] != y[i]) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// Spread `total` MB over `gpus` evenly (remainder on the first) as a
+// {"<gpu>": MB} map.
+export fn spread_mb(total, gpus): object {
+	let out = {};
+	let g = sorted_ints(gpus);
+	if (g.length == 0) { return out; }
+	let t = ival(total);
+	let each = t / g.length;
+	let each_i = i32(each);
+	let rem = t - each_i * g.length;
+	let i = 0;
+	while (i < g.length) {
+		out["" + g[i]] = each_i + (i == 0 ? rem : 0);
+		i = i + 1;
+	}
+	return out;
+}
+
+export fn mb_total(m): i32 {
+	let t = 0;
+	if (m == null) { return 0; }
+	for (k in m.keys()) { t = t + ival(m[k]); }
+	return t;
+}
+
+// JSON merge patch (RFC 7386): objects merge recursively, null deletes a
+// key, anything else (arrays included) replaces. Returns a new object.
+export fn merge_patch(target, patch) {
+	if (patch == null || typeof(patch) != "object") { return patch; }
+	let out = {};
+	if (target != null && typeof(target) == "object") {
+		for (k in target.keys()) { out[k] = target[k]; }
+	}
+	for (k in patch.keys()) {
+		let v = patch[k];
+		if (v == null) {
+			if (out.has(k)) { out.delete(k); }
+		} else if (typeof(v) == "object") {
+			out[k] = merge_patch(out?[k], v);
+		} else {
+			out[k] = v;
+		}
+	}
+	return out;
+}
+
+// ── request validation ──────────────────────────────────────────────
+
+fn is_int(v): bool {
+	let t = typeof(v);
+	return t == "i32" || t == "i64" || t == "i16" || t == "i8"
+		|| t == "u8" || t == "u16" || t == "u32" || t == "u64";
+}
+
+// Shape check of a layout request body (plan/apply). Returns an error
+// string or null. Semantics (profiles exist, nodes live) are cp.hml's.
+export fn validate_layout_request(body) {
+	if (body == null || typeof(body) != "object") { return "body must be a JSON object"; }
+	let d = body?.desired;
+	if (d == null || typeof(d) != "array") {
+		return "desired must be an array of { profile, node_id, gpus, port? }";
+	}
+	let seen = {};
+	let ports = {};
+	let i = 0;
+	while (i < d.length) {
+		let e = d[i];
+		let where = "desired[" + i + "]";
+		if (e == null || typeof(e) != "object") { return where + " must be an object"; }
+		if (e?.profile == null || typeof(e.profile) != "string" || e.profile.length == 0) {
+			return where + ".profile (string) is required";
+		}
+		if (seen.has(e.profile)) {
+			return "profile '" + e.profile + "' is listed twice (one instance per profile)";
+		}
+		seen[e.profile] = true;
+		if (e?.node_id == null || typeof(e.node_id) != "string" || e.node_id.length == 0) {
+			return where + ".node_id (string) is required";
+		}
+		if (e?.gpus == null || typeof(e.gpus) != "array") {
+			return where + ".gpus must be an array of GPU indices ([] = CPU)";
+		}
+		for (g in e.gpus) {
+			if (!is_int(g) || g < 0 || g > 255) { return where + ".gpus must hold GPU indices"; }
+		}
+		if (e?.port != null) {
+			if (!is_int(e.port) || e.port < 1024 || e.port > 65535) {
+				return where + ".port must be an integer 1024-65535";
+			}
+			let pk = e.node_id + ":" + e.port;
+			if (ports.has(pk)) {
+				return "port " + e.port + " on " + e.node_id + " is used by both '"
+					+ ports[pk] + "' and '" + e.profile + "'";
+			}
+			ports[pk] = e.profile;
+		}
+		if (e?.vram_mb != null) {
+			let vt = typeof(e.vram_mb);
+			if (!(is_int(e.vram_mb) && e.vram_mb >= 0) && vt != "object") {
+				return where + ".vram_mb must be MB (integer, whole service) or {\"<gpu>\": MB}";
+			}
+		}
+		i = i + 1;
+	}
+	let pp = body?.profile_patches;
+	if (pp != null && typeof(pp) != "object") {
+		return "profile_patches must be an object { profile: patch }";
+	}
+	if (body?.margin_mb != null && (!is_int(body.margin_mb) || body.margin_mb < 0)) {
+		return "margin_mb must be a non-negative integer";
+	}
+	return null;
+}
+
+// ── simulation state ────────────────────────────────────────────────
+
+fn new_unit(uid, kind, node_id, gpus, mb, group) {
+	return { uid: uid, kind: kind, node_id: node_id, gpus: sorted_ints(gpus),
+		mb: copy_map(mb), group: group, members: {}, du: null, config: null,
+		slots_in_use: 0, cps_in_use: 0 };
+}
+
+fn clone_unit(u) {
+	let c = new_unit(u.uid, u.kind, u.node_id, u.gpus, u.mb, u.group);
+	c["members"] = copy_map(u.members);
+	c["du"] = u.du;
+	c["config"] = u.config;
+	c["slots_in_use"] = u.slots_in_use;
+	c["cps_in_use"] = u.cps_in_use;
+	return c;
+}
+
+fn clone_state(st) {
+	let live = {};
+	for (k in st.live.keys()) { live[k] = clone_unit(st.live[k]); }
+	return { usage: copy_map(st.usage), live: live, where: copy_map(st.where),
+		ports: copy_map(st.ports) };
+}
+
+fn add_mb(st, node_id, mb, sign: i32): null {
+	for (g in mb.keys()) {
+		let k = gpu_key(node_id, g);
+		st.usage[k] = ival(st.usage?[k]) + sign * ival(mb[g]);
+	}
+	return null;
+}
+
+// Stop `profile` (its live member). Frees the unit when it was the last
+// member. Returns the unit uid it was in (or null).
+fn sim_stop(st, profile: string) {
+	let uid = st.where?[profile];
+	if (uid == null) { return null; }
+	let u = st.live?[uid];
+	st.where.delete(profile);
+	if (u == null) { return uid; }
+	let m = u.members?[profile];
+	if (m != null) {
+		if (m?.port != null) {
+			let pk = gpu_key(u.node_id, m.port);
+			if (st.ports?[pk] == profile) { st.ports.delete(pk); }
+		}
+		u.members.delete(profile);
+		if (m?.share != null) { u["slots_in_use"] = u.slots_in_use - ival(m.share?.slots); }
+	}
+	if (u.members.keys().length == 0 && u.kind != "stopping") {
+		add_mb(st, u.node_id, u.mb, -1);
+		st.live.delete(uid);
+	}
+	return uid;
+}
+
+// Would a start of member `dm` (of desired unit `du`) need the shared
+// server to restart? Returns { restarts, config }.
+fn join_config(u, dm) {
+	let sh = dm?.share;
+	if (sh == null || u.config == null) { return { restarts: false, config: u.config }; }
+	let cur = u.config;
+	let want_adapters = [];
+	for (a in (cur?.adapters ?? [])) { want_adapters.push(a); }
+	let missing = false;
+	for (a in (sh?.adapters ?? [])) {
+		if (!want_adapters.contains(a)) { want_adapters.push(a); missing = true; }
+	}
+	let want_slots = u.slots_in_use + ival(sh?.slots);
+	let want_cps = u.cps_in_use;
+	if (ival(sh?.ctx_per_slot) > want_cps) { want_cps = ival(sh.ctx_per_slot); }
+	let covered = !missing && want_slots <= ival(cur?.slots) && want_cps <= ival(cur?.ctx_per_slot);
+	if (covered) { return { restarts: false, config: cur }; }
+	return { restarts: true, config: { adapters: want_adapters, slots: want_slots,
+		ctx_per_slot: want_cps } };
+}
+
+// Start member dm of desired unit du. Returns { uid, joined, restarts,
+// reload_members }.
+fn sim_start(st, du, dm) {
+	let target = null;
+	for (k in st.live.keys()) {
+		if (st.live[k].du == du.uid) { target = st.live[k]; break; }
+	}
+	let res = { uid: null, joined: false, restarts: false, reload_members: [] };
+	if (target == null) {
+		target = new_unit("d:" + du.uid, du.kind, du.node_id, du.gpus, du.mb, du?.group);
+		target["du"] = du.uid;
+		if (dm?.share != null) {
+			target["config"] = { adapters: dm.share?.adapters ?? [], slots: ival(dm.share?.slots),
+				ctx_per_slot: ival(dm.share?.ctx_per_slot) };
+		}
+		st.live[target.uid] = target;
+		add_mb(st, target.node_id, target.mb, 1);
+	} else {
+		res["joined"] = true;
+		// The unit grows to the desired size if that's bigger than what it
+		// holds now (a shared server restarted with more slots/adapters).
+		let grown = copy_map(target.mb);
+		let delta = {};
+		for (g in du.mb.keys()) {
+			let want = ival(du.mb[g]);
+			let have = ival(target.mb?[g]);
+			if (want > have) { delta[g] = want - have; grown[g] = want; }
+		}
+		add_mb(st, target.node_id, delta, 1);
+		target["mb"] = grown;
+		let jc = join_config(target, dm);
+		if (jc.restarts) {
+			res["restarts"] = true;
+			for (p in target.members.keys()) { res.reload_members.push(p); }
+			target["config"] = jc.config;
+		}
+	}
+	target.members[dm.profile] = dm;
+	if (dm?.share != null) {
+		target["slots_in_use"] = target.slots_in_use + ival(dm.share?.slots);
+		if (ival(dm.share?.ctx_per_slot) > target.cps_in_use) {
+			target["cps_in_use"] = ival(dm.share.ctx_per_slot);
+		}
+	}
+	st.where[dm.profile] = target.uid;
+	if (dm?.port != null) { st.ports[gpu_key(du.node_id, dm.port)] = dm.profile; }
+	res["uid"] = target.uid;
+	return res;
+}
+
+// Is the port free on that node in this state (or held by `profile`)?
+fn port_free(st, node_id, port, profile: string): bool {
+	if (port == null) { return true; }
+	let holder = st.ports?[gpu_key(node_id, port)];
+	return holder == null || holder == profile;
+}
+
+// usable = capacity − margin. A state is acceptable when no GPU touched by
+// the step went over usable — or, for a GPU that was already over before
+// (measured state can start above the margin), didn't go up.
+fn within(st_before, st_after, cap, margin: i32): bool {
+	for (k in st_after.usage.keys()) {
+		let after = ival(st_after.usage[k]);
+		let before = ival(st_before.usage?[k]);
+		if (after <= before) { continue; }
+		if (!cap.has(k)) { continue; }
+		if (after > ival(cap[k]) - margin) { return false; }
+	}
+	return true;
+}
+
+// ── the planner ─────────────────────────────────────────────────────
+
+fn projection(st, cap): object {
+	let out = {};
+	let keys = [];
+	for (k in cap.keys()) { keys.push(k); }
+	keys.sort();
+	for (k in keys) { out[k] = ival(st.usage?[k]); }
+	return out;
+}
+
+fn find_du(desired, uid) {
+	for (d in desired) { if (d.uid == uid) { return d; } }
+	return null;
+}
+
+// Try change `a` in state st; mode "mbb" (start new, then stop old) or
+// "bbm" (stop old if still running, then start). Returns the new state
+// + start result, or null when it doesn't fit / the port is taken.
+fn try_change(st, a, mode: string, cap, margin: i32) {
+	let t = clone_state(st);
+	let old_running = (a.old != null && t.where.has(a.profile));
+	if (mode == "mbb") {
+		if (!old_running) { return null; }
+		// the old copy keeps its port; the new one must be elsewhere
+		if (a.old.node_id == a.du.node_id && a.old.port == a.dm.port) { return null; }
+		// the profile's member entry moves: start under a temp name, then
+		// rename by stopping the old one.
+		let before = clone_state(t);
+		let held = t.where[a.profile];
+		t.where.delete(a.profile);
+		if (!port_free(t, a.du.node_id, a.dm.port, a.profile)) { return null; }
+		let sr = sim_start(t, a.du, a.dm);
+		if (!within(before, t, cap, margin)) { return null; }
+		// stop the old copy (its unit loses this member)
+		let ou = t.live?[held];
+		if (ou != null) {
+			let om = ou.members?[a.profile];
+			if (om != null && om?.port != null) {
+				let pk = gpu_key(ou.node_id, om.port);
+				if (t.ports?[pk] == a.profile) { t.ports.delete(pk); }
+			}
+			ou.members.delete(a.profile);
+			if (ou.members.keys().length == 0 && ou.kind != "stopping") {
+				add_mb(t, ou.node_id, ou.mb, -1);
+				t.live.delete(held);
+			}
+		}
+		// the new start registered the profile's port again; restore it
+		if (a.dm?.port != null) { t.ports[gpu_key(a.du.node_id, a.dm.port)] = a.profile; }
+		return { state: t, start: sr, stopped_old: true };
+	}
+	let stopped = false;
+	if (old_running) { sim_stop(t, a.profile); stopped = true; }
+	if (!port_free(t, a.du.node_id, a.dm.port, a.profile)) { return null; }
+	let mid = clone_state(t);
+	let sr = sim_start(t, a.du, a.dm);
+	if (!within(mid, t, cap, margin)) { return null; }
+	// the stop half never makes anything worse; only the start is checked
+	return { state: t, start: sr, stopped_old: stopped };
+}
+
+fn est_of(a): f64 {
+	let s = a.dm?.startup_s;
+	if (s == null) { return 30.0; }
+	return f64(s);
+}
+
+let STOP_EST_S: f64 = 3.0;
+
+// How many other pending changes fit (in either mode) in state st.
+fn count_fitting(st, pending, skip: i32, cap, margin: i32): i32 {
+	let n = 0;
+	let i = 0;
+	while (i < pending.length) {
+		if (i != skip) {
+			let p = pending[i];
+			if (try_change(st, p, "bbm", cap, margin) != null) { n = n + 1; }
+			else if (try_change(st, p, "mbb", cap, margin) != null) { n = n + 1; }
+		}
+		i = i + 1;
+	}
+	return n;
+}
+
+fn step_base(op: string, a) {
+	return { op: op, profile: a.profile };
+}
+
+export fn plan_layout(inp): object {
+	let margin = ival(inp?.margin_mb ?? 512);
+	let keep_unlisted = (inp?.keep_unlisted ?? true) == true;
+	let cap = {};
+	for (g in (inp?.gpus ?? [])) { cap[gpu_key(g.node_id, g.index)] = ival(g.total_mb); }
+
+	// ── initial state ──
+	let st = { usage: {}, live: {}, where: {}, ports: {} };
+	for (k in cap.keys()) { st.usage[k] = 0; }
+	let fixed = inp?.fixed ?? {};
+	for (k in fixed.keys()) { st.usage[k] = ival(st.usage?[k]) + ival(fixed[k]); }
+
+	let current = inp?.current ?? [];
+	let desired = inp?.desired ?? [];
+	// profile → { unit uid, member } for its (first) running instance;
+	// further instances of the same profile are extras.
+	let cur_by_profile = {};
+	let extras = [];
+	for (cu in current) {
+		let u = new_unit("c:" + cu.uid, cu.kind, cu.node_id, cu.gpus ?? [], cu.mb ?? {}, cu?.group);
+		if (cu?.config != null) { u["config"] = cu.config; }
+		for (m in (cu?.members ?? [])) {
+			if (cur_by_profile.has(m.profile)) {
+				extras.push({ profile: m.profile, unit: u.uid, m: m, cu: cu });
+				if (m?.port != null) { st.ports[gpu_key(cu.node_id, m.port)] = "(extra) " + m.profile; }
+				continue;
+			}
+			u.members[m.profile] = m;
+			if (m?.share != null) {
+				u["slots_in_use"] = u.slots_in_use + ival(m.share?.slots);
+				if (ival(m.share?.ctx_per_slot) > u.cps_in_use) { u["cps_in_use"] = ival(m.share.ctx_per_slot); }
+			}
+			cur_by_profile[m.profile] = { unit: u.uid, m: m, cu: cu };
+			st.where[m.profile] = u.uid;
+			if (m?.port != null) { st.ports[gpu_key(cu.node_id, m.port)] = m.profile; }
+		}
+		for (p in (cu?.ports ?? [])) { st.ports[gpu_key(cu.node_id, p)] = "(stopping)"; }
+		st.live[u.uid] = u;
+		add_mb(st, u.node_id, u.mb, 1);
+	}
+	let initial = clone_state(st);
+
+	// desired member index + shared correspondence (same group, node, GPU
+	// set, and no listed member of the server changes its fingerprint)
+	let listed = {};
+	for (du in desired) {
+		for (dm in du.members) { listed[dm.profile] = du.uid; }
+		if (du.kind != "shared") { continue; }
+		for (cu in current) {
+			if (cu.kind != "shared" || cu?.group != du?.group) { continue; }
+			if (cu.node_id != du.node_id || !same_gpus(cu.gpus, du.gpus)) { continue; }
+			let ok = true;
+			for (cm in (cu?.members ?? [])) {
+				for (dm in du.members) {
+					if (dm.profile == cm.profile && dm.fp != cm.fp && (cm?.fp ?? "") != "") { ok = false; }
+				}
+			}
+			if (!ok) { continue; }
+			let lu = st.live?["c:" + cu.uid];
+			if (lu != null && lu.du == null) { lu["du"] = du.uid; break; }
+		}
+	}
+
+	// ── classify ──
+	let changes = [];      // pending start/move/restart
+	let pure_stops = [];   // { profile, reason, m, cu }
+	let unchanged = [];
+	let warnings = [];
+	for (du in desired) {
+		for (dm in du.members) {
+			let cur = cur_by_profile?[dm.profile];
+			if (cur == null) {
+				changes.push({ kind: "start", profile: dm.profile, du: du, dm: dm, old: null });
+				continue;
+			}
+			let cu = cur.cu;
+			let lu = st.live[cur.unit];
+			let same_place = (cu.node_id == du.node_id && same_gpus(cu.gpus ?? [], du.gpus)
+				&& ival(cur.m.port) == ival(dm.port));
+			let same_kind = false;
+			if (du.kind == "service") { same_kind = (cu.kind == "service"); }
+			else { same_kind = (cu.kind == "shared" && lu.du == du.uid); }
+			let old = { node_id: cu.node_id, gpus: cu.gpus ?? [], port: cur.m.port,
+				service_id: cur.m?.id, model_path: cur.m?.model_path, kind: cu.kind };
+			// An agent too old to stamp fingerprints reports "": treat as
+			// unchanged (restarting everything on a CP-first upgrade would be
+			// worse) and say so.
+			let fp_same = (cur.m.fp == dm.fp);
+			if ((cur.m?.fp ?? "") == "") {
+				fp_same = true;
+				warnings.push(dm.profile + ": its agent doesn't report profile fingerprints "
+					+ "(older agent) — profile changes won't restart it; upgrade the agent");
+			}
+			if (same_place && same_kind && fp_same) {
+				if (du.kind == "service") { lu["du"] = du.uid; }
+				unchanged.push(dm.profile);
+				continue;
+			}
+			let kind = "move";
+			if (same_place && du.kind == "service" && cu.kind == "service") { kind = "restart"; }
+			let why = "";
+			if (!fp_same) { why = "profile change"; }
+			if (!same_place) {
+				why = (why.length > 0 ? why + ", " : "") + "placement "
+					+ cu.node_id + "[" + sorted_ints(cu.gpus ?? []).join(",") + "]:" + cur.m.port
+					+ " → " + du.node_id + "[" + sorted_ints(du.gpus).join(",") + "]:" + dm.port;
+			}
+			if (why.length == 0) { why = "joins/leaves a shared server"; }
+			changes.push({ kind: kind, profile: dm.profile, du: du, dm: dm, old: old, why: why });
+		}
+	}
+	for (p in cur_by_profile.keys()) {
+		if (listed.has(p)) { continue; }
+		if (keep_unlisted) { continue; }
+		let cur = cur_by_profile[p];
+		pure_stops.push({ profile: p, reason: "not in the layout", m: cur.m, cu: cur.cu });
+	}
+	for (x in extras) {
+		if (keep_unlisted && !listed.has(x.profile)) { continue; }
+		pure_stops.push({ profile: x.profile, reason: "extra instance", m: x.m, cu: x.cu, extra_unit: x.unit });
+	}
+
+	// ── end state must fit ──
+	let fin = clone_state(st);
+	for (ps in pure_stops) {
+		if (ps?.extra_unit != null) {
+			let eu = fin.live?[ps.extra_unit];
+			if (eu != null && eu.members.keys().length == 0 && eu.kind != "stopping") {
+				add_mb(fin, eu.node_id, eu.mb, -1);
+				fin.live.delete(ps.extra_unit);
+			}
+			continue;
+		}
+		sim_stop(fin, ps.profile);
+	}
+	for (c in changes) { if (c.old != null) { sim_stop(fin, c.profile); } }
+	for (c in changes) { sim_start(fin, c.du, c.dm); }
+	let overflows = [];
+	let fkeys = [];
+	for (k in cap.keys()) { fkeys.push(k); }
+	fkeys.sort();
+	for (k in fkeys) {
+		let used = ival(fin.usage?[k]);
+		let usable = ival(cap[k]) - margin;
+		if (used > usable) {
+			let holders = [];
+			let held = 0;
+			for (uk in fin.live.keys()) {
+				let u = fin.live[uk];
+				for (g in u.mb.keys()) {
+					if (gpu_key(u.node_id, g) != k || ival(u.mb[g]) <= 0) { continue; }
+					let names = [];
+					for (p in u.members.keys()) { names.push(p); }
+					if (names.length == 0) { names.push("(stopping process)"); }
+					let src = "measured";
+					if (u.du != null) {
+						let d = find_du(desired, u.du);
+						if (d != null && u.uid == "d:" + d.uid) { src = d?.source ?? "estimate"; }
+					}
+					holders.push({ profiles: names, mb: ival(u.mb[g]), source: src });
+					held = held + ival(u.mb[g]);
+				}
+			}
+			let colon = k.find(":");
+			overflows.push({
+				node_id: k.substr(0, colon), gpu: i32(k.substr(colon + 1, k.length - colon - 1)),
+				projected_mb: used, capacity_mb: ival(cap[k]), margin_mb: margin,
+				usable_mb: usable, over_by_mb: used - usable,
+				other_mb: used - held, holders: holders,
+			});
+		}
+	}
+	if (overflows.length > 0) {
+		let parts = [];
+		for (o in overflows) {
+			parts.push(o.node_id + " GPU " + o.gpu + " by " + o.over_by_mb + " MB ("
+				+ o.projected_mb + " of " + o.usable_mb + " usable)");
+		}
+		return { ok: false, error: "infeasible: the layout overflows " + parts.join("; "),
+			overflows: overflows, final_mb: projection(fin, cap) };
+	}
+
+	// ── order ──
+	let steps = [];
+	for (pt in (inp?.patches ?? [])) {
+		steps.push({ op: "patch_profile", profile: pt.profile, patch: pt.patch,
+			restart: pt?.restart == true, est_s: 0.0, projected_mb: projection(st, cap) });
+	}
+	for (ps in pure_stops) {
+		if (ps?.extra_unit != null) {
+			let eu = st.live?[ps.extra_unit];
+			if (ps.m?.port != null) { st.ports.delete(gpu_key(ps.cu.node_id, ps.m.port)); }
+			if (eu != null) {
+				eu.members.delete(ps.profile);
+				if (eu.members.keys().length == 0 && eu.kind != "stopping") {
+					add_mb(st, eu.node_id, eu.mb, -1);
+					st.live.delete(ps.extra_unit);
+				}
+			}
+		} else {
+			sim_stop(st, ps.profile);
+		}
+		steps.push({ op: "stop", profile: ps.profile, node_id: ps.cu.node_id,
+			gpus: sorted_ints(ps.cu.gpus ?? []), port: ps.m?.port, service_id: ps.m?.id,
+			reason: ps.reason, est_s: STOP_EST_S, projected_mb: projection(st, cap) });
+	}
+
+	let pending = [];
+	for (c in changes) { pending.push(c); }
+	let parked = {};
+	let guard = 0;
+	while (pending.length > 0) {
+		guard = guard + 1;
+		if (guard > 500) {
+			return { ok: false, error: "planner did not converge (internal)", steps: steps };
+		}
+		// candidates that fit now
+		let best = -1;
+		let best_mode = "";
+		let best_score = -1;
+		let best_res = null;
+		let i = 0;
+		while (i < pending.length) {
+			let a = pending[i];
+			let mode = "mbb";
+			let r = try_change(st, a, "mbb", cap, margin);
+			if (r == null) { mode = "bbm"; r = try_change(st, a, "bbm", cap, margin); }
+			if (r != null) {
+				let score = count_fitting(r.state, pending, i, cap, margin)
+					- count_fitting(st, pending, i, cap, margin);
+				if (score > best_score) {
+					best = i; best_mode = mode; best_score = score; best_res = r;
+				}
+			}
+			i = i + 1;
+		}
+		if (best >= 0) {
+			let a = pending[best];
+			pending.remove(best);
+			let target = { node_id: a.du.node_id, gpus: sorted_ints(a.du.gpus), port: a.dm.port };
+			let start_step = { op: "start", profile: a.profile, node_id: target.node_id,
+				gpus: target.gpus, port: target.port, est_mb: a.du.mb, est_source: a.du?.source,
+				est_s: est_of(a), reason: (a.kind == "start" ? (parked.has(a.profile) ? "parked earlier; " + (a?.why ?? "") : "not running") : a.why) };
+			if (a.du.kind == "shared") {
+				start_step["shared_group"] = a.du?.group;
+				if (best_res.start.joined) { start_step["joins"] = true; }
+				if (best_res.start.restarts) {
+					start_step["restarts_shared"] = true;
+					start_step["reload_members"] = best_res.start.reload_members;
+				}
+			}
+			if (a.kind == "restart" && best_res.stopped_old) {
+				start_step["op"] = "restart";
+				start_step["from"] = a.old;
+				start_step["est_s"] = STOP_EST_S + est_of(a);
+				st = best_res.state;
+				start_step["projected_mb"] = projection(st, cap);
+				steps.push(start_step);
+				continue;
+			}
+			if (best_mode == "mbb") {
+				st = best_res.state;
+				start_step["projected_mb"] = projection(st, cap);
+				start_step["make_before_break"] = true;
+				steps.push(start_step);
+				steps.push({ op: "stop", profile: a.profile, node_id: a.old.node_id,
+					gpus: sorted_ints(a.old.gpus), port: a.old.port, service_id: a.old?.service_id,
+					reason: "moved (new copy already serving)", est_s: STOP_EST_S,
+					projected_mb: projection(st, cap) });
+				continue;
+			}
+			if (best_res.stopped_old) {
+				// show the stop on its own (projection after the stop)
+				let mid = clone_state(st);
+				sim_stop(mid, a.profile);
+				steps.push({ op: "stop", profile: a.profile, node_id: a.old.node_id,
+					gpus: sorted_ints(a.old.gpus), port: a.old.port, service_id: a.old?.service_id,
+					reason: "moving: " + a.why, est_s: STOP_EST_S, then_start: true,
+					projected_mb: projection(mid, cap) });
+			}
+			st = best_res.state;
+			start_step["projected_mb"] = projection(st, cap);
+			steps.push(start_step);
+			continue;
+		}
+		// nothing fits: park the old copy whose removal unblocks the
+		// cheapest next change
+		let pick = -1;
+		let pick_cost = 0.0;
+		let pick_freed = -1;
+		let j = 0;
+		while (j < pending.length) {
+			let a = pending[j];
+			if (a.old != null && st.where.has(a.profile)) {
+				let t = clone_state(st);
+				sim_stop(t, a.profile);
+				let cost = -1.0;
+				let k2 = 0;
+				while (k2 < pending.length) {
+					let b = pending[k2];
+					if (try_change(t, b, "bbm", cap, margin) != null) {
+						let c = est_of(b);
+						if (cost < 0.0 || c < cost) { cost = c; }
+					}
+					k2 = k2 + 1;
+				}
+				let freed = 0;
+				for (kk in st.usage.keys()) { freed = freed + ival(st.usage[kk]) - ival(t.usage?[kk]); }
+				if (cost >= 0.0) {
+					if (pick < 0 || pick_cost < 0.0 || cost < pick_cost) { pick = j; pick_cost = cost; pick_freed = freed; }
+				} else if (pick < 0 || (pick_cost < 0.0 && freed > pick_freed)) {
+					pick = j; pick_cost = -1.0; pick_freed = freed;
+				}
+			}
+			j = j + 1;
+		}
+		if (pick < 0) {
+			let names = [];
+			for (a in pending) {
+				let holder = st.ports?[gpu_key(a.du.node_id, a.dm.port)];
+				if (holder != null && holder != a.profile) {
+					names.push(a.profile + " (port " + a.dm.port + " on " + a.du.node_id
+						+ " is held by " + holder + ")");
+				} else {
+					names.push(a.profile);
+				}
+			}
+			return { ok: false, error: "no order fits within capacity − margin for: "
+				+ names.join(", ") + " (end state fits; try a smaller margin_mb or "
+				+ "stop something first)", steps: steps, final_mb: projection(fin, cap) };
+		}
+		let a = pending[pick];
+		sim_stop(st, a.profile);
+		parked[a.profile] = true;
+		a["why"] = "was parked to make room; " + (a?.why ?? "");
+		steps.push({ op: "stop", profile: a.profile, node_id: a.old.node_id,
+			gpus: sorted_ints(a.old.gpus), port: a.old.port, service_id: a.old?.service_id,
+			reason: "parked: nothing fits until it moves; it restarts at its new place later",
+			parked: true, est_s: STOP_EST_S, projected_mb: projection(st, cap) });
+	}
+
+	// ── number, downtime ──
+	let n = 1;
+	for (s in steps) { s["n"] = n; n = n + 1; }
+	let downtime = [];
+	let seen = {};
+	let si = 0;
+	while (si < steps.length) {
+		let s = steps[si];
+		if (s.op == "restart") {
+			downtime.push({ profile: s.profile, expected_s: s.est_s, kind: "restart", steps: [s.n] });
+		} else if (s.op == "stop" && !seen.has(s.profile)) {
+			// find its later start
+			let sj = si + 1;
+			let total = s.est_s;
+			let end = -1;
+			while (sj < steps.length) {
+				total = total + steps[sj].est_s;
+				if (steps[sj].op == "start" && steps[sj].profile == s.profile) { end = sj; break; }
+				sj = sj + 1;
+			}
+			if (end >= 0) {
+				downtime.push({ profile: s.profile, expected_s: total,
+					kind: (s?.parked == true ? "parked move" : "move"), steps: [s.n, steps[end].n] });
+			} else if (s.reason != "moved (new copy already serving)") {
+				downtime.push({ profile: s.profile, expected_s: -1.0, kind: "stopped", steps: [s.n] });
+			}
+			seen[s.profile] = true;
+		}
+		if (s.op == "start" && s?.restarts_shared == true) {
+			for (p in (s?.reload_members ?? [])) {
+				downtime.push({ profile: p, expected_s: s.est_s, kind: "shared server reload",
+					steps: [s.n] });
+			}
+		}
+		si = si + 1;
+	}
+	let peak = {};
+	for (k in cap.keys()) { peak[k] = ival(initial.usage?[k]); }
+	for (s in steps) {
+		let pm = s?.projected_mb ?? {};
+		for (k in pm.keys()) { if (ival(pm[k]) > ival(peak?[k])) { peak[k] = ival(pm[k]); } }
+	}
+	let usable = {};
+	for (k in cap.keys()) { usable[k] = ival(cap[k]) - margin; }
+	return {
+		ok: true,
+		noop: steps.length == 0,
+		steps: steps,
+		unchanged: unchanged,
+		downtime: downtime,
+		initial_mb: projection(initial, cap),
+		final_mb: projection(st, cap),
+		peak_mb: peak,
+		capacity_mb: copy_map(cap),
+		usable_mb: usable,
+		margin_mb: margin,
+		warnings: warnings,
+	};
+}

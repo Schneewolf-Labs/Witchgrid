@@ -16,6 +16,7 @@ import { register as register_transfers }    from "./transfers_test";
 import { register as register_mcp }          from "./mcp_test";
 import { register as register_local }        from "./local_services_test";
 import { register as register_lora_share }   from "./lora_share_test";
+import { register as register_layout }       from "./layout_test";
 
 import { run } from "@stdlib/testing";
 import { exit } from "@stdlib/env";
@@ -27,6 +28,7 @@ register_transfers();
 register_mcp();
 register_local();
 register_lora_share();
+register_layout();
 
 let result = run();
 if (!result.success) {
