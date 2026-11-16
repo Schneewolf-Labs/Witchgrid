@@ -268,6 +268,27 @@ fi
 check "stop escalates to SIGKILL and reaps a backend that ignores SIGTERM" \
 	bash -c "[ $STOP_DONE -eq 1 ]"
 
+# Catalog changes after boot must reach the CP on the next heartbeat. The
+# heartbeat runs on its own spawn()ed task and spawn() deep-copies its
+# arguments, so a heartbeat holding boot-time copies of the catalog kept
+# re-registering the stale list forever: a GGUF added + /rescan'd showed up
+# in the agent's GET /models but never in the CP catalog (so a profile
+# naming it failed "no model resolved") until the agent restarted. Must run
+# before anything restarts agent 1 (a boot rescan would mask the bug).
+FRESH="$TMP/models/hb-fresh.gguf"
+cp "$ROOT/tests/fixtures/normal_llama.gguf" "$FRESH"
+cp_has_fresh() {  # exit 0 iff the CP catalog lists $FRESH on agent 1
+	curl -fsS "$CP_URL/api/catalog" | python3 -c 'import sys,json; sys.exit(0 if any(o["node_id"]==sys.argv[1] and o["path"]==sys.argv[2] for a in json.load(sys.stdin) for o in a["on_nodes"]) else 1)' "$NODE_ID" "$FRESH"
+}
+cp_lacks_fresh() { ! cp_has_fresh; }
+curl -fsS -X POST "$AGENT_URL/rescan" >/dev/null 2>&1
+for _ in $(seq 1 20); do cp_has_fresh >/dev/null 2>&1 && break; sleep 0.5; done
+check "a GGUF added + /rescan'd reaches the CP catalog via heartbeat (no restart)" cp_has_fresh
+curl -fsS -X POST "$AGENT_URL/models/delete" -H 'content-type: application/json' \
+	-d '{"path":"'"$FRESH"'"}' >/dev/null 2>&1
+for _ in $(seq 1 20); do cp_lacks_fresh >/dev/null 2>&1 && break; sleep 0.5; done
+check "a deleted GGUF drops out of the CP catalog via heartbeat" cp_lacks_fresh
+
 # ── local engine: declare → profile → spawn → health → stop → refusal ──
 # tiny-voice is declared in $LOCAL_DIR on agent 1 only. The CP profile names
 # it; the command line never leaves the agent.

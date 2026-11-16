@@ -211,9 +211,17 @@ export fn dispatch(req, routes, auth_check): object {
 //   - models_ref / capability map: read-mostly; one writer (POST
 //     /rescan) racing with readers is fine — pointer-swap of the
 //     entries array is single-instruction; readers see either the
-//     before or after, never a torn list
+//     before or after, never a torn list. (Route handlers share these
+//     holders by closure; the heartbeat task does not — it reads them
+//     from the db, see agent.hml live_put.)
 //   - PROFILES + LLM caps: read-only after boot, no contention
-async fn handle_connection(stream, routes, auth_check): null {
+//
+// A plain fn, not the spawn target: serve() wraps it in a closure that
+// captures routes/auth_check by reference. spawn() DEEP-COPIES every
+// argument, so spawn(handle_connection, stream, routes, auth_check)
+// copied the whole route table per accepted connection — the same
+// per-request memory bleed cp/http_server.hml fixed the same way.
+fn handle_connection(stream, routes, auth_check): null {
 	try {
 		let req = parse_request(stream);
 		let resp = dispatch(req, routes, auth_check);
@@ -233,13 +241,17 @@ async fn handle_connection(stream, routes, auth_check): null {
 export fn serve(host: string, port: i32, routes, auth_check): null {
 	let listener = TcpListener(host, port);
 	print("[http] listening on " + host + ":" + port);
+	// Only `stream` crosses spawn(); routes/auth_check ride the closure.
+	let conn_worker = async fn(stream): null {
+		return handle_connection(stream, routes, auth_check);
+	};
 	loop {
 		try {
 			let stream = listener.accept();
 			// Detach so we don't accumulate join handles. If the handler
 			// throws past its own try/catch (shouldn't, dispatch wraps),
 			// the runtime swallows on the worker thread.
-			let t = spawn(handle_connection, stream, routes, auth_check);
+			let t = spawn(conn_worker, stream);
 			detach(t);
 		} catch (e) {
 			eprint("[http] accept failed: " + e + " (retrying)");
