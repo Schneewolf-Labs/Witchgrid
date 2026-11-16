@@ -145,6 +145,13 @@ Without these, every agent roll bounces inference for a few seconds (the
 children die, the watchdog respawns them). With them, you can upgrade the
 agent under live traffic.
 
+**Exception — shared-LoRA members** (`share_group` profiles, see
+[`shared-lora.md`](shared-lora.md)): their ports are proxies *inside* the
+agent, so they are closed while the agent is down even with the settings
+above (the shared llama-server behind them survives and is re-adopted). The
+restarted agent re-binds them first thing at boot; the gap is the time the
+agent process is gone.
+
 ### pm2 (no-sudo agent supervision)
 
 When you can't (or don't want to) write a system unit, pm2 with its boot hook
@@ -212,6 +219,7 @@ All config is env vars. Both binaries read `WITCHGRID_DATA_DIR` and
 | `WITCHGRID_DATA_DIR` | *(CWD)* | Dir for `witchgrid-agent.db`. Same rationale as the CP. |
 | `WITCHGRID_HEARTBEAT_SECONDS` | `30` | How often the agent re-probes hardware and heartbeats the CP (advancing its `last_seen_at`). Lower = fresher `free_mb` for placement at the cost of more RPC + `nvidia-smi` calls. Keep the CP's `WITCHGRID_STALE_NODE_SECONDS` ≳ 3× this. |
 | `WITCHGRID_SHARED_SECRET` | *(unset)* | See above; must match the CP. |
+| `WITCHGRID_SHARED_PORT_BASE` | `18700` | First internal (loopback) port for shared-LoRA llama-servers; walks up past ports in use. Members keep their own ports. See [`shared-lora.md`](shared-lora.md). |
 | `WITCHGRID_LOCAL_SERVICES` | `~/.witchgrid/local-services` | Dir of `local` engine declarations (one `<name>.json` per service: argv, cwd, env, port, health path, VRAM). Missing = no local services. Must not be group/world-writable. See [`agent/README.md`](../agent/README.md#local-services-local-engine). |
 
 ## Device selection (CPU/GPU)

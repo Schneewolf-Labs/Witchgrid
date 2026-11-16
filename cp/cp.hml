@@ -41,6 +41,10 @@ import { WITCHGRID_VERSION } from "../version";
 import { on_shutdown } from "@stdlib/signal";
 import { exit, exec_argv } from "@stdlib/process";
 import { read_metadata, estimate_vram_mb, estimate_vram_from_ingredients } from "./gguf";
+// Shared-base LoRA: the same pure rules the agent applies (validation,
+// adapters, slot/context sizing) for profile checks + join placement.
+import { is_sharing_profile, sharing_profile_error, profile_adapters, member_slots,
+	member_ctx_per_slot } from "../agent/lora_share";
 import { render_nodes, render_services, render_profiles, render_capabilities, render_catalog, render_stats, render_transfers, render_missing, render_bench,
          OVERVIEW_HTML, PAGE_CATALOG, PAGE_TRANSFERS, PAGE_PROFILES, PAGE_BENCH, PAGE_DEPLOY, PAGE_SETTINGS,
          SHELL_CSS, SHELL_JS, LOGO } from "./dashboard";
@@ -2140,6 +2144,132 @@ fn pick_placement(model_path: string, profile) {
 	return null;
 }
 
+// ── shared-base LoRA placement ───────────────────────────────────────
+// A profile with `share_group` (see agent/lora_share.hml) is served by one
+// llama-server per (group, base model, settings, GPU set) on a node; the
+// agent does the joining. The CP's part is placement: before the normal
+// "fit a whole new server" search, look for a RUNNING shared server of the
+// same group whose base model is this profile's model on that node, and
+// join it when its GPUs have room for what the join adds. No room → normal
+// placement (which may start a second shared server elsewhere).
+
+// Per-new-adapter VRAM allowance when the profile doesn't say (`lora_mb`).
+// The adapters in use are 58-640 MB f16 files; llama.cpp keeps them on
+// the GPU at that size.
+let SHARED_LORA_DEFAULT_MB: f64 = 512.0;
+
+// Sum of current free VRAM over a node's GPU indices (latest heartbeat).
+fn gpu_free_mb(node_id: string, indices): i32 {
+	let rows = query(DB, "select hardware_json from nodes where node_id = ?", [node_id]);
+	if (rows.length == 0) { return 0; }
+	let hw = null;
+	try { hw = parse(rows[0].hardware_json); } catch (e) { return 0; }
+	let total = 0;
+	for (g in (hw?.gpus ?? [])) {
+		for (i in indices) { if (g.index == i) { total = total + g.free_mb; } }
+	}
+	return total;
+}
+
+// What joining adds to a running shared server, in MB: nothing when the
+// server already covers the member (adapter loaded, spare slots/context);
+// otherwise the KV growth from the restart config plus an allowance per
+// adapter it has to load. `cand` is the node's catalog row for the base
+// model (ingredients for the KV math); without it only adapters count.
+fn shared_join_cost_mb(profile, sh, cand): f64 {
+	let mine = [];
+	try { for (a in profile_adapters(profile)) { mine.push(a.path); } } catch (e) { }
+	let loaded = sh?.adapters ?? [];
+	let new_adapters = 0;
+	for (p in mine) { if (!loaded.contains(p)) { new_adapters = new_adapters + 1; } }
+	let m_slots = member_slots(profile);
+	let m_cps = member_ctx_per_slot(profile);
+	let want_slots = (sh?.slots_in_use ?? 0) + m_slots;
+	let want_cps = sh?.ctx_per_slot_in_use ?? 0;
+	if (m_cps > want_cps) { want_cps = m_cps; }
+	if (new_adapters == 0 && want_slots <= (sh?.slots ?? 0) && want_cps <= (sh?.ctx_per_slot ?? 0)) {
+		return 0.0;
+	}
+	let per_adapter = SHARED_LORA_DEFAULT_MB;
+	if (profile?.lora_mb != null) { per_adapter = f64(profile.lora_mb); }
+	let kv_delta: f64 = 0.0;
+	if (cand != null) {
+		try {
+			let kv = profile?.kv_type ?? "f16";
+			let new_ctx = i32(want_cps * want_slots);
+			let cur_ctx = i32(sh?.context ?? 0);
+			kv_delta = estimate_vram_from_ingredients(cand, new_ctx, kv).kv_total_mb
+				- estimate_vram_from_ingredients(cand, cur_ctx, kv).kv_total_mb;
+		} catch (e) { kv_delta = 0.0; }
+	}
+	if (kv_delta < 0.0) { kv_delta = 0.0; }
+	return kv_delta + per_adapter * f64(new_adapters);
+}
+
+// A running shared server this profile can join, as a placement pick
+// ({ node_id, agent_url, gpu_indices, tensor_split, est_mb, model_path,
+// joined, share_key }), or null.
+fn find_shared_join(profile_name: string, profile, explicit_model) {
+	if (!is_sharing_profile(profile)) { return null; }
+	let group = "" + profile.share_group;
+	for (a in list_all_agents()) {
+		let entries = null;
+		try {
+			let resp = cp_get_fast(a.agent_url + "/services");
+			if (resp.status_code < 200 || resp.status_code >= 300) { continue; }
+			entries = parse(resp.body);
+		} catch (e) { continue; }
+		for (s in entries) {
+			let sh = s?.shared;
+			if (sh?.role != "server" || sh?.group != group || s?.alive != true) { continue; }
+			let model = explicit_model;
+			let cand = null;
+			if (model == null && profile?.model_alias != null) {
+				let rows = query(DB,
+					"select node_id, path, size_mb, architecture, n_layers, n_heads, "
+					+ "n_kv_heads, embedding_length, claimed_context "
+					+ "from node_models where alias = ? and node_id = ?",
+					[profile.model_alias, a.node_id]);
+				if (rows.length > 0) { model = rows[0].path; cand = rows[0]; }
+			}
+			if (model == null) { model = profile?.default_model; }
+			if (model == null || model != s.model_path) { continue; }
+			if (cand == null) {
+				// explicit/default path: the node's catalog row for that file
+				let rows = query(DB,
+					"select node_id, path, size_mb, architecture, n_layers, n_heads, "
+					+ "n_kv_heads, embedding_length, claimed_context "
+					+ "from node_models where path = ? and node_id = ?", [model, a.node_id]);
+				if (rows.length > 0) { cand = rows[0]; }
+			}
+			let gpus = s?.gpus ?? [];
+			let need = shared_join_cost_mb(profile, sh, cand);
+			if (gpus.length > 0 && need > 0.0) {
+				let free = gpu_free_mb(a.node_id, gpus);
+				if (f64(free) < need * (1.0 + MULTI_GPU_OVERHEAD_FRACTION)) {
+					print("[share] " + profile_name + ": shared server " + sh.key + " on "
+						+ a.node_id + " lacks headroom (join needs ~" + i32(need)
+						+ " MB, " + free + " MB free) — placing normally");
+					continue;
+				}
+			}
+			print("[share] " + profile_name + " → joins " + sh.key + " on " + a.node_id
+				+ " (adds ~" + i32(need) + " MB)");
+			return {
+				node_id:      a.node_id,
+				agent_url:    a.agent_url,
+				gpu_indices:  gpus,
+				tensor_split: null,
+				est_mb:       need,
+				model_path:   model,
+				joined:       s.id,
+				share_key:    sh.key,
+			};
+		}
+	}
+	return null;
+}
+
 // ── local engine placement ───────────────────────────────────────────
 // A `local` profile ({ binary: "local", local_service: "<name>" }) runs
 // a command the agent declares on its own disk; the CP never sees or
@@ -2425,7 +2555,12 @@ fn handle_spawn_proxy(req): object {
 		let pick = null;
 		// Prefer explicit model: from the request, then alias, then default_model.
 		let resolved_model = model;
-		if (resolved_model == null && profile?.model_alias != null) {
+		// share_group: join a running shared server first (no new base copy).
+		if (is_sharing_profile(profile)) {
+			pick = find_shared_join(profile_name, profile, resolved_model);
+			if (pick != null) { resolved_model = pick.model_path; }
+		}
+		if (pick == null && resolved_model == null && profile?.model_alias != null) {
 			pick = pick_placement_via_alias(profile.model_alias, profile);
 			if (pick != null) { resolved_model = pick.model_path; }
 		}
@@ -2888,7 +3023,11 @@ fn auto_spawn(profile_name: string) {
 	// supplied override; it's all profile-derived.
 	let pick = null;
 	let resolved_model = null;
-	if (profile?.model_alias != null) {
+	if (is_sharing_profile(profile)) {
+		pick = find_shared_join(profile_name, profile, null);
+		if (pick != null) { resolved_model = pick.model_path; }
+	}
+	if (pick == null && profile?.model_alias != null) {
 		pick = pick_placement_via_alias(profile.model_alias, profile);
 		if (pick != null) { resolved_model = pick.model_path; }
 	}
@@ -4606,6 +4745,13 @@ fn validate_profile(profile, is_put: bool) {
 	}
 	if (profile?.extra_flags != null && typeof(profile.extra_flags) != "array") {
 		return "extra_flags must be an array of strings";
+	}
+	if (profile?.share_group != null) {
+		if (profile?.binary != null && profile.binary != "llama-server") {
+			return "share_group is only for llama-server profiles";
+		}
+		let serr = sharing_profile_error(profile);
+		if (serr != null) { return "share_group: " + serr; }
 	}
 	if (profile?.binary == "local") {
 		// The command lives in the agent's declaration; a profile only

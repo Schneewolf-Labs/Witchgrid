@@ -1,0 +1,494 @@
+// lora_share.hml — shared-base LoRA serving: the pure (no I/O) half.
+//
+// Several llama-server profiles often run the SAME base GGUF with
+// different LoRA adapters (on schneewolf: luna-spark = B4-9B + Luna LoRA,
+// familiar-spark = B4-9B plain, riko-narrator = B4-9B + Riko LoRA). Run
+// dedicated, each one is a full copy of the base weights in VRAM. A profile
+// that opts in with `share_group` instead joins ONE llama-server per
+// (group, base model, server settings, GPU set) that has every member's
+// adapters loaded, and the agent selects the right adapter per request.
+//
+// Consumers do not change: every member keeps its own port, where the agent
+// runs a thin proxy (lora_proxy.hml) that forwards to the shared server and
+// writes the member's `lora` selection into generation requests.
+//
+// This file holds the decisions, so they can be unit tested without a GPU:
+//   - which adapters a profile wants (profile `lora` field and/or the
+//     `--lora` / `--lora-scaled` flags already in its extra_flags)
+//   - which profiles are compatible (the share key)
+//   - the shared server's size (slots summed, per-slot context = max)
+//   - whether a running server already covers a new member (no restart)
+//   - the per-member `lora` selection and how it is injected into a body
+//   - which endpoints get the selection and which are refused on members
+//
+// llama-server facts these rules rely on (verified against build 12003,
+// see docs/shared-lora.md for the measurements):
+//   - per-request `"lora": [{"id": N, "scale": S}, ...]`: listed ids get S,
+//     ids NOT listed get 0. An EMPTY list (or no field) falls back to the
+//     server's global scales — so a no-LoRA member must send every id at 0,
+//     never [].
+//   - `--lora-init-without-apply` does NOT zero the global scales (they stay
+//     1.0 and apply to every request without a `lora` field). The shared
+//     server therefore loads each adapter with `--lora-scaled <path>:0`.
+//   - zero-scale adapters are skipped in the graph, so a member's output is
+//     bit-identical to a dedicated `--lora <its adapter>` server.
+//   - requests with different adapter sets are never batched together.
+//   - the host-RAM prompt cache (`--cache-ram`, default 8 GiB) is keyed by
+//     tokens only, not by adapter: a slot can restore KV computed under
+//     another member's adapter. The shared server runs with `--cache-ram 0`;
+//     the per-slot cache is adapter-aware (cleared on an adapter change).
+//   - adapters can't be added to a running server (POST /lora-adapters only
+//     rescales loaded ones), so a join that needs a new adapter restarts it.
+
+import { stringify, parse } from "@stdlib/json";
+import { sha256 } from "@stdlib/hash";
+
+// ── profile inspection ──────────────────────────────────────────────
+
+// The profile opts in to sharing. Only llama-server profiles can share.
+export fn is_sharing_profile(prof): bool {
+	if (prof == null) { return false; }
+	if (prof?.binary != null && prof.binary != "llama-server") { return false; }
+	let g = prof?.share_group;
+	if (g == null) { return false; }
+	return ("" + g).length > 0;
+}
+
+// A profile synthesized by the agent for the shared server itself.
+export fn is_shared_server_profile(prof): bool {
+	return prof != null && prof?.__shared_server != null;
+}
+
+// share_group names end up in service rows, logs and the dashboard.
+export fn valid_group_name(g): bool {
+	if (g == null || typeof(g) != "string") { return false; }
+	if (g.length == 0 || g.length > 63) { return false; }
+	let i = 0;
+	while (i < g.length) {
+		let c = g.substr(i, 1);
+		let ok = (c >= "a" && c <= "z") || (c >= "0" && c <= "9")
+			|| c == "-" || c == "_" || c == ".";
+		if (!ok) { return false; }
+		i = i + 1;
+	}
+	return true;
+}
+
+// llama-server splits --lora on ',' and --lora-scaled on ',' and ':', so a
+// path containing either can't be passed to it at all.
+fn check_adapter_path(p): null {
+	if (p == null || typeof(p) != "string" || p.length == 0) {
+		throw "lora: adapter path must be a non-empty string";
+	}
+	if (p.find(",") >= 0 || p.find(":") >= 0) {
+		throw "lora: adapter path '" + p + "' contains ',' or ':' which llama-server "
+			+ "can't parse in --lora/--lora-scaled; rename or symlink it";
+	}
+	return null;
+}
+
+fn add_adapter(out, path, scale): null {
+	check_adapter_path(path);
+	let s = 1.0;
+	if (scale != null) { s = f64(scale); }
+	for (a in out) {
+		if (a.path == path) {
+			throw "lora: adapter '" + path + "' listed twice for one profile";
+		}
+	}
+	out.push({ path: path, scale: s });
+	return null;
+}
+
+// Flags that size or address the server, or that select adapters — the
+// shared server owns them, so a sharing profile's own values are dropped
+// (adapters/alias are read out first) or refused (context/slots must come
+// from intent so the agent can sum them).
+let VALUE_FLAGS_DROPPED = ["--lora", "--lora-scaled", "-a", "--alias",
+	"--cache-ram", "-cram", "--host", "--port"];
+let BARE_FLAGS_DROPPED = ["--lora-init-without-apply"];
+let VALUE_FLAGS_REFUSED = ["-c", "--ctx-size", "-np", "--parallel", "-m", "--model"];
+
+// Split a sharing profile's extra_flags into what the shared server keeps
+// (common), the adapters it asked for, and its -a/--alias value.
+//   --lora A,B          → A and B at scale 1.0
+//   --lora-scaled A:0.5 → A at 0.5
+//   -a name / --alias n → alias (first entry of a comma list)
+export fn split_extra_flags(flags): object {
+	let common = [];
+	let adapters = [];
+	let alias = null;
+	if (flags == null) { return { common: common, adapters: adapters, alias: alias }; }
+	let i = 0;
+	while (i < flags.length) {
+		let f = "" + flags[i];
+		if (VALUE_FLAGS_REFUSED.contains(f)) {
+			throw "sharing profile sets " + f + " in extra_flags; give context and "
+				+ "parallel_slots as intent (the agent sizes the shared server from them) "
+				+ "and the model via model_alias/default_model";
+		}
+		if (BARE_FLAGS_DROPPED.contains(f)) { i = i + 1; continue; }
+		if (VALUE_FLAGS_DROPPED.contains(f)) {
+			if (i + 1 >= flags.length) { throw "extra_flags: " + f + " needs a value"; }
+			let v = "" + flags[i + 1];
+			if (f == "--lora") {
+				for (p in v.split(",")) {
+					let pp = p.trim();
+					if (pp.length > 0) { add_adapter(adapters, pp, 1.0); }
+				}
+			} else if (f == "--lora-scaled") {
+				for (item in v.split(",")) {
+					let it = item.trim();
+					if (it.length == 0) { continue; }
+					let parts = it.split(":");
+					if (parts.length != 2) {
+						throw "extra_flags: --lora-scaled expects FNAME:SCALE, got '" + it + "'";
+					}
+					add_adapter(adapters, parts[0], f64(parts[1]));
+				}
+			} else if (f == "-a" || f == "--alias") {
+				if (alias == null) {
+					let first = v.split(",")[0].trim();
+					if (first.length > 0) { alias = first; }
+				}
+			}
+			i = i + 2;
+			continue;
+		}
+		common.push(f);
+		i = i + 1;
+	}
+	return { common: common, adapters: adapters, alias: alias };
+}
+
+// Every adapter a sharing profile wants: the `lora` field (a path, a list of
+// paths, or a list of { path, scale }) plus any --lora / --lora-scaled in
+// extra_flags. Order: field first, then flags.
+export fn profile_adapters(prof): array {
+	let out = [];
+	let l = prof?.lora;
+	if (l != null) {
+		if (typeof(l) == "string") {
+			add_adapter(out, l, 1.0);
+		} else if (typeof(l) == "array") {
+			for (e in l) {
+				if (typeof(e) == "string") { add_adapter(out, e, 1.0); }
+				else if (typeof(e) == "object") { add_adapter(out, e?.path, e?.scale); }
+				else { throw "lora: entries must be paths or { path, scale }"; }
+			}
+		} else {
+			throw "lora: must be a path, a list of paths, or a list of { path, scale }";
+		}
+	}
+	let split = split_extra_flags(prof?.extra_flags ?? []);
+	for (a in split.adapters) { add_adapter(out, a.path, a.scale); }
+	return out;
+}
+
+// The member's model name as a dedicated server would report it (-a), or
+// null (then the shared server's own name — the base model path — is what a
+// dedicated server would have reported too).
+export fn profile_alias(prof) {
+	return split_extra_flags(prof?.extra_flags ?? []).alias;
+}
+
+export fn member_slots(prof): i32 {
+	let s = prof?.intent?.parallel_slots;
+	if (s == null) { throw "sharing profile needs intent.parallel_slots"; }
+	let n = i32(s);
+	if (n < 1) { throw "intent.parallel_slots must be >= 1"; }
+	return n;
+}
+
+export fn member_ctx_per_slot(prof): i32 {
+	let c = prof?.intent?.context;
+	if (c == null) { throw "sharing profile needs intent.context"; }
+	let ctx = i32(c);
+	let slots = member_slots(prof);
+	// ceil: a member must never get less per-slot context than it would
+	// have had on its own server.
+	return i32((ctx + slots - 1) / slots);
+}
+
+// Shape problems that make a profile unable to share, as a message (or
+// null). Used by the CP when a profile is saved, and by the agent at spawn.
+export fn sharing_profile_error(prof) {
+	if (!is_sharing_profile(prof)) { return null; }
+	if (!valid_group_name(prof.share_group)) {
+		return "share_group must match [a-z0-9._-]{1,63}";
+	}
+	try {
+		member_ctx_per_slot(prof);
+		profile_adapters(prof);
+	} catch (e) {
+		return "" + e;
+	}
+	return null;
+}
+
+// ── compatibility ───────────────────────────────────────────────────
+
+fn sorted_keys(obj): array {
+	let ks = [];
+	for (k in obj.keys()) { ks.push("" + k); }
+	ks.sort();
+	return ks;
+}
+
+// The server-shaping settings that must be identical for profiles to share
+// one llama-server: every intent except context/parallel_slots (those are
+// combined) and every extra flag except adapters/alias.
+export fn compat_signature(prof): string {
+	let intent = prof?.intent ?? {};
+	let parts = [];
+	for (k in sorted_keys(intent)) {
+		if (k == "context" || k == "parallel_slots") { continue; }
+		parts.push(k + "=" + intent[k]);
+	}
+	let split = split_extra_flags(prof?.extra_flags ?? []);
+	return "intent{" + parts.join(";") + "} flags[" + split.common.join(" ") + "]";
+}
+
+fn gpus_csv(gpus): string {
+	if (gpus == null) { return ""; }
+	let out = [];
+	for (g in gpus) { out.push("" + g); }
+	return out.join(",");
+}
+
+// Identity of a shared server: group + base model + settings + GPU set.
+// Readable prefix for logs, digest for the rest.
+export fn share_key(group: string, model_path: string, prof, gpus): string {
+	let sig = model_path + "\n" + compat_signature(prof) + "\n" + gpus_csv(gpus);
+	return group + "#" + sha256(sig).substr(0, 12);
+}
+
+// ── sizing ──────────────────────────────────────────────────────────
+
+// Desired shared-server config for a member list (join order). Adapters
+// keep first-seen order so existing ids stay stable across joins.
+//   slots        = sum of member parallel_slots
+//   ctx_per_slot = max of member per-slot contexts (nobody loses context)
+//   context      = ctx_per_slot * slots  (llama-server's -c is the total)
+export fn desired_config(member_profs): object {
+	let adapters = [];
+	let slots = 0;
+	let cps = 0;
+	for (p in member_profs) {
+		slots = slots + member_slots(p);
+		let c = member_ctx_per_slot(p);
+		if (c > cps) { cps = c; }
+		for (a in profile_adapters(p)) {
+			if (!adapters.contains(a.path)) { adapters.push(a.path); }
+		}
+	}
+	return { adapters: adapters, slots: slots, ctx_per_slot: cps, context: cps * slots };
+}
+
+// Can a running server (cur) serve the desired config without a restart?
+// It must already have every adapter loaded and at least as many slots and
+// per-slot context.
+export fn config_covers(cur, want): bool {
+	if (cur == null) { return false; }
+	for (a in want.adapters) {
+		if (!(cur?.adapters ?? []).contains(a)) { return false; }
+	}
+	if ((cur?.slots ?? 0) < want.slots) { return false; }
+	if ((cur?.ctx_per_slot ?? 0) < want.ctx_per_slot) { return false; }
+	return true;
+}
+
+// Config to restart with when `want` isn't covered: the desired config, but
+// adapters the server already has keep their ids (appended-to, not
+// reordered) only if they are still wanted.
+export fn restart_config(cur, want): object {
+	let adapters = [];
+	for (a in (cur?.adapters ?? [])) {
+		if (want.adapters.contains(a)) { adapters.push(a); }
+	}
+	for (a in want.adapters) {
+		if (!adapters.contains(a)) { adapters.push(a); }
+	}
+	return { adapters: adapters, slots: want.slots, ctx_per_slot: want.ctx_per_slot,
+		context: want.ctx_per_slot * want.slots };
+}
+
+// ── per-request selection ───────────────────────────────────────────
+
+// [{id, scale}] covering EVERY loaded adapter: the member's own at its
+// scale, all others explicitly 0 (an empty list would mean "global scales").
+export fn selection_for(server_adapters, member_adapters): array {
+	let out = [];
+	let i = 0;
+	while (i < server_adapters.length) {
+		let scale = 0.0;
+		for (m in member_adapters) {
+			if (m.path == server_adapters[i]) { scale = f64(m.scale); }
+		}
+		out.push({ id: i, scale: scale });
+		i = i + 1;
+	}
+	return out;
+}
+
+export fn selection_json(sel): string {
+	let parts = [];
+	for (s in sel) {
+		let sc = "" + s.scale;
+		parts.push("{\"id\":" + s.id + ",\"scale\":" + sc + "}");
+	}
+	return "[" + parts.join(",") + "]";
+}
+
+// POST endpoints whose JSON body gets the member's `lora` selection: every
+// llama-server route that runs the model on a slot.
+let INJECT_PATHS = [
+	"/completion", "/completions", "/v1/completions",
+	"/chat/completions", "/v1/chat/completions",
+	"/responses", "/v1/responses", "/v1/messages",
+	"/infill",
+	"/embedding", "/embeddings", "/v1/embeddings",
+	"/rerank", "/reranking", "/v1/rerank", "/v1/reranking",
+];
+
+export fn strip_query(target: string): string {
+	let q = target.find("?");
+	if (q >= 0) { return target.substr(0, q); }
+	return target;
+}
+
+export fn is_injectable(method: string, target: string): bool {
+	if (method != "POST") { return false; }
+	return INJECT_PATHS.contains(strip_query(target));
+}
+
+// Requests a member port refuses: server-global state another member
+// depends on. POST /lora-adapters changes the global scales; POST
+// /slots/{id} saves/restores/erases slot KV (restoring a slot saved under
+// another adapter would be exactly the cache contamination we avoid).
+export fn blocked_reason(method: string, target: string) {
+	let p = strip_query(target);
+	if (method == "POST" && p == "/lora-adapters") {
+		return "POST /lora-adapters is disabled on a shared-LoRA member port: the "
+			+ "adapter scales are server-wide; the member's adapter is selected per request";
+	}
+	if (method == "POST" && p.starts_with("/slots")) {
+		return "slot save/restore/erase is disabled on a shared-LoRA member port: "
+			+ "slots are shared between members with different adapters";
+	}
+	return null;
+}
+
+// Paths whose (small, buffered) response the proxy rewrites so the member
+// reports its own model alias.
+export fn is_alias_rewrite(method: string, target: string): bool {
+	if (method != "GET") { return false; }
+	let p = strip_query(target);
+	return p == "/v1/models" || p == "/models" || p == "/props";
+}
+
+// Insert the selection into a JSON-object body. Policy: OVERRIDE — the
+// selection is appended as the LAST key; llama-server's JSON parser keeps
+// the last duplicate key, so a client-sent `lora` (which would otherwise
+// let a caller on one member's port run another member's adapter) is
+// ignored. The client's bytes are otherwise untouched (no re-serialization).
+// Returns null when the body is not a JSON object (forwarded unchanged).
+export fn inject_lora(body: string, sel_json: string) {
+	if (body == null) { return null; }
+	let t = body.trim();
+	if (t.length < 2 || t.substr(0, 1) != "{" || t.substr(t.length - 1, 1) != "}") {
+		return null;
+	}
+	let obj = null;
+	try { obj = parse(t); } catch (e) { return null; }
+	if (obj == null || typeof(obj) != "object") { return null; }
+	if (obj.keys().length == 0) { return "{\"lora\":" + sel_json + "}"; }
+	return t.substr(0, t.length - 1) + ",\"lora\":" + sel_json + "}";
+}
+
+// Rewrite a /v1/models, /models or /props JSON body so it names `alias`.
+// Returns null when there's nothing to rewrite or the body isn't JSON.
+export fn rewrite_alias_json(target: string, body: string, alias: string) {
+	let obj = null;
+	try { obj = parse(body); } catch (e) { return null; }
+	if (obj == null || typeof(obj) != "object") { return null; }
+	let p = strip_query(target);
+	let changed = false;
+	if (p == "/props") {
+		if (obj.has("model_alias")) { obj["model_alias"] = alias; changed = true; }
+	} else {
+		if (obj.has("data") && typeof(obj.data) == "array") {
+			for (d in obj.data) {
+				if (typeof(d) == "object" && d.has("id")) { d["id"] = alias; changed = true; }
+			}
+		}
+		if (obj.has("models") && typeof(obj.models) == "array") {
+			for (m in obj.models) {
+				if (typeof(m) != "object") { continue; }
+				if (m.has("name"))  { m["name"] = alias; changed = true; }
+				if (m.has("model")) { m["model"] = alias; changed = true; }
+			}
+		}
+	}
+	if (!changed) { return null; }
+	return stringify(obj);
+}
+
+// ── shared server profile ───────────────────────────────────────────
+
+// The profile the agent spawns for the shared server: the first member's
+// common settings, sized by cfg, every adapter loaded at global scale 0,
+// the host-RAM prompt cache off (when the binary has it), bound to
+// loopback (members reach it through their proxies; a direct caller would
+// get the base model, never someone's adapter). Stored as the server row's
+// profile_json, so the watchdog respawns it like any other service.
+export fn shared_server_profile(base_prof, cfg, group: string, key: string,
+                                caps, model_path: string): object {
+	let intent = {};
+	let bi = base_prof?.intent ?? {};
+	for (k in bi.keys()) {
+		if (k == "context" || k == "parallel_slots") { continue; }
+		intent[k] = bi[k];
+	}
+	intent["context"] = cfg.context;
+	intent["parallel_slots"] = cfg.slots;
+	let split = split_extra_flags(base_prof?.extra_flags ?? []);
+	let flags = [];
+	for (f in split.common) { flags.push(f); }
+	for (a in cfg.adapters) {
+		flags.push("--lora-scaled");
+		flags.push(a + ":0");
+	}
+	let cache_ram_off = (caps != null && caps.has("cache-ram"));
+	if (cache_ram_off) {
+		flags.push("--cache-ram");
+		flags.push("0");
+	}
+	return {
+		binary: "llama-server",
+		intent: intent,
+		extra_flags: flags,
+		context: cfg.context,
+		kv_type: base_prof?.kv_type,
+		bind_host: "127.0.0.1",
+		__shared_server: {
+			group: group,
+			key: key,
+			signature: compat_signature(base_prof),
+			model_path: model_path,
+			adapters: cfg.adapters,
+			slots: cfg.slots,
+			ctx_per_slot: cfg.ctx_per_slot,
+			context: cfg.context,
+			cache_ram_off: cache_ram_off,
+		},
+	};
+}
+
+// The config a running server row was started with (from its profile).
+export fn server_config(server_prof) {
+	let s = server_prof?.__shared_server;
+	if (s == null) { return null; }
+	return { adapters: s?.adapters ?? [], slots: s?.slots ?? 0,
+		ctx_per_slot: s?.ctx_per_slot ?? 0, context: s?.context ?? 0 };
+}

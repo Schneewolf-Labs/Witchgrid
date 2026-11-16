@@ -1,0 +1,535 @@
+// lora_proxy.hml — the member-port proxy for shared-base LoRA serving.
+//
+// A profile that shares a llama-server (see lora_share.hml) keeps its own
+// port. The agent listens there and forwards every request to the shared
+// llama-server on loopback, byte for byte, except:
+//   - POST to a generation endpoint with a JSON-object body: the member's
+//     `lora` selection is appended (override policy, see inject_lora)
+//   - GET /v1/models, /models, /props: rewritten to the member's -a alias
+//     when it has one
+//   - POST /lora-adapters and POST /slots/*: refused (403), server-global
+//   - GET /__witchgrid/lora-proxy: answered here (liveness probe the agent
+//     uses to tell its own proxy from anything else on the port)
+//
+// Forwarding is at the HTTP/1.1 byte level: the request head is rebuilt
+// (hop-by-hop headers dropped, Connection: close, a fresh Content-Length);
+// the response is relayed as raw bytes as soon as they arrive. Status line,
+// headers, chunked framing and SSE (`stream: true`) all pass through
+// untouched and unbuffered, and a client that disconnects closes the
+// upstream connection, which llama-server treats as a cancel. One request
+// per connection (the response says Connection: close).
+//
+// The proxy lives inside the agent process: it stops when the agent stops,
+// and the watchdog (services.reconcile_services → ensure_member_proxies)
+// starts it again on the next agent boot — the shared llama-server itself
+// is a setsid child and survives an agent restart like any other service.
+//
+// State is read from sqlite on every request (member row → server row):
+// no in-memory registry is shared across threads, and a shared server
+// restart (new internal port) is picked up by the very next request.
+
+import { TcpListener, TcpStream } from "@stdlib/net";
+import { query } from "@stdlib/sqlite";
+import { stringify, parse } from "@stdlib/json";
+import { get_pid } from "@stdlib/process";
+import { sleep } from "@stdlib/time";
+import { SpinLock } from "@stdlib/atomic";
+import { profile_adapters, profile_alias, selection_for, selection_json,
+	is_injectable, blocked_reason, is_alias_rewrite, inject_lora,
+	rewrite_alias_json, strip_query } from "./lora_share";
+
+export let PROBE_PATH = "/__witchgrid/lora-proxy";
+
+let READ_CHUNK = 65536;
+let CLIENT_TIMEOUT_S = 60.0;          // reading the request from the client
+let UPSTREAM_TIMEOUT_S = 1800.0;      // long prefill / long non-stream generations
+let MAX_HEADER_BYTES = 65536;
+let MAX_BODY_BYTES = 67108864;        // 64 MiB — a long-context chat body is ~1 MB
+
+// ── outbound connections ────────────────────────────────────────────
+
+// Hemlock's socket connect() resolves the address with gethostbyname(),
+// which returns a pointer into static storage — two threads connecting at
+// once can read a half-overwritten hostent and crash (seen as a SIGSEGV in
+// hml_socket_connect under concurrent member requests). Serialize the
+// connect; to a loopback port it's microseconds, then the threads run free.
+let CONNECT_LOCK = SpinLock();
+
+fn connect_loopback(port: i32) {
+	CONNECT_LOCK.acquire();
+	let s = null;
+	try {
+		s = TcpStream("127.0.0.1", port);
+	} catch (e) {
+		CONNECT_LOCK.release();
+		throw e;
+	}
+	CONNECT_LOCK.release();
+	return s;
+}
+
+// ── growable byte buffer ────────────────────────────────────────────
+
+fn bb_new(cap: i32) { return { buf: buffer(cap), len: 0 }; }
+
+fn bb_append(bb, chunk, n: i32): null {
+	if (n <= 0) { return null; }
+	if (bb.len + n > bb.buf.length) {
+		let cap = bb.buf.length * 2;
+		if (cap < 1024) { cap = 1024; }
+		while (cap < bb.len + n) { cap = cap * 2; }
+		let nb = buffer(cap);
+		if (bb.len > 0) { memcpy(nb, bb.buf, bb.len); }
+		bb.buf = nb;
+	}
+	memcpy(bb.buf.slice(bb.len, bb.len + n), chunk, n);
+	bb.len = bb.len + n;
+	return null;
+}
+
+fn bb_slice(bb, start: i32, end: i32) {
+	return bb.buf.slice(start, end);
+}
+
+// Index of "\r\n\r\n" at or after `from`, or -1.
+fn bb_find_head_end(bb, from: i32): i32 {
+	let i = from;
+	while (i + 3 < bb.len) {
+		if (bb.buf[i] == 13 && bb.buf[i + 1] == 10 && bb.buf[i + 2] == 13 && bb.buf[i + 3] == 10) {
+			return i;
+		}
+		i = i + 1;
+	}
+	return -1;
+}
+
+// Index of "\r\n" at or after `from`, or -1.
+fn bb_find_crlf(bb, from: i32): i32 {
+	let i = from;
+	while (i + 1 < bb.len) {
+		if (bb.buf[i] == 13 && bb.buf[i + 1] == 10) { return i; }
+		i = i + 1;
+	}
+	return -1;
+}
+
+// Write everything (send(2) may write less than asked).
+fn write_all(stream, data): null {
+	let buf = data;
+	if (typeof(data) == "string") { buf = data.to_bytes(); }
+	let off = 0;
+	let n = buf.length;
+	while (off < n) {
+		let w = stream.write(off == 0 ? buf : buf.slice(off, n));
+		if (w <= 0) { throw "write returned " + w; }
+		off = off + w;
+	}
+	return null;
+}
+
+// ── request parsing ─────────────────────────────────────────────────
+
+// A reader over a socket with a byte buffer and a cursor.
+fn reader_new(stream) { return { stream: stream, bb: bb_new(16384), pos: 0, eof: false }; }
+
+fn reader_fill(rd): bool {
+	if (rd.eof) { return false; }
+	let chunk = rd.stream.read(READ_CHUNK);
+	if (chunk == null || chunk.length == 0) { rd.eof = true; return false; }
+	bb_append(rd.bb, chunk, chunk.length);
+	return true;
+}
+
+// Read up to and including the next CRLF; returns the line (no CRLF) or null.
+fn reader_line(rd) {
+	loop {
+		let at = bb_find_crlf(rd.bb, rd.pos);
+		if (at >= 0) {
+			let line = __string_from_bytes(bb_slice(rd.bb, rd.pos, at));
+			rd.pos = at + 2;
+			return line;
+		}
+		if (rd.bb.len - rd.pos > MAX_HEADER_BYTES) { throw "line too long"; }
+		if (!reader_fill(rd)) { return null; }
+	}
+}
+
+// Ensure n unread bytes are buffered.
+fn reader_need(rd, n: i32): bool {
+	while (rd.bb.len - rd.pos < n) {
+		if (!reader_fill(rd)) { return false; }
+	}
+	return true;
+}
+
+fn header_get(headers, name: string) {
+	for (h in headers) {
+		if (h.key == name) { return h.value; }
+	}
+	return null;
+}
+
+// Parse one request. Returns { method, target, version, headers: [{name,
+// key (lower), value}], body: bb } or null (client closed / bad request).
+// Bodies: Content-Length or chunked (decoded). `Expect: 100-continue` is
+// answered before reading the body, so curl doesn't stall a second.
+fn read_request(stream) {
+	let rd = reader_new(stream);
+	let head_end = -1;
+	loop {
+		head_end = bb_find_head_end(rd.bb, 0);
+		if (head_end >= 0) { break; }
+		if (rd.bb.len > MAX_HEADER_BYTES) { return null; }
+		if (!reader_fill(rd)) { return null; }
+	}
+	let head = __string_from_bytes(bb_slice(rd.bb, 0, head_end));
+	rd.pos = head_end + 4;
+	let lines = head.split("\r\n");
+	let rl = lines[0].split(" ");
+	if (rl.length < 3) { return null; }
+	let headers = [];
+	let i = 1;
+	while (i < lines.length) {
+		let line = lines[i];
+		let c = line.find(":");
+		if (c > 0) {
+			let name = line.substr(0, c).trim();
+			let value = line.substr(c + 1, line.length - c - 1).trim();
+			headers.push({ name: name, key: name.to_lower(), value: value });
+		}
+		i = i + 1;
+	}
+	let req = { method: rl[0], target: rl[1], version: rl[rl.length - 1],
+		headers: headers, body: bb_new(1024), has_body: false };
+
+	let expect = header_get(headers, "expect");
+	let te = header_get(headers, "transfer-encoding");
+	let cl = header_get(headers, "content-length");
+	let wants_body = (te != null && te.to_lower().find("chunked") >= 0) || (cl != null && i32(cl) > 0);
+	if (wants_body && expect != null && expect.to_lower() == "100-continue") {
+		write_all(stream, "HTTP/1.1 100 Continue\r\n\r\n");
+	}
+
+	if (te != null && te.to_lower().find("chunked") >= 0) {
+		req.has_body = true;
+		loop {
+			let size_line = reader_line(rd);
+			if (size_line == null) { return null; }
+			let semi = size_line.find(";");
+			let hex = (semi >= 0 ? size_line.substr(0, semi) : size_line).trim();
+			let size = i32(parse_hex(hex));
+			if (size == 0) {
+				// trailers until the blank line
+				loop {
+					let t = reader_line(rd);
+					if (t == null || t.length == 0) { break; }
+				}
+				break;
+			}
+			if (req.body.len + size > MAX_BODY_BYTES) { throw "body too large"; }
+			if (!reader_need(rd, size + 2)) { return null; }
+			bb_append(req.body, bb_slice(rd.bb, rd.pos, rd.pos + size), size);
+			rd.pos = rd.pos + size + 2;
+		}
+	} else if (cl != null) {
+		let n = i32(cl);
+		if (n > MAX_BODY_BYTES) { throw "body too large"; }
+		req.has_body = true;
+		if (n > 0) {
+			if (!reader_need(rd, n)) { return null; }
+			bb_append(req.body, bb_slice(rd.bb, rd.pos, rd.pos + n), n);
+		}
+	}
+	return req;
+}
+
+fn parse_hex(s: string): i64 {
+	let v: i64 = 0;
+	let i = 0;
+	let digits = "0123456789abcdef";
+	let ls = s.to_lower();
+	while (i < ls.length) {
+		let d = digits.find(ls.substr(i, 1));
+		if (d < 0) { throw "bad chunk size '" + s + "'"; }
+		v = v * 16 + d;
+		i = i + 1;
+	}
+	return v;
+}
+
+// ── responses generated by the proxy itself ─────────────────────────
+
+fn simple_response(stream, status: i32, reason: string, body: string): null {
+	let b = body.to_bytes();
+	write_all(stream, "HTTP/1.1 " + status + " " + reason + "\r\n"
+		+ "Content-Type: application/json; charset=utf-8\r\n"
+		+ "Content-Length: " + b.length + "\r\n"
+		+ "Connection: close\r\n\r\n");
+	write_all(stream, b);
+	return null;
+}
+
+// Same shape llama-server answers with while its model loads, so health
+// pollers (CP auto-spawn, /api/ready) treat a restarting shared server as
+// "loading", not as an error.
+fn loading_response(stream, why: string): null {
+	return simple_response(stream, 503, "Service Unavailable", stringify({
+		error: { code: 503, message: "Loading model", type: "unavailable_error",
+			witchgrid: why },
+	}));
+}
+
+// ── member context (per request, from sqlite) ───────────────────────
+
+// Everything a request needs: where the shared server is and what to
+// inject. null member → the member was stopped (close up shop).
+fn member_context(db, member_id: string) {
+	let m = query(db,
+		"select id, profile, port, profile_json, share_key, pid from services "
+		+ "where id = ? and state = 'running' and share_role = 'member'", [member_id]);
+	if (m.length == 0) { return { stopped: true }; }
+	let mrow = m[0];
+	let prof = null;
+	try { prof = parse(mrow.profile_json); } catch (e) { }
+	let s = query(db,
+		"select id, port, pid, profile_json from services "
+		+ "where share_key = ? and share_role = 'server' and state = 'running' "
+		+ "order by started_at desc limit 1", [mrow.share_key]);
+	if (s.length == 0) {
+		return { stopped: false, server: null, member: mrow, prof: prof };
+	}
+	let sprof = null;
+	try { sprof = parse(s[0].profile_json); } catch (e) { }
+	let adapters = sprof?.__shared_server?.adapters ?? [];
+	let mine = [];
+	try { mine = profile_adapters(prof); } catch (e) { mine = []; }
+	return {
+		stopped: false,
+		member: mrow,
+		prof: prof,
+		server: s[0],
+		upstream_port: s[0].port,
+		selection: selection_json(selection_for(adapters, mine)),
+		alias: profile_alias(prof),
+	};
+}
+
+export fn member_still_ours(db, member_id: string): bool {
+	let m = query(db,
+		"select pid from services where id = ? and state = 'running' and share_role = 'member'",
+		[member_id]);
+	return m.length > 0 && m[0].pid == get_pid();
+}
+
+// ── forwarding ──────────────────────────────────────────────────────
+
+let HOP_BY_HOP = ["connection", "keep-alive", "proxy-connection", "transfer-encoding",
+	"te", "trailer", "upgrade", "content-length", "host", "expect"];
+
+fn build_head(req, port: i32, body_len: i32, send_length: bool): string {
+	// Keep the client's HTTP version: llama-server (cpp-httplib) frames its
+	// response for the version it's asked with, and an HTTP/1.0 client
+	// (nginx's default proxy_http_version) must get what a dedicated
+	// server would have sent it.
+	let ver = (req.version == "HTTP/1.0") ? "HTTP/1.0" : "HTTP/1.1";
+	let h = req.method + " " + req.target + " " + ver + "\r\n";
+	h = h + "Host: 127.0.0.1:" + port + "\r\n";
+	for (x in req.headers) {
+		if (HOP_BY_HOP.contains(x.key)) { continue; }
+		h = h + x.name + ": " + x.value + "\r\n";
+	}
+	if (send_length) { h = h + "Content-Length: " + body_len + "\r\n"; }
+	h = h + "Connection: close\r\n\r\n";
+	return h;
+}
+
+// Read the whole upstream response (only used for small JSON responses
+// that get the alias rewrite). Returns { head, body (string), raw (bb) }.
+fn read_all(stream) {
+	let bb = bb_new(8192);
+	loop {
+		let chunk = stream.read(READ_CHUNK);
+		if (chunk == null || chunk.length == 0) { break; }
+		bb_append(bb, chunk, chunk.length);
+	}
+	return bb;
+}
+
+// Rewrite a buffered upstream response's JSON body to the member alias.
+// Anything unexpected (chunked framing, non-JSON, non-200) → raw passthrough.
+fn relay_with_alias(client, up, target: string, alias: string): null {
+	let raw = read_all(up);
+	let he = bb_find_head_end(raw, 0);
+	if (he < 0) { if (raw.len > 0) { write_all(client, bb_slice(raw, 0, raw.len)); } return null; }
+	let head = __string_from_bytes(bb_slice(raw, 0, he));
+	let lines = head.split("\r\n");
+	let ok = lines[0].find(" 200") >= 0 && head.to_lower().find("transfer-encoding: chunked") < 0;
+	let rewritten = null;
+	if (ok) {
+		let body = __string_from_bytes(bb_slice(raw, he + 4, raw.len));
+		rewritten = rewrite_alias_json(target, body, alias);
+	}
+	if (rewritten == null) { write_all(client, bb_slice(raw, 0, raw.len)); return null; }
+	let nb = rewritten.to_bytes();
+	let out = lines[0] + "\r\n";
+	let i = 1;
+	while (i < lines.length) {
+		let lk = lines[i].to_lower();
+		if (!lk.starts_with("content-length:") && !lk.starts_with("connection:")) {
+			out = out + lines[i] + "\r\n";
+		}
+		i = i + 1;
+	}
+	out = out + "Content-Length: " + nb.length + "\r\nConnection: close\r\n\r\n";
+	write_all(client, out);
+	write_all(client, nb);
+	return null;
+}
+
+fn handle_one(db, member_id: string, client): null {
+	client.set_timeout(CLIENT_TIMEOUT_S);
+	let req = null;
+	try { req = read_request(client); } catch (e) {
+		try { simple_response(client, 400, "Bad Request", stringify({ error: "" + e })); } catch (e2) { }
+		return null;
+	}
+	if (req == null) { return null; }
+
+	if (req.method == "GET" && strip_query(req.target) == PROBE_PATH) {
+		simple_response(client, 200, "OK", stringify({ member_id: member_id, agent_pid: get_pid() }));
+		return null;
+	}
+	let ctx = member_context(db, member_id);
+	if (ctx.stopped) {
+		simple_response(client, 503, "Service Unavailable",
+			stringify({ error: "witchgrid: this shared-LoRA member was stopped" }));
+		return null;
+	}
+	let blocked = blocked_reason(req.method, req.target);
+	if (blocked != null) {
+		simple_response(client, 403, "Forbidden", stringify({ error: blocked }));
+		return null;
+	}
+	if (ctx.server == null) {
+		loading_response(client, "shared llama-server for this member is not running");
+		return null;
+	}
+
+	// Body: inject the selection into generation requests; anything else
+	// goes through as the exact bytes received.
+	let body_out = null;
+	if (req.has_body && req.body.len > 0) {
+		body_out = bb_slice(req.body, 0, req.body.len);
+		if (is_injectable(req.method, req.target)) {
+			let injected = inject_lora(__string_from_bytes(body_out), ctx.selection);
+			if (injected != null) { body_out = injected.to_bytes(); }
+		}
+	} else if (is_injectable(req.method, req.target)) {
+		// A generation POST with no body is a client error upstream; still
+		// pin the adapter so it can never fall back to global scales.
+		body_out = ("{\"lora\":" + ctx.selection + "}").to_bytes();
+	}
+	let body_len = (body_out == null) ? 0 : body_out.length;
+	let send_length = (body_out != null) || req.has_body;
+
+	let up = null;
+	try {
+		up = connect_loopback(i32(ctx.upstream_port));
+	} catch (e) {
+		loading_response(client, "shared llama-server not accepting connections yet");
+		return null;
+	}
+	try {
+		up.set_timeout(UPSTREAM_TIMEOUT_S);
+		write_all(up, build_head(req, i32(ctx.upstream_port), body_len, send_length));
+		if (body_len > 0) { write_all(up, body_out); }
+		let alias = ctx.alias;
+		if (alias != null && is_alias_rewrite(req.method, req.target)) {
+			relay_with_alias(client, up, req.target, alias);
+		} else {
+			// Raw relay: bytes go out the moment they arrive (SSE).
+			loop {
+				let chunk = up.read(READ_CHUNK);
+				if (chunk == null || chunk.length == 0) { break; }
+				write_all(client, chunk);
+			}
+		}
+	} catch (e) {
+		// Client went away (write failed) or upstream timed out. Closing
+		// upstream below is what cancels the generation in llama-server.
+	}
+	try { up.close(); } catch (e) { }
+	return null;
+}
+
+// Bind the member port and serve it on a detached task. Throws if the port
+// can't be bound (the caller turns that into a spawn error). The accept
+// loop exits — closing the port — once the member row is no longer
+// 'running' and ours; stop_member_proxy wakes it with a connection.
+export fn start_member_proxy(db, member_id: string, port: i32): null {
+	let listener = TcpListener("0.0.0.0", port);
+	let worker = async fn(stream): null {
+		try { handle_one(db, member_id, stream); } catch (e) {
+			eprint("[lora-proxy] " + member_id.substr(0, 8) + ": " + e);
+		}
+		try { stream.close(); } catch (e) { }
+		return null;
+	};
+	let accept_loop = async fn(): null {
+		loop {
+			let stream = null;
+			try { stream = listener.accept(); } catch (e) {
+				sleep(0.1);
+				if (!member_still_ours(db, member_id)) { break; }
+				continue;
+			}
+			if (!member_still_ours(db, member_id)) {
+				try { stream.close(); } catch (e) { }
+				break;
+			}
+			let t = spawn(worker, stream);
+			detach(t);
+		}
+		try { listener.close(); } catch (e) { }
+		print("[lora-proxy] member " + member_id.substr(0, 8) + " port " + port + " closed");
+		return null;
+	};
+	let t = spawn(accept_loop);
+	detach(t);
+	print("[lora-proxy] member " + member_id.substr(0, 8) + " listening on :" + port);
+	return null;
+}
+
+// Is OUR proxy for this member serving the port right now?
+export fn member_proxy_alive(member_id: string, port: i32): bool {
+	let s = null;
+	try { s = connect_loopback(port); } catch (e) { return false; }
+	let ok = false;
+	try {
+		s.set_timeout(3.0);
+		write_all(s, "GET " + PROBE_PATH + " HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+		let bb = read_all(s);
+		let txt = __string_from_bytes(bb_slice(bb, 0, bb.len));
+		let he = txt.find("\r\n\r\n");
+		if (he >= 0) {
+			let body = parse(txt.substr(he + 4, txt.length - he - 4));
+			ok = (body?.member_id == member_id && body?.agent_pid == get_pid());
+		}
+	} catch (e) { ok = false; }
+	try { s.close(); } catch (e) { }
+	return ok;
+}
+
+// Wake the accept loop so it notices the member is gone and closes the
+// port; wait (briefly) until the port is free again.
+export fn stop_member_proxy(port: i32): null {
+	let i = 0;
+	while (i < 20) {
+		let s = null;
+		try { s = connect_loopback(port); } catch (e) { return null; }
+		try { s.close(); } catch (e) { }
+		sleep(0.1);
+		i = i + 1;
+	}
+	return null;
+}

@@ -21,8 +21,10 @@
 //   GET  /profiles                                                → [profile names]
 
 import { posix_spawn, kill, get_pid, waitpid, exec_argv } from "@stdlib/process";
-import { SIGTERM } from "@stdlib/signal";
-import { setenv, unsetenv } from "@stdlib/env";
+// Aliased: hemlockc emits `#undef <name>` for imported names, which
+// clobbers the C macros SIGTERM / AF_INET for modules initialized later.
+import { SIGTERM as SIG_TERM } from "@stdlib/signal";
+import { setenv, unsetenv, getenv } from "@stdlib/env";
 import { SpinLock } from "@stdlib/atomic";
 import { open, open_fd, file_stat, list_dir, exists } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
@@ -43,6 +45,14 @@ import { current_binary_path as pcpp_current_binary_path } from "./piper_cpp";
 // time — never from the CP payload. See local_services.hml.
 import { local_services_dir, find_declaration, build_argv as local_build_argv,
 	build_env as local_build_env } from "./local_services";
+// Shared-base LoRA serving: pure decisions + the member-port proxy.
+import { is_sharing_profile, is_shared_server_profile, sharing_profile_error,
+	share_key, compat_signature, desired_config, config_covers, restart_config,
+	shared_server_profile, server_config, profile_adapters, profile_alias,
+	member_slots, member_ctx_per_slot } from "./lora_share";
+import { start_member_proxy, stop_member_proxy, member_proxy_alive } from "./lora_proxy";
+import { socket_create, AF_INET as NET_AF_INET, SOCK_STREAM as NET_SOCK_STREAM,
+	SOL_SOCKET as NET_SOL_SOCKET, SO_REUSEADDR as NET_SO_REUSEADDR } from "@stdlib/net";
 
 // IDs come from sqlite's hex(randomblob(16)) rather than @stdlib/uuid —
 // keeps us at one FFI-backed stdlib dep (libsqlite3) and avoids needing
@@ -122,6 +132,16 @@ export fn init_services_schema(db): null {
 	try {
 		db_exec(db, "alter table services add column stopped_at text", []);
 	} catch (e) { }
+	// Shared-base LoRA serving (lora_share.hml). share_role is 'server' for
+	// a shared llama-server, 'member' for a profile served through it (its
+	// pid is the agent's own — the member is a proxy inside the agent);
+	// share_key links them. NULL for every ordinary service.
+	try {
+		db_exec(db, "alter table services add column share_key text", []);
+	} catch (e) { }
+	try {
+		db_exec(db, "alter table services add column share_role text", []);
+	} catch (e) { }
 	return null;
 }
 
@@ -194,13 +214,18 @@ let ADOPTION_HISTORY_DAYS = 7;
 
 export fn reap_zombie_services(db): i32 {
 	let rows = query(db,
-		"select id, pid, profile_json from services where state = 'running'", []);
+		"select id, pid, profile_json, share_role from services where state = 'running'", []);
 	let reaped = 0;
+	let me = get_pid();
 	for (row in rows) {
 		// Binary-aware (service_healthy), so with the watchdog off a live
 		// sd/whisper/piper/local service isn't misread as a recycled
-		// llama-server pid and dropped from 'running'.
-		let drop = !service_healthy(row.pid, row_binary(row.profile_json));
+		// llama-server pid and dropped from 'running'. A shared-LoRA member
+		// is a proxy inside the agent: alive iff it belongs to this process
+		// (with the watchdog off nothing re-binds it after an agent restart).
+		let drop = false;
+		if (row?.share_role == "member") { drop = (row.pid != me); }
+		else { drop = !service_healthy(row.pid, row_binary(row.profile_json)); }
 		if (drop) {
 			db_exec(db,
 				"update services set state = 'dead' where id = ?",
@@ -343,6 +368,7 @@ export fn discover_orphan_llama_servers(db, our_uid: i32): null {
 			"select id, profile, port, profile_json, profile_version "
 			+ "from services where state in ('dead', 'stopped') and port = ? "
 			+ "and (model_path = ? or model_path is null) "
+			+ "and (share_role is null or share_role <> 'member') "
 			+ "order by started_at desc limit 1",
 			[port, model ?? ""]);
 		if (candidates.length == 0) {
@@ -406,6 +432,7 @@ export fn discover_orphan_sd_servers(db, our_uid: i32): null {
 			"select id, profile, port, profile_json, profile_version "
 			+ "from services where state in ('dead', 'stopped') and port = ? "
 			+ "and (model_path = ? or model_path is null) "
+			+ "and (share_role is null or share_role <> 'member') "
 			+ "order by started_at desc limit 1",
 			[port, model ?? ""]);
 		if (candidates.length == 0) {
@@ -636,6 +663,12 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 	if (prof?.binary == "local") {
 		return spawn_local_service(db, profile_name, prof, port, gpus);
 	}
+	// share_group profile: join (or start) the shared llama-server for its
+	// base model and serve this profile through a proxy on its own port.
+	if (is_sharing_profile(prof)) {
+		return join_shared(db, profile_name, prof, model_path, port, gpus,
+			tensor_split, capabilities, binary_path);
+	}
 
 	// Build full argv: binary + intent-derived flags + extras + spawner-set
 	// model/port/host. capabilities is the parsed --help map for prof.binary
@@ -670,7 +703,10 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 		argv.push("-l"); argv.push("0.0.0.0");
 	} else {
 		argv.push("--port"); argv.push("" + port);
-		argv.push("--host"); argv.push("0.0.0.0");
+		// A shared-LoRA server binds loopback only: members reach it through
+		// their proxies, which pin the adapter per request.
+		argv.push("--host");
+		argv.push(is_shared_server_profile(prof) ? (prof?.bind_host ?? "127.0.0.1") : "0.0.0.0");
 
 		// Multimodal autoload (llama-server only). If the model has a
 		// co-located mmproj projector and the profile didn't already
@@ -868,6 +904,10 @@ fn finish_spawn(db, id: string, log_path: string, pid: i32, profile_name: string
 		"insert into services (id, profile, model_path, pid, port, log_path, args_json, started_at, profile_version, profile_json, gpus_json, tensor_split_json, state) "
 		+ "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')",
 		[id, profile_name, model_path, pid, port, log_path, stringify(argv), now, pv, pjson, gjson, tjson]);
+	if (is_shared_server_profile(prof)) {
+		db_exec(db, "update services set share_key = ?, share_role = 'server' where id = ?",
+			[prof.__shared_server.key, id]);
+	}
 
 	return {
 		id: id,
@@ -1044,9 +1084,10 @@ export fn list_services(db): array {
 	// these (a just-crashed 'running' row gets reaped within ~1 tick, too
 	// fleeting to rely on). Adoption-history ('dead'/'stopped') stays hidden.
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state, profile_json "
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state, profile_json, share_key, share_role "
 		+ "from services where state in ('running', 'failed') order by started_at desc", []);
 	let out = [];
+	let me = get_pid();
 	for (row in rows) {
 		// device reflects where the service actually runs: gpus_json is the
 		// pinned GPU index list at spawn time — empty/null means it was
@@ -1075,11 +1116,45 @@ export fn list_services(db): array {
 			binary: row_binary(row?.profile_json),
 			alive: process_alive(row.pid),
 		});
+		let sv = shared_view(db, row);
+		if (sv != null) {
+			let entry = out[out.length - 1];
+			entry["shared"] = sv;
+			// A member is up when its proxy belongs to this agent process
+			// and the shared server it forwards to is up.
+			if (sv.role == "member") {
+				entry["alive"] = (row.pid == me) && (sv.server_alive == true);
+			}
+		}
 	}
 	return out;
 }
 
 export fn stop_service(db, id: string): bool {
+	let rows = query(db,
+		"select port, share_key, share_role from services where id = ? and state = 'running'", [id]);
+	if (rows.length == 0) {
+		return false;
+	}
+	let role = rows[0]?.share_role;
+	if (role == "member" || role == "server") {
+		share_lock();
+		try {
+			if (role == "member") { stop_member_locked(db, id, rows[0].port, rows[0].share_key); }
+			else { stop_server_locked(db, id, rows[0].share_key); }
+		} catch (e) {
+			share_unlock();
+			throw e;
+		}
+		share_unlock();
+		return true;
+	}
+	return stop_plain_service(db, id);
+}
+
+// SIGTERM a process-backed service and soft-delete its row (the original
+// stop path; shared members are handled above).
+fn stop_plain_service(db, id: string): bool {
 	let rows = query(db,
 		"select pid, profile_json from services where id = ? and state = 'running'", [id]);
 	if (rows.length == 0) {
@@ -1088,9 +1163,9 @@ export fn stop_service(db, id: string): bool {
 	let pid = rows[0].pid;
 	if (row_binary(rows[0].profile_json) == "local") {
 		// The whole process group: a wrapper script's children too.
-		signal_group(pid, SIGTERM);
+		signal_group(pid, SIG_TERM);
 	} else if (process_alive(pid)) {
-		try { kill(pid, SIGTERM); } catch (e) { /* race with exit; fine */ }
+		try { kill(pid, SIG_TERM); } catch (e) { /* race with exit; fine */ }
 	}
 	reap_child(pid);
 	// Soft-delete: keep the row so adoption can match by port if the
@@ -1130,7 +1205,8 @@ export fn finish_stops(db): i32 {
 	let rows = query(db,
 		"select id, pid, profile_json, "
 		+ "(strftime('%s','now') - strftime('%s', stopped_at)) as since_s "
-		+ "from services where state <> 'running'", []);
+		+ "from services where state <> 'running' "
+		+ "and (share_role is null or share_role <> 'member')", []);
 	let running = query(db, "select pid from services where state = 'running'", []);
 	let running_pids = {};
 	for (r in running) { running_pids["" + r.pid] = true; }
@@ -1234,13 +1310,35 @@ export fn reconcile_services(db, caps_ref): i32 {
 		// Watchdog off — plain reap so dead rows still leave 'running'.
 		return 0 - reap_zombie_services(db);   // negative = "reaped, not restarted"
 	}
+	// Under SHARE_LOCK so a respawn can't interleave with a shared-server
+	// join/restart on another thread. try_acquire, not wait: a join can hold
+	// the lock for a model reload, and blocking the heartbeat that long
+	// would make the CP drop this node as stale. The next tick catches up.
+	if (!SHARE_LOCK.try_acquire()) {
+		print("[watchdog] shared-server change in progress; reconcile deferred to next tick");
+		return 0;
+	}
+	let n = 0;
+	try {
+		n = reconcile_services_locked(db, caps_ref);
+		ensure_member_proxies_locked(db);
+	} catch (e) {
+		share_unlock();
+		throw e;
+	}
+	share_unlock();
+	return n;
+}
+
+fn reconcile_services_locked(db, caps_ref): i32 {
 
 	// ── phase 1: read-only classification ──────────────────────────
 	let rows = query(db,
 		"select id, profile, model_path, pid, port, profile_json, gpus_json, "
 		+ "tensor_split_json, restart_count, "
 		+ "(strftime('%s','now') - strftime('%s', started_at)) as uptime_s "
-		+ "from services where state = 'running'", []);
+		+ "from services where state = 'running' "
+		+ "and (share_role is null or share_role <> 'member')", []);
 	let dead = [];
 	let live_ports = {};   // ports already served by a healthy 'running' row
 	for (row in rows) {
@@ -1336,6 +1434,391 @@ export fn reconcile_services(db, caps_ref): i32 {
 	return restarted;
 }
 
+// ── shared-base LoRA serving ────────────────────────────────────────────
+// Profiles with `share_group` (lora_share.hml) are served by ONE
+// llama-server per (group, base model, server settings, GPU set) — the
+// "server" row — with every member's adapters loaded at global scale 0.
+// Each member keeps its own port: a "member" row whose pid is the agent's
+// own and whose port is served by an in-agent proxy (lora_proxy.hml) that
+// pins the member's adapter on every generation request.
+//
+// Lifecycle:
+//   join     first member starts the server; a later member joins it, and
+//            the server restarts only when it doesn't already cover the
+//            new member (adapter not loaded, too few slots/context) —
+//            llama-server can't load an adapter at runtime. The restart is
+//            stop-then-start (a 16 GB card can't hold two copies), so the
+//            other members answer 503 "Loading model" for the reload time.
+//   leave    stopping a member closes its port; the server keeps running
+//            for the others WITHOUT a restart (the departed member's
+//            adapter/slots are reclaimed at the next restart). Stopping
+//            the LAST member stops the server. Stopping the server row
+//            stops all of its members.
+//   watchdog the server is an ordinary llama-server row: crash → respawn
+//            from its stored profile (same config), crash-loop → 'failed'.
+//            Members are re-checked every tick (ensure_member_proxies): a
+//            member whose proxy isn't this agent process's — i.e. after an
+//            agent restart — gets its port re-bound. The proxies live and
+//            die with the agent; the server, a setsid child, outlives it.
+// All membership changes and the watchdog tick hold SHARE_LOCK.
+
+let SHARE_LOCK = SpinLock();
+
+// Sleeping lock: a join can hold it across a model load, so don't spin.
+fn share_lock(): null {
+	while (!SHARE_LOCK.try_acquire()) { sleep(0.02); }
+	return null;
+}
+
+fn share_unlock(): null {
+	SHARE_LOCK.release();
+	return null;
+}
+
+// Internal (loopback) ports for shared servers start here and walk up.
+fn shared_port_base(): i32 {
+	let v = getenv("WITCHGRID_SHARED_PORT_BASE");
+	if (v == null || v.length == 0) { return 18700; }
+	return i32(v);
+}
+
+fn port_bindable(port: i32): bool {
+	let s = null;
+	try { s = socket_create(NET_AF_INET, NET_SOCK_STREAM, 0); } catch (e) { return true; }
+	try { s.setsockopt(NET_SOL_SOCKET, NET_SO_REUSEADDR, 1); } catch (e) { }
+	let free = true;
+	try { s.bind("0.0.0.0", port); } catch (e) { free = false; }
+	try { s.close(); } catch (e) { }
+	return free;
+}
+
+fn pick_internal_port(db): i32 {
+	let used = {};
+	let rows = query(db, "select port from services where state in ('running', 'failed')", []);
+	for (r in rows) { used["" + r.port] = true; }
+	let p = shared_port_base();
+	let n = 0;
+	while (n < 200) {
+		if (!used.has("" + p) && port_bindable(p)) { return p; }
+		p = p + 1;
+		n = n + 1;
+	}
+	throw "share: no free internal port in " + shared_port_base() + "-" + (shared_port_base() + 199);
+}
+
+// The running server row for a share key (with its parsed profile), or null.
+fn server_row_by_key(db, key: string) {
+	let r = query(db,
+		"select id, pid, port, model_path, profile_json, gpus_json, tensor_split_json, "
+		+ "log_path, started_at from services "
+		+ "where share_key = ? and share_role = 'server' and state = 'running' "
+		+ "order by started_at desc limit 1", [key]);
+	if (r.length == 0) { return null; }
+	let row = r[0];
+	let prof = null;
+	try { prof = parse(row.profile_json); } catch (e) { }
+	row["prof"] = prof;
+	return row;
+}
+
+// Profiles of the running members of a share key, in join order.
+fn member_profs(db, key: string): array {
+	let rows = query(db,
+		"select profile_json from services where share_key = ? and share_role = 'member' "
+		+ "and state = 'running' order by started_at asc, rowid asc", [key]);
+	let out = [];
+	for (r in rows) {
+		try { out.push(parse(r.profile_json)); } catch (e) { }
+	}
+	return out;
+}
+
+// Stop a shared server and WAIT for it to exit (its VRAM must be free
+// before the replacement loads). SIGKILL after HALT_TERM_GRACE_SECONDS:
+// a server spawned from one of the agent's worker threads inherits that
+// thread's blocked signal mask (Hemlock blocks signals in spawned tasks and
+// posix_spawn doesn't reset the mask), so SIGTERM stays pending and only
+// SIGKILL ends it. llama-server holds nothing that needs a clean shutdown,
+// and every second here is downtime for the other members.
+let HALT_TERM_GRACE_SECONDS = 1.0;
+
+fn halt_server(db, row): null {
+	let pid = row.pid;
+	if (process_alive(pid)) {
+		try { kill(pid, SIG_TERM); } catch (e) { }
+	}
+	let waited = 0.0;
+	while (process_alive(pid) && waited < HALT_TERM_GRACE_SECONDS) {
+		sleep(0.2);
+		waited = waited + 0.2;
+		reap_child(pid);
+	}
+	if (process_alive(pid) && is_our_llama_server(pid)) {
+		try { kill(pid, SIGKILL); } catch (e) { }
+		sleep(0.5);
+	}
+	reap_child(pid);
+	db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?",
+		[row.id]);
+	return null;
+}
+
+fn parse_or_null(j) {
+	if (j == null) { return null; }
+	try { return parse(j); } catch (e) { }
+	return null;
+}
+
+// Restart a shared server with a bigger config. On failure, bring the
+// previous config back so the existing members keep serving, then throw.
+fn restart_shared(db, srv, cfg, prof, group: string, key: string, caps, bin: string,
+                  model_path: string) {
+	let gpus = parse_or_null(srv.gpus_json);
+	let ts = parse_or_null(srv.tensor_split_json);
+	print("[share] restarting " + key + ": " + cfg.adapters.length + " adapter(s), "
+		+ cfg.slots + " slot(s) x " + cfg.ctx_per_slot + " ctx");
+	halt_server(db, srv);
+	let sprof = shared_server_profile(prof, cfg, group, key, caps, model_path);
+	try {
+		spawn_service(db, "shared:" + group, sprof, model_path, pick_internal_port(db),
+			gpus, ts, caps, bin);
+	} catch (e) {
+		eprint("[share] restart of " + key + " failed: " + e + " — restoring the previous config");
+		try {
+			spawn_service(db, "shared:" + group, srv.prof, model_path, pick_internal_port(db),
+				gpus, ts, caps, bin);
+		} catch (e2) {
+			eprint("[share] restoring " + key + " failed too: " + e2);
+		}
+		throw e;
+	}
+	return server_row_by_key(db, key);
+}
+
+fn join_shared(db, profile_name: string, prof, model_path: string, port: i32, gpus,
+               tensor_split, caps, bin: string): object {
+	let err = sharing_profile_error(prof);
+	if (err != null) { throw "share: " + err; }
+	if (caps == null || !caps.has("lora-scaled")) {
+		throw "share: this llama-server has no --lora-scaled (needed to load adapters "
+			+ "at global scale 0); upgrade llama.cpp on this node";
+	}
+	share_lock();
+	let out = null;
+	try {
+		out = join_shared_locked(db, profile_name, prof, model_path, port, gpus,
+			tensor_split, caps, bin);
+	} catch (e) {
+		share_unlock();
+		throw e;
+	}
+	share_unlock();
+	return out;
+}
+
+fn join_shared_locked(db, profile_name: string, prof, model_path: string, port: i32,
+                      gpus, tensor_split, caps, bin: string): object {
+	let group = "" + prof.share_group;
+	let key = share_key(group, model_path, prof, gpus);
+	let sig = compat_signature(prof);
+
+	// Same group + same base model already served with DIFFERENT server
+	// settings is almost certainly a profile mismatch (one has --jinja, one
+	// doesn't…). Refuse with the diff instead of quietly loading the base
+	// twice. (Different GPU sets with equal settings are separate servers.)
+	let others = query(db,
+		"select profile_json, model_path from services "
+		+ "where share_role = 'server' and state = 'running'", []);
+	for (o in others) {
+		let ss = parse_or_null(o.profile_json)?.__shared_server;
+		if (ss == null || ss?.group != group || o.model_path != model_path) { continue; }
+		if (ss?.signature != null && ss.signature != sig) {
+			throw "share: share_group '" + group + "' already serves " + model_path
+				+ " with " + ss.signature + "; '" + profile_name + "' has " + sig
+				+ " — make the settings match or use another share_group";
+		}
+	}
+
+	let srv = server_row_by_key(db, key);
+	let profs = member_profs(db, key);
+	profs.push(prof);
+	let want = desired_config(profs);
+	let restarted = false;
+	if (srv != null) {
+		let cur = server_config(srv.prof);
+		if (!config_covers(cur, want)) {
+			srv = restart_shared(db, srv, restart_config(cur, want), prof, group, key,
+				caps, bin, model_path);
+			restarted = true;
+		} else {
+			print("[share] " + profile_name + " joins " + key + " (no restart needed)");
+		}
+	} else {
+		let iport = pick_internal_port(db);
+		let sprof = shared_server_profile(prof, want, group, key, caps, model_path);
+		spawn_service(db, "shared:" + group, sprof, model_path, iport, gpus, tensor_split,
+			caps, bin);
+		srv = server_row_by_key(db, key);
+		print("[share] started shared server " + key + " on 127.0.0.1:" + iport
+			+ " for " + profile_name);
+	}
+	if (srv == null) { throw "share: shared server for " + key + " is not running"; }
+
+	let id = new_id(db);
+	let now = iso_now(db);
+	db_exec(db,
+		"insert into services (id, profile, model_path, pid, port, log_path, args_json, "
+		+ "started_at, profile_version, profile_json, gpus_json, tensor_split_json, state, "
+		+ "share_key, share_role) values (?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, 'running', ?, 'member')",
+		[id, profile_name, model_path, get_pid(), port, srv.log_path, now, prof?.__version,
+			stringify(prof), srv.gpus_json, srv.tensor_split_json, key]);
+	try {
+		start_member_proxy(db, id, port);
+	} catch (e) {
+		db_exec(db, "update services set state = 'dead' where id = ?", [id]);
+		if (member_profs(db, key).length == 0) { halt_server(db, srv); }
+		throw "spawn died immediately: member port " + port + " could not be bound (" + e + ")";
+	}
+	return {
+		id: id,
+		profile: profile_name,
+		model_path: model_path,
+		pid: get_pid(),
+		port: port,
+		log_path: srv.log_path,
+		started_at: now,
+		profile_version: prof?.__version,
+		shared: { role: "member", group: group, key: key, server_id: srv.id,
+			server_port: srv.port, restarted: restarted },
+	};
+}
+
+// Watchdog half for members (called from reconcile_services under the
+// lock): make sure every running member's port is served by THIS agent
+// process. After an agent restart every member's stored pid is the old
+// agent's, so all proxies get re-bound here; a member whose server is gone
+// for good (stopped/dead, not just 'failed') is retired. Returns the
+// number of proxies (re)started.
+fn ensure_member_proxies_locked(db): i32 {
+	let rows = query(db,
+		"select id, profile, port, pid, share_key from services "
+		+ "where share_role = 'member' and state = 'running'", []);
+	let me = get_pid();
+	let started = 0;
+	for (r in rows) {
+		let srv = query(db,
+			"select id from services where share_key = ? and share_role = 'server' "
+			+ "and state in ('running', 'failed') limit 1", [r.share_key]);
+		if (srv.length == 0) {
+			db_exec(db, "update services set state = 'dead' where id = ?", [r.id]);
+			print("[share] member " + r.profile + " retired: its shared server is gone");
+			continue;
+		}
+		if (r.pid == me && member_proxy_alive(r.id, r.port)) { continue; }
+		db_exec(db, "update services set pid = ? where id = ?", [me, r.id]);
+		try {
+			start_member_proxy(db, r.id, r.port);
+			started = started + 1;
+		} catch (e) {
+			eprint("[share] member " + r.profile + ": port " + r.port + " not re-bound: " + e);
+		}
+	}
+	return started;
+}
+
+export fn ensure_member_proxies(db): i32 {
+	share_lock();
+	let n = 0;
+	try { n = ensure_member_proxies_locked(db); } catch (e) {
+		eprint("[share] ensure_member_proxies: " + e);
+	}
+	share_unlock();
+	return n;
+}
+
+// Stop one member: close its port; stop the server if it was the last one.
+fn stop_member_locked(db, id: string, port: i32, key: string): null {
+	db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [id]);
+	stop_member_proxy(port);
+	if (member_profs(db, key).length == 0) {
+		let srv = server_row_by_key(db, key);
+		if (srv != null) {
+			print("[share] last member left " + key + " — stopping the shared server");
+			stop_plain_service(db, srv.id);
+		}
+	}
+	return null;
+}
+
+// Stop a shared server and every member it serves.
+fn stop_server_locked(db, id: string, key: string): null {
+	stop_plain_service(db, id);
+	let rows = query(db,
+		"select id, port from services where share_key = ? and share_role = 'member' and state = 'running'",
+		[key]);
+	for (r in rows) {
+		db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [r.id]);
+		stop_member_proxy(r.port);
+	}
+	return null;
+}
+
+// /services view of the shared bits of a row (null for ordinary rows).
+fn shared_view(db, row) {
+	if (row?.share_role == null) { return null; }
+	if (row.share_role == "server") {
+		let prof = parse_or_null(row.profile_json);
+		let ss = prof?.__shared_server ?? {};
+		let members = query(db,
+			"select profile, port from services where share_key = ? and share_role = 'member' "
+			+ "and state = 'running' order by started_at asc", [row.share_key]);
+		let names = [];
+		let slots_in_use = 0;
+		let cps_in_use = 0;
+		let mrows = query(db,
+			"select profile_json from services where share_key = ? and share_role = 'member' "
+			+ "and state = 'running'", [row.share_key]);
+		for (m in mrows) {
+			let mp = parse_or_null(m.profile_json);
+			try {
+				slots_in_use = slots_in_use + member_slots(mp);
+				let c = member_ctx_per_slot(mp);
+				if (c > cps_in_use) { cps_in_use = c; }
+			} catch (e) { }
+		}
+		for (m in members) { names.push({ profile: m.profile, port: m.port }); }
+		return {
+			role: "server",
+			group: ss?.group,
+			key: row.share_key,
+			adapters: ss?.adapters ?? [],
+			slots: ss?.slots,
+			ctx_per_slot: ss?.ctx_per_slot,
+			context: ss?.context,
+			cache_ram_off: ss?.cache_ram_off,
+			members: names,
+			slots_in_use: slots_in_use,
+			ctx_per_slot_in_use: cps_in_use,
+		};
+	}
+	let mp = parse_or_null(row.profile_json);
+	let srv = query(db,
+		"select id, pid, port, state from services where share_key = ? and share_role = 'server' "
+		+ "and state in ('running', 'failed') order by started_at desc limit 1", [row.share_key]);
+	let adapters = [];
+	try { for (a in profile_adapters(mp)) { adapters.push(a.path); } } catch (e) { }
+	return {
+		role: "member",
+		group: mp?.share_group,
+		key: row.share_key,
+		server_id: (srv.length > 0 ? srv[0].id : null),
+		server_port: (srv.length > 0 ? srv[0].port : null),
+		server_alive: (srv.length > 0 && srv[0].state == "running" && process_alive(srv[0].pid)),
+		adapters: adapters,
+		alias: profile_alias(mp),
+	};
+}
+
 // ── HTTP handlers ─────────────────────────────────────────────────────
 
 // reserved_ports: ports the agent must refuse to spawn services on,
@@ -1408,6 +1891,10 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				// Declaration removed/broken between the check above and
 				// the spawn: still a refusal, not a bad request.
 				if (msg.find("not declared") >= 0) { status = 403; }
+				// Shared-LoRA refusals (incompatible settings, bad lora
+				// field, no --lora-scaled): a conflict with what's running
+				// or with the profile, not a malformed request.
+				if (msg.find("share: ") == 0) { status = 409; }
 				return { status: status, body: stringify({ error: msg }) };
 			}
 		},
@@ -1454,7 +1941,7 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 				return { status: 409, body: "{\"error\":\"that pid is a managed witchgrid service \\u2014 use stop\"}" };
 			}
 			try {
-				kill(pid, SIGTERM);
+				kill(pid, SIG_TERM);
 			} catch (e) {
 				return { status: 502, body: stringify({ error: "kill failed: " + e }) };
 			}

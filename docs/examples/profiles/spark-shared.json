@@ -1,0 +1,32 @@
+{
+  "_comment": "luna-spark + familiar-spark on ONE llama-server (B4-9B Q8 loaded once, Luna LoRA selected per request on :18091, base on :18090). Each entry is a POST /api/profiles body. Compared with dedicated profiles the only new field is share_group; context/parallel_slots must be in intent and every other intent/flag must match between the two. Paths/alias are examples — use the ones from your current profiles. See docs/shared-lora.md.",
+  "profiles": [
+    {
+      "name": "luna-spark",
+      "profile": {
+        "binary": "llama-server",
+        "share_group": "spark-b4-9b",
+        "intent": { "context": 65536, "parallel_slots": 2, "gpu_layers": 99, "flash_attention": true },
+        "extra_flags": ["--jinja", "--lora", "/home/witchgrid/loras/B4-9B-Luna-F2-f16.gguf"],
+        "default_port": 18091,
+        "context": 65536,
+        "kv_type": "f16",
+        "model_alias": "b4-9b-nomtp-q8_0",
+        "lora_mb": 64
+      }
+    },
+    {
+      "name": "familiar-spark",
+      "profile": {
+        "binary": "llama-server",
+        "share_group": "spark-b4-9b",
+        "intent": { "context": 65536, "parallel_slots": 2, "gpu_layers": 99, "flash_attention": true },
+        "extra_flags": ["--jinja"],
+        "default_port": 18090,
+        "context": 65536,
+        "kv_type": "f16",
+        "model_alias": "b4-9b-nomtp-q8_0"
+      }
+    }
+  ]
+}
