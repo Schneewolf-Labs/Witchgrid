@@ -30,7 +30,7 @@ import { open, open_fd, file_stat, list_dir, exists } from "@stdlib/fs";
 import { fd_close } from "@stdlib/ipc";
 import { exec as db_exec, query } from "@stdlib/sqlite";
 import { parse, stringify } from "@stdlib/json";
-import { sleep } from "@stdlib/time";
+import { sleep, time_ms } from "@stdlib/time";
 import { render_argv } from "./intent";
 // Binary-path resolvers for the auto-restart watchdog (reconcile_services).
 // reconcile respawns dead services itself, so it needs to resolve a
@@ -51,6 +51,11 @@ import { is_sharing_profile, is_shared_server_profile, sharing_profile_error,
 	shared_server_profile, server_config, profile_adapters, profile_alias,
 	member_slots, member_ctx_per_slot } from "./lora_share";
 import { start_member_proxy, stop_member_proxy, member_proxy_alive } from "./lora_proxy";
+// posix_spawn children inherit the calling thread's signal mask, and
+// Hemlock blocks signals on its worker threads — bracket every spawn with a
+// cleared mask so services can be stopped with SIGTERM. See sigmask.hml.
+import { sigmask_clear, sigmask_restore } from "./sigmask";
+import { profile_fingerprint } from "./fingerprint";
 import { socket_create, AF_INET as NET_AF_INET, SOCK_STREAM as NET_SOCK_STREAM,
 	SOL_SOCKET as NET_SOL_SOCKET, SO_REUSEADDR as NET_SO_REUSEADDR } from "@stdlib/net";
 
@@ -141,6 +146,13 @@ export fn init_services_schema(db): null {
 	} catch (e) { }
 	try {
 		db_exec(db, "alter table services add column share_role text", []);
+	} catch (e) { }
+	// Measured GPU memory (measure_services): {"<gpu index>": MB} and when.
+	try {
+		db_exec(db, "alter table services add column vram_json text", []);
+	} catch (e) { }
+	try {
+		db_exec(db, "alter table services add column vram_measured_at text", []);
 	} catch (e) { }
 	return null;
 }
@@ -249,16 +261,37 @@ fn prune_service_history(db): null {
 	// Drop those immediately regardless of age — the failure is resolved
 	// once a running instance for the same profile exists. (The 'failed'
 	// "needs a human" signal is only meaningful while nothing's running.)
-	db_exec(db,
-		"delete from services where state in ('dead', 'stopped', 'failed') "
-		+ "and profile in (select profile from services where state = 'running')",
-		[]);
-	// Age-based prune of the remaining (genuinely-not-running) history.
-	db_exec(db,
-		"delete from services where state in ('dead', 'stopped', 'failed') "
-		+ "and started_at < datetime('now', ?)",
+	//
+	// Never a 'stopped' row whose process is still there: that row is what
+	// finish_stops escalates from, and what list_services shows as
+	// "stopping" (its VRAM is still in use). Dropping it while the pid
+	// lived is how a SIGTERM-deaf server kept 12 GB with nothing left to
+	// kill it.
+	let cands = query(db,
+		"select id, pid, state, profile_json, share_role, "
+		+ "(strftime('%s','now') - strftime('%s', coalesce(stopped_at, started_at))) as since_s "
+		+ "from services where state in ('dead', 'stopped', 'failed') "
+		+ "and (profile in (select profile from services where state = 'running') "
+		+ "or started_at < datetime('now', ?))",
 		["-" + ADOPTION_HISTORY_DAYS + " days"]);
+	for (c in cands) {
+		if (c.state == "stopped" && stopped_row_lingering(c)) { continue; }
+		db_exec(db, "delete from services where id = ?", [c.id]);
+	}
 	return null;
+}
+
+// A 'stopped' row whose process is still present (recently stopped, so the
+// pid can't have been recycled). Members are proxies inside the agent — the
+// agent's own pid — never lingering.
+fn stopped_row_lingering(row): bool {
+	if (row?.share_role == "member") { return false; }
+	if (row?.since_s != null && i32(row.since_s) > STOP_ESCALATE_WINDOW_SECONDS) { return false; }
+	let pid = row.pid;
+	if (pid <= 1 || pid == get_pid()) { return false; }
+	let binary = row_binary(row?.profile_json);
+	if (binary == "local") { return group_alive(pid); }
+	return process_alive(pid) && service_healthy(pid, binary);
 }
 
 // Platform probe for the process-introspection helpers below. Linux
@@ -824,12 +857,19 @@ export fn spawn_service(db, profile_name: string, prof, model_path: string, port
 			setenv("LD_LIBRARY_PATH", libdir);
 		}
 
-		result = posix_spawn(argv, {
-			stdin: null_fd,
-			stdout: log_fd,
-			stderr: log_fd,
-			setsid: true,
-		});
+		let mask = sigmask_clear();
+		try {
+			result = posix_spawn(argv, {
+				stdin: null_fd,
+				stdout: log_fd,
+				stderr: log_fd,
+				setsid: true,
+			});
+		} catch (e3) {
+			sigmask_restore(mask);
+			throw e3;
+		}
+		sigmask_restore(mask);
 
 		if (pinned || cpu_only) {
 			unsetenv("CUDA_VISIBLE_DEVICES");
@@ -967,6 +1007,7 @@ fn spawn_local_service(db, profile_name: string, prof, port: i32, gpus): object 
 	let log_fd = open_fd(log_path, "w");
 	let null_fd = open_fd("/dev/null", "r");
 	let result = null;
+	let mask = sigmask_clear();
 	try {
 		result = posix_spawn(argv, {
 			stdin: null_fd,
@@ -977,10 +1018,12 @@ fn spawn_local_service(db, profile_name: string, prof, port: i32, gpus): object 
 			cwd: decl.cwd,
 		});
 	} catch (e) {
+		sigmask_restore(mask);
 		fd_close(log_fd);
 		fd_close(null_fd);
 		throw e;
 	}
+	sigmask_restore(mask);
 	fd_close(log_fd);
 	fd_close(null_fd);
 	print("[spawn] local " + decl.name + " port=" + port
@@ -1076,6 +1119,158 @@ export fn managed_pids(db): array {
 	return out;
 }
 
+// ── measured GPU memory ───────────────────────────────────────────────
+// What each service actually holds on each GPU, from nvidia-smi's compute
+// apps (hardware.probe_compute_apps) attributed by pid: the service's own
+// pid, every process in its process group (all services are setsid'd, so
+// pgid == pid) and every descendant (a child that called setsid itself).
+// Shared-LoRA members are proxies inside the agent; the memory belongs to
+// their server row. Results are written to the rows (vram_json,
+// vram_measured_at) so GET /services serves them without re-probing.
+
+fn vram_total(m): i32 {
+	if (m == null) { return 0; }
+	let t = 0;
+	for (k in m.keys()) { t = t + i32(m[k]); }
+	return t;
+}
+
+fn row_profile_fp(profile_json): string {
+	let p = parse_or_null(profile_json);
+	if (p == null) { return ""; }
+	return profile_fingerprint(p);
+}
+
+// pid → { ppid, pgrp } for every process (Linux /proc; {} elsewhere).
+fn proc_table(): object {
+	let out = {};
+	if (!host_has_proc()) { return out; }
+	let entries = null;
+	try { entries = list_dir("/proc"); } catch (e) { return out; }
+	for (name in entries) {
+		let c = name.substr(0, 1);
+		if (!(c >= "0" && c <= "9")) { continue; }
+		try {
+			let f = open("/proc/" + name + "/stat", "r");
+			let st = f.read();
+			f.close();
+			let rp = -1;
+			let i = 0;
+			while (i < st.length) {
+				if (st.substr(i, 1) == ")") { rp = i; }
+				i = i + 1;
+			}
+			if (rp < 0) { continue; }
+			let fields = st.substr(rp + 2, st.length - rp - 2).split(" ");
+			if (fields.length > 2) {
+				out[name] = { ppid: i32(fields[1]), pgrp: i32(fields[2]) };
+			}
+		} catch (e) { }
+	}
+	return out;
+}
+
+// The pids that count as service `pid`: itself, its process group, and
+// all descendants. As a { "<pid>": true } set.
+fn service_pid_set(pid: i32, table): object {
+	let set = {};
+	set["" + pid] = true;
+	let children = {};
+	for (k in table.keys()) {
+		let e = table[k];
+		if (e.pgrp == pid) { set[k] = true; }
+		let pk = "" + e.ppid;
+		if (!children.has(pk)) { children[pk] = []; }
+		children[pk].push(k);
+	}
+	let queue = [];
+	for (k in set.keys()) { queue.push(k); }
+	while (queue.length > 0) {
+		let cur = queue.shift();
+		let kids = children?[cur] ?? [];
+		for (kid in kids) {
+			if (!set.has(kid)) { set[kid] = true; queue.push(kid); }
+		}
+	}
+	return set;
+}
+
+// Measure every running (and still-present stopped) process-backed
+// service. gpus: the hardware probe's GPU list; apps: probe_compute_apps.
+// Returns
+//   { measured_at, gpus: [{ index, total_mb, used_mb, free_mb,
+//       services_mb, other_mb }],
+//     services: [{ id, profile, port, pid, state, gpus, vram_mb, vram_total_mb }],
+//     other: [{ pid, gpu_index, used_mb }] }   (not ours: unmanaged/other users)
+export fn measure_services(db, gpus, apps): object {
+	let now = iso_now(db);
+	let table = proc_table();
+	let rows = query(db,
+		"select id, profile, pid, port, state, gpus_json, profile_json, share_role, share_key, stopped_at, "
+		+ "(strftime('%s','now') - strftime('%s', coalesce(stopped_at, started_at))) as since_s, "
+		+ "(strftime('%s','now') - strftime('%s', started_at)) as uptime_s "
+		+ "from services where state in ('running', 'stopped') "
+		+ "and (share_role is null or share_role <> 'member') order by started_at desc", []);
+	let claimed = {};          // app index → true
+	let svc_out = [];
+	let me = get_pid();
+	for (row in rows) {
+		if (row.state == "stopped" && !stopped_row_lingering(row)) { continue; }
+		if (row.pid <= 1 || row.pid == me) { continue; }
+		let set = service_pid_set(row.pid, table);
+		let per = {};
+		let ai = 0;
+		while (ai < apps.length) {
+			let a = apps[ai];
+			if (!claimed.has("" + ai) && set.has("" + a.pid) && a.gpu_index >= 0) {
+				let gk = "" + a.gpu_index;
+				per[gk] = i32(per?[gk] ?? 0) + a.used_mb;
+				claimed["" + ai] = true;
+			}
+			ai = ai + 1;
+		}
+		db_exec(db, "update services set vram_json = ?, vram_measured_at = ? where id = ?",
+			[stringify(per), now, row.id]);
+		let entry = {
+			id: row.id, profile: row.profile, port: row.port, pid: row.pid,
+			state: (row.state == "stopped" ? "stopping" : row.state),
+			gpus: parse_or_null(row?.gpus_json) ?? [],
+			vram_mb: per, vram_total_mb: vram_total(per),
+			uptime_s: row?.uptime_s,
+			profile_fp: row_profile_fp(row?.profile_json),
+		};
+		// A shared server's memory is its members' (CP keys its
+		// last-measured value by the member set).
+		if (row?.share_role == "server") {
+			let ms = [];
+			let mrows = query(db,
+				"select profile, profile_json from services where share_key = ? "
+				+ "and share_role = 'member' and state = 'running' order by profile asc",
+				[row.share_key]);
+			for (m in mrows) { ms.push({ profile: m.profile, fp: row_profile_fp(m.profile_json) }); }
+			entry["members"] = ms;
+		}
+		svc_out.push(entry);
+	}
+	let other = [];
+	let ai2 = 0;
+	while (ai2 < apps.length) {
+		if (!claimed.has("" + ai2)) { other.push(apps[ai2]); }
+		ai2 = ai2 + 1;
+	}
+	let gout = [];
+	for (g in (gpus ?? [])) {
+		let svc_mb = 0;
+		for (sv in svc_out) { svc_mb = svc_mb + i32(sv.vram_mb?["" + g.index] ?? 0); }
+		let used = g?.used_mb ?? (g.total_mb - g.free_mb);
+		let oth = used - svc_mb;
+		if (oth < 0) { oth = 0; }
+		gout.push({ index: g.index, name: g?.name, total_mb: g.total_mb, used_mb: used,
+			free_mb: g.free_mb, services_mb: svc_mb, other_mb: oth });
+	}
+	return { measured_at: now, gpus: gout, services: svc_out, other: other };
+}
+
 export fn list_services(db): array {
 	// Surface running services + crash-loop-exhausted ones (state='failed').
 	// 'failed' rows are the durable "needs a human" signal — the watchdog
@@ -1084,11 +1279,22 @@ export fn list_services(db): array {
 	// these (a just-crashed 'running' row gets reaped within ~1 tick, too
 	// fleeting to rely on). Adoption-history ('dead'/'stopped') stays hidden.
 	let rows = query(db,
-		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state, profile_json, share_key, share_role "
-		+ "from services where state in ('running', 'failed') order by started_at desc", []);
+		"select id, profile, model_path, pid, port, log_path, started_at, profile_version, gpus_json, state, profile_json, share_key, share_role, "
+		+ "vram_json, vram_measured_at, stopped_at, "
+		+ "(strftime('%s','now') - strftime('%s', coalesce(stopped_at, started_at))) as since_s, "
+		+ "(strftime('%s','now') - strftime('%s', started_at)) as uptime_s "
+		+ "from services where state in ('running', 'failed', 'stopped') order by started_at desc", []);
 	let out = [];
 	let me = get_pid();
 	for (row in rows) {
+		// A stopped row is listed only while its process is still there
+		// ("stopping": SIGKILL sent, not yet gone) — it still holds its port
+		// and VRAM, so placement and the layout planner must see it.
+		let stopping = false;
+		if (row.state == "stopped") {
+			if (!stopped_row_lingering(row)) { continue; }
+			stopping = true;
+		}
 		// device reflects where the service actually runs: gpus_json is the
 		// pinned GPU index list at spawn time — empty/null means it was
 		// placed CPU-only (gpu_layers=0, CUDA_VISIBLE_DEVICES="").
@@ -1112,10 +1318,22 @@ export fn list_services(db): array {
 			profile_version: row?.profile_version,
 			device: device,
 			gpus: gpus,        // pinned GPU index list (empty = CPU-only)
-			state: row?.state,
+			state: (stopping ? "stopping" : row?.state),
 			binary: row_binary(row?.profile_json),
-			alive: process_alive(row.pid),
+			// stopping rows are never routable
+			alive: (stopping ? false : process_alive(row.pid)),
+			uptime_s: row?.uptime_s,
+			profile_fp: row_profile_fp(row?.profile_json),
+			// Measured GPU memory (nvidia-smi compute apps of the service's
+			// pid, process group and descendants), per GPU index, from the
+			// last measure_services pass (heartbeat or GET /vram).
+			vram_mb: parse_or_null(row?.vram_json) ?? {},
+			vram_total_mb: vram_total(parse_or_null(row?.vram_json)),
+			vram_measured_at: row?.vram_measured_at,
 		});
+		if (stopping) {
+			out[out.length - 1]["stopped_at"] = row?.stopped_at;
+		}
 		let sv = shared_view(db, row);
 		if (sv != null) {
 			let entry = out[out.length - 1];
@@ -1131,49 +1349,163 @@ export fn list_services(db): array {
 }
 
 export fn stop_service(db, id: string): bool {
+	return stop_service_report(db, id, -1.0)?.found == true;
+}
+
+// Stop a service and report what happened:
+//   { found, id, gone, killed, sigterm_unreceivable, waited_s, pid, role? }
+// gone == false means the process outlived SIGKILL + STOP_KILL_WAIT_SECONDS
+// (its row stays, listed as "stopping"). grace_s < 0 → the default grace.
+export fn stop_service_report(db, id: string, grace_s: f64): object {
 	let rows = query(db,
 		"select port, share_key, share_role from services where id = ? and state = 'running'", [id]);
 	if (rows.length == 0) {
-		return false;
+		return { found: false, id: id };
 	}
 	let role = rows[0]?.share_role;
 	if (role == "member" || role == "server") {
 		share_lock();
+		let rep = null;
 		try {
-			if (role == "member") { stop_member_locked(db, id, rows[0].port, rows[0].share_key); }
-			else { stop_server_locked(db, id, rows[0].share_key); }
+			if (role == "member") { rep = stop_member_locked(db, id, rows[0].port, rows[0].share_key, grace_s); }
+			else { rep = stop_server_locked(db, id, rows[0].share_key, grace_s); }
 		} catch (e) {
 			share_unlock();
 			throw e;
 		}
 		share_unlock();
-		return true;
+		rep["found"] = true;
+		rep["id"] = id;
+		rep["role"] = role;
+		return rep;
 	}
-	return stop_plain_service(db, id);
+	return stop_plain_service_verified(db, id, grace_s);
 }
 
-// SIGTERM a process-backed service and soft-delete its row (the original
-// stop path; shared members are handled above).
-fn stop_plain_service(db, id: string): bool {
+// SIGTERM a process-backed service, soft-delete its row, and WAIT until the
+// process (for a local service: its whole process group) is really gone —
+// SIGKILL after the grace period, then reap. Returns the stop report
+// (see terminate_verified). A process that is still there after the
+// SIGKILL wait keeps its row ('stopped', pid alive → listed as "stopping"
+// by list_services, so its VRAM stays visible) and finish_stops keeps
+// escalating; it is never silently forgotten. (Before: SIGTERM, row
+// 'stopped', return — and prune_service_history deleted that row as soon as
+// the same profile was running again, so a server that ignored SIGTERM
+// kept its GPU memory with nothing left to escalate.)
+fn stop_plain_service_verified(db, id: string, grace_s: f64) {
 	let rows = query(db,
 		"select pid, profile_json from services where id = ? and state = 'running'", [id]);
 	if (rows.length == 0) {
-		return false;
+		return { found: false };
 	}
 	let pid = rows[0].pid;
-	if (row_binary(rows[0].profile_json) == "local") {
-		// The whole process group: a wrapper script's children too.
-		signal_group(pid, SIG_TERM);
-	} else if (process_alive(pid)) {
-		try { kill(pid, SIG_TERM); } catch (e) { /* race with exit; fine */ }
-	}
-	reap_child(pid);
-	// Soft-delete: keep the row so adoption can match by port if the
-	// operator later restarts the service with the same profile and
-	// the previous llama-server hadn't yet exited. finish_stops follows
-	// up on the next heartbeat tick in case SIGTERM wasn't enough.
+	let binary = row_binary(rows[0].profile_json);
+	// Mark first: the watchdog must not respawn it while we wait.
 	db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [id]);
-	return true;
+	let rep = terminate_verified(pid, binary, grace_s);
+	rep["found"] = true;
+	rep["id"] = id;
+	if (!rep.gone) {
+		eprint("[stop] service " + id + " (pid " + pid + ") still present after SIGKILL; "
+			+ "keeping its row, the watchdog keeps escalating");
+	}
+	return rep;
+}
+
+// Seconds to wait for exit after SIGTERM before SIGKILL (default; a stop
+// request may pass grace_s). A process that can't get SIGTERM (blocked or
+// ignored — services started by agents before the signal-mask fix) gets
+// SIGKILL after SHORT_GRACE_SECONDS instead.
+let STOP_TERM_GRACE_SECONDS = 10.0;
+let SHORT_GRACE_SECONDS = 1.0;
+// How long to wait for the process to disappear after SIGKILL (CUDA
+// teardown of a large model can take a few seconds).
+let STOP_KILL_WAIT_SECONDS = 15.0;
+let SIGTERM_BIT_MASK_DIGIT = 4;   // SIGTERM = 15 → bit 14 → hex digit 3 (from the right), value 4
+
+// Is SIGTERM blocked or ignored for this pid? Reads SigBlk/SigIgn from
+// /proc/<pid>/status (Linux). false when unreadable.
+export fn sigterm_unreceivable(pid: i32): bool {
+	if (!host_has_proc()) { return false; }
+	let content = "";
+	try {
+		let f = open("/proc/" + pid + "/status", "r");
+		content = f.read();
+		f.close();
+	} catch (e) { return false; }
+	for (line in content.split("\n")) {
+		if (line.find("SigBlk:") == 0 || line.find("SigIgn:") == 0) {
+			let hex = line.substr(7, line.length - 7).trim();
+			if (hex.length < 4) { continue; }
+			let c = hex.substr(hex.length - 4, 1);
+			let v = 0;
+			if (c >= "0" && c <= "9") { v = i32(c); }
+			else {
+				let lc = c.lower();
+				if (lc >= "a" && lc <= "f") { v = 10 + ("abcdef".find(lc)); }
+			}
+			if ((v & SIGTERM_BIT_MASK_DIGIT) != 0) { return true; }
+		}
+	}
+	return false;
+}
+
+// Still there? For a local service: any member of its process group; for
+// an engine: the pid (zombies excluded — reap_child collects ours).
+fn stop_target_present(pid: i32, binary: string): bool {
+	reap_child(pid);
+	if (binary == "local") { return group_alive(pid); }
+	return process_alive(pid) || group_alive(pid);
+}
+
+fn wait_target_gone(pid: i32, binary: string, seconds: f64): bool {
+	let waited = 0.0;
+	loop {
+		if (!stop_target_present(pid, binary)) { return true; }
+		if (waited >= seconds) { return false; }
+		sleep(0.2);
+		waited = waited + 0.2;
+	}
+	return false;
+}
+
+// SIGTERM → wait → SIGKILL → wait. The whole process group (every service
+// is spawned with setsid, so pgid == pid): a wrapper script's children and
+// a llama-server's helpers go too. Returns
+//   { pid, gone, killed, sigterm_unreceivable, waited_s }
+export fn terminate_verified(pid: i32, binary: string, grace_s: f64): object {
+	let t0 = unix_now_s();
+	if (pid <= 1 || pid == get_pid()) {
+		return { pid: pid, gone: true, killed: false, sigterm_unreceivable: false, waited_s: 0.0 };
+	}
+	if (!stop_target_present(pid, binary)) {
+		return { pid: pid, gone: true, killed: false, sigterm_unreceivable: false, waited_s: 0.0 };
+	}
+	let blocked = sigterm_unreceivable(pid);
+	let grace = grace_s;
+	if (grace < 0.0) { grace = STOP_TERM_GRACE_SECONDS; }
+	if (blocked && grace > SHORT_GRACE_SECONDS) { grace = SHORT_GRACE_SECONDS; }
+	if (!signal_group(pid, SIG_TERM)) {
+		try { kill(pid, SIG_TERM); } catch (e) { }
+	}
+	let gone = wait_target_gone(pid, binary, grace);
+	let killed = false;
+	if (!gone) {
+		eprint("[stop] pid " + pid + " still running " + grace + "s after SIGTERM"
+			+ (blocked ? " (SIGTERM blocked/ignored in that process)" : "")
+			+ "; sending SIGKILL");
+		if (!signal_group(pid, SIGKILL)) {
+			try { kill(pid, SIGKILL); } catch (e) { }
+		}
+		killed = true;
+		gone = wait_target_gone(pid, binary, STOP_KILL_WAIT_SECONDS);
+	}
+	return { pid: pid, gone: gone, killed: killed, sigterm_unreceivable: blocked,
+		waited_s: unix_now_s() - t0 };
+}
+
+fn unix_now_s(): f64 {
+	return f64(time_ms()) / 1000.0;
 }
 
 // Seconds a stopped service gets to exit on SIGTERM before finish_stops
@@ -1395,6 +1727,18 @@ fn reconcile_services_locked(db, caps_ref): i32 {
 		let tsplit = null;
 		try { if (d.gpus_json != null) { gpus = parse(d.gpus_json); } } catch (e) { }
 		try { if (d.tensor_split_json != null) { tsplit = parse(d.tensor_split_json); } } catch (e) { }
+		// A pinned profile (profile.pin, set by the operator or by a layout
+		// apply) respawns exactly where the pin says when the pin names this
+		// node — even if the row was placed elsewhere before the pin existed.
+		let respawn_port = i32(d.port);
+		let pin = d.prof?.pin;
+		if (pin != null && pin?.node_id != null && pin.node_id == agent_setting_get(db, "node_id", "")) {
+			if (pin?.gpus != null && stringify(pin.gpus) != stringify(gpus ?? [])) {
+				gpus = pin.gpus;
+				tsplit = null;   // split weights were for the old GPU set
+			}
+			if (pin?.port != null) { respawn_port = i32(pin.port); }
+		}
 		let caps = caps_for_binary(caps_ref, d.binary);
 		let bin = binpath_for_binary(d.binary);
 		// A local service's leader died but its group may not have (a
@@ -1409,7 +1753,7 @@ fn reconcile_services_locked(db, caps_ref): i32 {
 		}
 		try {
 			let svc = spawn_service(db, d.profile, d.prof, d.model_path,
-				i32(d.port), gpus, tsplit, caps, bin);
+				respawn_port, gpus, tsplit, caps, bin);
 			// Old row → dead; carry the climbing count onto the new row.
 			db_exec(db, "update services set state = 'dead' where id = ?", [d.id]);
 			db_exec(db, "update services set restart_count = ? where id = ?",
@@ -1737,22 +2081,28 @@ export fn ensure_member_proxies(db): i32 {
 }
 
 // Stop one member: close its port; stop the server if it was the last one.
-fn stop_member_locked(db, id: string, port: i32, key: string): null {
+// Returns a stop report (the server's, when it was stopped).
+fn stop_member_locked(db, id: string, port: i32, key: string, grace_s: f64): object {
 	db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [id]);
 	stop_member_proxy(port);
+	let rep = { gone: true, killed: false, sigterm_unreceivable: false, waited_s: 0.0,
+		server_stopped: false };
 	if (member_profs(db, key).length == 0) {
 		let srv = server_row_by_key(db, key);
 		if (srv != null) {
 			print("[share] last member left " + key + " — stopping the shared server");
-			stop_plain_service(db, srv.id);
+			let srep = stop_plain_service_verified(db, srv.id, grace_s);
+			rep = srep;
+			rep["server_stopped"] = true;
+			rep["server_id"] = srv.id;
 		}
 	}
-	return null;
+	return rep;
 }
 
 // Stop a shared server and every member it serves.
-fn stop_server_locked(db, id: string, key: string): null {
-	stop_plain_service(db, id);
+fn stop_server_locked(db, id: string, key: string, grace_s: f64): object {
+	let rep = stop_plain_service_verified(db, id, grace_s);
 	let rows = query(db,
 		"select id, port from services where share_key = ? and share_role = 'member' and state = 'running'",
 		[key]);
@@ -1760,7 +2110,7 @@ fn stop_server_locked(db, id: string, key: string): null {
 		db_exec(db, "update services set state = 'stopped', stopped_at = datetime('now') where id = ?", [r.id]);
 		stop_member_proxy(r.port);
 	}
-	return null;
+	return rep;
 }
 
 // /services view of the shared bits of a row (null for ordinary rows).
@@ -1907,9 +2257,22 @@ export fn make_handlers(db, reserved_ports, capabilities_for, binary_path_for): 
 			if (id == null) {
 				return { status: 400, body: "{\"error\":\"id required\"}" };
 			}
-			let ok = stop_service(db, id);
-			if (!ok) {
+			// grace_s: seconds between SIGTERM and SIGKILL (default 10;
+			// 1 when the process can't receive SIGTERM). report: true →
+			// 200 with the stop report even when the process is gone
+			// (default: 204, as before). The call returns only once the
+			// process is gone, or 202 + report when it outlived SIGKILL.
+			let grace = -1.0;
+			if (payload?.grace_s != null) { grace = f64(payload.grace_s); }
+			let rep = stop_service_report(db, id, grace);
+			if (rep?.found != true) {
 				return { status: 404, body: "{\"error\":\"not found\"}" };
+			}
+			if (rep?.gone != true) {
+				return { status: 202, body: stringify(rep) };
+			}
+			if (payload?.report == true) {
+				return { status: 200, body: stringify(rep) };
 			}
 			return { status: 204, body: "" };
 		},
